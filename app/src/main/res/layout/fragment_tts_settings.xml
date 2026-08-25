@@ -1,0 +1,148 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@android:color/black"
+    android:padding="24dp"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:gravity="center_horizontal">
+
+        <!-- Title -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Voice Settings"
+            android:textSize="28sp"
+            android:textStyle="bold"
+            android:textColor="@android:color/white"
+            android:layout_marginBottom="8dp"
+            android:importantForAccessibility="yes"
+            android:labelFor="@id/slider_speech_rate" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Adjust how Vyze speaks to you"
+            android:textSize="16sp"
+            android:textColor="#AAAAAA"
+            android:layout_marginBottom="32dp" />
+
+        <!-- Speech Rate -->
+        <TextView
+            android:id="@+id/label_speech_rate"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Speech Speed"
+            android:textSize="22sp"
+            android:textStyle="bold"
+            android:textColor="@android:color/white"
+            android:layout_marginBottom="4dp" />
+
+        <TextView
+            android:id="@+id/value_speech_rate"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="1.0x"
+            android:textSize="36sp"
+            android:textStyle="bold"
+            android:textColor="#FFD700"
+            android:layout_marginBottom="8dp" />
+
+        <SeekBar
+            android:id="@+id/slider_speech_rate"
+            android:layout_width="match_parent"
+            android:layout_height="56dp"
+            android:max="150"
+            android:progress="50"
+            android:progressTint="#FFD700"
+            android:thumbTint="#FFD700"
+            android:minHeight="48dp"
+            android:contentDescription="Speech speed slider, current value 1.0"
+            android:layout_marginBottom="32dp" />
+
+        <!-- Pitch -->
+        <TextView
+            android:id="@+id/label_pitch"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Voice Pitch"
+            android:textSize="22sp"
+            android:textStyle="bold"
+            android:textColor="@android:color/white"
+            android:layout_marginBottom="4dp" />
+
+        <TextView
+            android:id="@+id/value_pitch"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="1.0"
+            android:textSize="36sp"
+            android:textStyle="bold"
+            android:textColor="#FFD700"
+            android:layout_marginBottom="8dp" />
+
+        <SeekBar
+            android:id="@+id/slider_pitch"
+            android:layout_width="match_parent"
+            android:layout_height="56dp"
+            android:max="100"
+            android:progress="50"
+            android:progressTint="#FFD700"
+            android:thumbTint="#FFD700"
+            android:minHeight="48dp"
+            android:contentDescription="Voice pitch slider, current value 1.0"
+            android:layout_marginBottom="32dp" />
+
+        <!-- Volume -->
+        <TextView
+            android:id="@+id/label_volume"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Audio Volume"
+            android:textSize="22sp"
+            android:textStyle="bold"
+            android:textColor="@android:color/white"
+            android:layout_marginBottom="4dp" />
+
+        <TextView
+            android:id="@+id/value_volume"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="80%"
+            android:textSize="36sp"
+            android:textStyle="bold"
+            android:textColor="#FFD700"
+            android:layout_marginBottom="8dp" />
+
+        <SeekBar
+            android:id="@+id/slider_volume"
+            android:layout_width="match_parent"
+            android:layout_height="56dp"
+            android:max="100"
+            android:progress="80"
+            android:progressTint="#FFD700"
+            android:thumbTint="#FFD700"
+            android:minHeight="48dp"
+            android:contentDescription="Audio volume slider, current value 80 percent"
+            android:layout_marginBottom="40dp" />
+
+        <!-- Test Button -->
+        <Button
+            android:id="@+id/btn_test_voice"
+            android:layout_width="match_parent"
+            android:layout_height="64dp"
+            android:text="Test Voice"
+            android:textSize="20sp"
+            android:textStyle="bold"
+            android:backgroundTint="#FFD700"
+            android:textColor="@android:color/black"
+            android:contentDescription="Tap to hear a sample with current voice settings" />
+
+    </LinearLayout>
+</ScrollView>

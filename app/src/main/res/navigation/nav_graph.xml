@@ -49,4 +49,17 @@
         android:id="@+id/gallery_fragment"
         android:name="com.vyze.app.fragments.GalleryFragment"
         android:label="GalleryFragment" />
+
+    <fragment
+        android:id="@+id/tts_settings_fragment"
+        android:name="com.vyze.app.fragments.TtsSettingsFragment"
+        android:label="TtsSettingsFragment">
+
+        <action
+            android:id="@+id/action_tts_settings_to_camera"
+            app:destination="@id/camera_fragment"
+            app:popUpTo="@id/tts_settings_fragment"
+            app:popUpToInclusive="true" />
+
+    </fragment>
 </navigation>

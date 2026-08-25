@@ -223,22 +223,22 @@ class CurrencyAnalyzer {
         // Use negative lookahead for word chars after 'c'
 
         private val C_50 = CurrencyPattern(
-            regex = Regex("""\b50\s?c\b(?![a-zA-Z])"""),
+            regex = Regex("""(?i)\b50\s?c\b(?![a-zA-Z])"""),
             denominationKey = "50c",
             announcement = "50 sen coin detected"
         )
         private val C_20 = CurrencyPattern(
-            regex = Regex("""\b20\s?c\b(?![a-zA-Z])"""),
+            regex = Regex("""(?i)\b20\s?c\b(?![a-zA-Z])"""),
             denominationKey = "20c",
             announcement = "20 sen coin detected"
         )
         private val C_10 = CurrencyPattern(
-            regex = Regex("""\b10\s?c\b(?![a-zA-Z])"""),
+            regex = Regex("""(?i)\b10\s?c\b(?![a-zA-Z])"""),
             denominationKey = "10c",
             announcement = "10 sen coin detected"
         )
         private val C_5 = CurrencyPattern(
-            regex = Regex("""\b5\s?c\b(?![a-zA-Z])"""),
+            regex = Regex("""(?i)\b5\s?c\b(?![a-zA-Z])"""),
             denominationKey = "5c",
             announcement = "5 sen coin detected"
         )
