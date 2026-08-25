@@ -17,6 +17,7 @@ package com.vyze.app
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.RectF
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.SystemClock
@@ -31,6 +32,8 @@ import com.google.mediapipe.tasks.vision.core.ImageProcessingOptions
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetector
 import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetectorResult
+import java.util.concurrent.ConcurrentHashMap
+import kotlin.math.abs
 
 class ObjectDetectorHelper(
     var threshold: Float = THRESHOLD_DEFAULT,
@@ -49,6 +52,15 @@ class ObjectDetectorHelper(
     private var imageRotation = 0
     private lateinit var imageProcessingOptions: ImageProcessingOptions
 
+    // ── Spatial Mapping & Speech Debouncing ───────────────────────────────────
+
+    /**
+     * Timestamp of the last frame returned by the detector (for debouncing).
+     * Keyed by a composite key: "label|zone" where zone is the spatial zone string.
+     * Value is the [SystemClock.uptimeMillis] at which that label+zone was last spoken.
+     */
+    private val lastSpokenTimestamp = ConcurrentHashMap<String, Long>()
+
     init {
         setupObjectDetector()
     }
@@ -56,6 +68,7 @@ class ObjectDetectorHelper(
     fun clearObjectDetector() {
         objectDetector?.close()
         objectDetector = null
+        lastSpokenTimestamp.clear()
     }
 
     // Initialize the object detector using current settings on the
@@ -144,6 +157,203 @@ class ObjectDetectorHelper(
     fun isClosed(): Boolean {
         return objectDetector == null
     }
+
+    // ── Spatial Mapping ──────────────────────────────────────────────────────
+
+    /**
+     * Spatial information for a single detected object.
+     *
+     * @property categoryName  The label assigned by the model (e.g. "person", "cup").
+     * @property score         Confidence score 0.0–1.0.
+     * @property boundingBox   Raw bounding box from the detector.
+     * @property direction     One of [DIR_LEFT], [DIR_AHEAD], [DIR_RIGHT].
+     * @property proximity     One of [PROX_CLOSE], [PROX_FAR], [PROX_MEDIUM] (empty string).
+     * @property zoneKey       Composite key "label|direction|proximity" used for debouncing.
+     */
+    data class SpatialInfo(
+        val categoryName: String,
+        val score: Float,
+        val boundingBox: RectF,
+        val direction: String,
+        val proximity: String,
+        val zoneKey: String
+    )
+
+    /**
+     * Compute spatial position of a bounding box relative to the frame dimensions.
+     *
+     * **Direction** (horizontal centre of the box normalised to 0.0–1.0):
+     *  - `< 0.35` → "on your left"
+     *  - `0.35..0.65` → "directly ahead"
+     *  - `> 0.65` → "on your right"
+     *
+     * **Proximity** (box area as fraction of total frame area):
+     *  - `> 0.15` → "close"
+     *  - `< 0.05` → "far"
+     *  - otherwise → "" (medium, not announced to reduce speech clutter)
+     */
+    fun computeSpatialInfo(
+        boundingBox: RectF,
+        frameWidth: Int,
+        frameHeight: Int,
+        categoryName: String,
+        score: Float
+    ): SpatialInfo {
+        // Centre X normalised to 0.0–1.0
+        val centerX = (boundingBox.centerX().toFloat() / frameWidth).coerceIn(0f, 1f)
+
+        val direction = when {
+            centerX < LEFT_THRESHOLD  -> DIR_LEFT
+            centerX <= RIGHT_THRESHOLD -> DIR_AHEAD
+            else                       -> DIR_RIGHT
+        }
+
+        // Box area as fraction of total frame area
+        val boxArea = boundingBox.width().toLong() * boundingBox.height().toLong()
+        val frameArea = frameWidth.toLong() * frameHeight.toLong()
+        val areaFraction = if (frameArea > 0) boxArea.toFloat() / frameArea.toFloat() else 0f
+
+        val proximity = when {
+            areaFraction > CLOSE_THRESHOLD  -> PROX_CLOSE
+            areaFraction < FAR_THRESHOLD    -> PROX_FAR
+            else                            -> PROX_MEDIUM  // empty string
+        }
+
+        val zoneKey = "$categoryName|$direction|$proximity"
+
+        return SpatialInfo(
+            categoryName = categoryName,
+            score = score,
+            boundingBox = boundingBox,
+            direction = direction,
+            proximity = proximity,
+            zoneKey = zoneKey
+        )
+    }
+
+    // ── Speech Debouncing ────────────────────────────────────────────────────
+
+    /**
+     * Determines whether a [SpatialInfo] entry is eligible to be spoken right now.
+     *
+     * Rules:
+     *  1. If the label+zone has never been spoken → eligible.
+     *  2. If the cooldown has elapsed (> [DEBOUNCE_MS]) → eligible.
+     *  3. If the object has transitioned to a *new* spatial zone since the last
+     *     time this label was spoken → eligible (override cooldown).
+     *
+     * After returning `true` the timestamp is updated so subsequent calls within
+     * the cooldown window will return `false` (unless the zone changes again).
+     *
+     * Thread-safe: uses [ConcurrentHashMap] + atomic compare-and-set via
+     * [ConcurrentHashMap.put] which is sufficient because the composite analyzer
+     * is single-threaded and worst-case is a benign duplicate announcement.
+     */
+    fun isEligibleToSpeak(spatial: SpatialInfo): Boolean {
+        val now = SystemClock.uptimeMillis()
+        val previousTimestamp = lastSpokenTimestamp[spatial.zoneKey]
+
+        if (previousTimestamp == null) {
+            // Never spoken in this zone → speak
+            lastSpokenTimestamp[spatial.zoneKey] = now
+            return true
+        }
+
+        // Check cooldown
+        if (now - previousTimestamp > DEBOUNCE_MS) {
+            lastSpokenTimestamp[spatial.zoneKey] = now
+            return true
+        }
+
+        // Also check whether the object has moved to a *different* zone for the
+        // same label. We scan all keys that share the same label prefix.
+        val labelPrefix = spatial.categoryName + "|"
+        val hasDifferentZoneSpoken = lastSpokenTimestamp.any { (key, ts) ->
+            key.startsWith(labelPrefix) && key != spatial.zoneKey &&
+                (now - ts <= DEBOUNCE_MS)
+        }
+
+        // If a *different* zone for this label was recently spoken, and we are now
+        // in a new zone, override the cooldown.
+        if (hasDifferentZoneSpoken) {
+            lastSpokenTimestamp[spatial.zoneKey] = now
+            return true
+        }
+
+        return false
+    }
+
+    /**
+     * Build an announceable detection string with spatial context, or `null` if the
+     * detection is not eligible (debounced or medium proximity).
+     *
+     * Example output: "Person on your left, close."
+     */
+    fun buildAnnouncement(spatial: SpatialInfo): String? {
+        // Skip medium proximity to reduce speech clutter
+        if (spatial.proximity.isEmpty()) return null
+
+        // Debounce check
+        if (!isEligibleToSpeak(spatial)) return null
+
+        val proximityText = if (spatial.proximity.isNotEmpty()) {
+            ", ${spatial.proximity}"
+        } else ""
+
+        return "${spatial.categoryName} ${spatial.direction}$proximityText"
+    }
+
+    /**
+     * Convenience: given raw detection results, compute spatial info for every
+     * detection, filter by debounce + proximity, and return the list of
+     * announcement-ready strings sorted by confidence (highest first).
+     *
+     * @param resultBundle  The result bundle from the detector.
+     * @param frameWidth    Width of the input frame (before rotation).
+     * @param frameHeight   Height of the input frame (before rotation).
+     * @return List of announcement strings, or empty if nothing eligible.
+     */
+    fun getAnnounceableDetections(
+        resultBundle: ResultBundle,
+        frameWidth: Int,
+        frameHeight: Int
+    ): List<String> {
+        val detections = resultBundle.results.firstOrNull()?.detections()
+            ?: return emptyList()
+
+        return detections.mapNotNull { detection ->
+            val category = detection.categories().firstOrNull() ?: return@mapNotNull null
+            val spatial = computeSpatialInfo(
+                boundingBox = detection.boundingBox(),
+                frameWidth = frameWidth,
+                frameHeight = frameHeight,
+                categoryName = category.categoryName(),
+                score = category.score()
+            )
+            buildAnnouncement(spatial)
+        }.sortedByDescending { ann ->
+            // Sort by the confidence of the original detection
+            detections.firstOrNull { d ->
+                val cat = d.categories().firstOrNull()
+                cat != null && buildAnnouncement(
+                    computeSpatialInfo(
+                        d.boundingBox(), frameWidth, frameHeight,
+                        cat.categoryName(), cat.score()
+                    )
+                ) == ann
+            }?.categories()?.firstOrNull()?.score() ?: 0f
+        }
+    }
+
+    /**
+     * Clear all debounce timestamps. Call when the detector is reset or
+     * the user changes detection settings.
+     */
+    fun clearDebounceState() {
+        lastSpokenTimestamp.clear()
+    }
+
+    // ── Video Detection ──────────────────────────────────────────────────────
 
     // Accepts the URI for a video file loaded from the user's gallery and attempts to run
     // object detection inference on the video. This process will evaluate every frame in
@@ -354,6 +564,30 @@ class ObjectDetectorHelper(
         const val GPU_ERROR = 1
 
         const val TAG = "ObjectDetectorHelper"
+
+        // ── Spatial Mapping Constants ────────────────────────────────────────
+        /** Centre-X normalised threshold: below this → left */
+        const val LEFT_THRESHOLD = 0.35f
+        /** Centre-X normalised threshold: above this → right (0.35–0.65 = ahead) */
+        const val RIGHT_THRESHOLD = 0.65f
+
+        /** Box area fraction above this → "close" */
+        const val CLOSE_THRESHOLD = 0.15f
+        /** Box area fraction below this → "far" */
+        const val FAR_THRESHOLD = 0.05f
+
+        // ── Direction / Proximity Strings ────────────────────────────────────
+        const val DIR_LEFT   = "on your left"
+        const val DIR_AHEAD  = "directly ahead"
+        const val DIR_RIGHT  = "on your right"
+
+        const val PROX_CLOSE  = "close"
+        const val PROX_FAR    = "far"
+        const val PROX_MEDIUM = ""   // empty — medium proximity is not announced
+
+        // ── Debounce ─────────────────────────────────────────────────────────
+        /** Cooldown in milliseconds per label+zone before the same object is announced again. */
+        const val DEBOUNCE_MS = 3500L
     }
 
     // Used to pass results or errors back to the calling class

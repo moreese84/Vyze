@@ -59,18 +59,19 @@ class FlashlightManager {
     fun isTorchOn(): Boolean = torchEnabled
 
     /**
-     * Automatically enable the torch when the environment is dark (below the
-     * [LuminanceAnalyzer.DARK_THRESHOLD]), and disable it when lighting improves.
+     * Sets the torch state based on the hysteresis decision from
+     * [LuminanceAnalyzer].
      *
-     * Call this from the luminance analysis callback on each frame.
+     * The dual-threshold hysteresis (ON < 35 lux, OFF > 65 lux) is already
+     * computed by the analyzer, so this method simply applies the result
+     * without its own comparison logic.
      *
-     * @param isDark Whether the current frame luminance is below the dark threshold.
+     * @param shouldBeOn `true` if the hysteresis says torch should be on,
+     *                    `false` if it should be off.
      */
-    fun autoTorch(isDark: Boolean) {
-        if (isDark && !torchEnabled) {
-            toggleTorch(true)
-        } else if (!isDark && torchEnabled) {
-            toggleTorch(false)
+    fun autoTorch(shouldBeOn: Boolean) {
+        if (shouldBeOn != torchEnabled) {
+            toggleTorch(shouldBeOn)
         }
     }
 

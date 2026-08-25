@@ -1,12 +1,14 @@
 package com.vyze.app
 
 import android.graphics.Bitmap
+import android.graphics.Rect
 import android.media.Image
 import android.util.Log
 import androidx.annotation.OptIn
 import androidx.camera.core.ExperimentalGetImage
 import androidx.camera.core.ImageProxy
 import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.TextRecognizer
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
@@ -14,12 +16,16 @@ import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 /**
  * Helper class for on-device OCR text recognition using ML Kit.
  *
- * Initializes a TextRecognizer client and provides a function to process
- * CameraX ImageProxy frames, extracting recognized text blocks.
+ * Provides structured text hierarchy by:
+ *  - **Noise filtering** — removes isolated symbols, single-character artifacts,
+ *    pure non-alphanumeric text, and small floating noise (bbox area < 2% of frame).
+ *  - **Structural sorting** — orders [Text.TextBlock]s by bounding-box area
+ *    (largest / most prominent first) so headline text is read before secondary lines.
+ *  - **Top-3 limiting** — caps spoken output to the 3 most prominent blocks to
+ *    keep TTS concise for visually impaired users.
  *
- * **Memory management:** The intermediate [Bitmap] created from the ImageProxy
- * is explicitly [Bitmap.recycle]d after ML Kit has consumed it, preventing
- * frame-to-frame bitmap accumulation.
+ * **Memory safety:** Intermediate [Bitmap]s are explicitly recycled in both
+ * success and failure paths; [ImageProxy] is always closed in `addOnCompleteListener`.
  */
 class TextRecognitionHelper {
 
@@ -35,8 +41,8 @@ class TextRecognitionHelper {
      * unavailable in RGBA mode).
      *
      * @param imageProxy The camera frame to analyze. Always closed in completion.
-     * @param onSuccess  Callback with the concatenated recognized text (or a
-     *                   "No text detected" message when empty).
+     * @param onSuccess  Callback with the structured, filtered text output.
+     *                   Returns "No text detected" when no valid blocks remain.
      * @param onError    Callback invoked when recognition fails.
      */
     @OptIn(ExperimentalGetImage::class)
@@ -60,20 +66,22 @@ class TextRecognitionHelper {
             val rotationDegrees = imageProxy.imageInfo.rotationDegrees
             val inputImage = InputImage.fromBitmap(bitmap, rotationDegrees)
 
+            // Capture dimensions for noise filtering before ML Kit closes the image
+            val imageWidth = imageProxy.width
+            val imageHeight = imageProxy.height
+
             recognizer.process(inputImage)
                 .addOnSuccessListener { visionText ->
-                    val rawText = visionText.textBlocks.joinToString("\n\n") { block ->
-                        block.lines.joinToString("\n") { it.text }
-                    }
+                    val structuredText = processVisionText(
+                        visionText = visionText,
+                        imageWidth = imageWidth,
+                        imageHeight = imageHeight
+                    )
 
-                    val cleanedText = rawText
-                        .replace(Regex("\\n{3,}"), "\n\n")  // collapse excess newlines
-                        .trim()
-
-                    val resultText = if (cleanedText.isBlank()) {
+                    val resultText = if (structuredText.isBlank()) {
                         "No text detected"
                     } else {
-                        cleanedText
+                        structuredText
                     }
 
                     onSuccess(resultText)
@@ -105,6 +113,143 @@ class TextRecognitionHelper {
         }
     }
 
+    // ── Noise Filtering & Structural Sorting ────────────────────────────────
+
+    /**
+     * Processes raw ML Kit [Text] output into a structured, noise-filtered
+     * string suitable for TTS readout.
+     *
+     * Pipeline:
+     *  1. **Filter blocks** — drop blocks that are pure non-alphanumeric noise,
+     *     single-character artifacts, or isolated symbols.
+     *  2. **Filter small noise** — drop blocks whose bounding-box area is < 2%
+     *     of the total image area (floating noise artifacts).
+     *  3. **Sort by prominence** — order remaining blocks by bounding-box area
+     *     (descending) so headline text comes first.
+     *  4. **Limit to top 3** — keep only the 3 most prominent blocks for concise TTS.
+     *  5. **Format output** — headline block first, then secondary lines separated
+     *     by "Next, " for natural TTS pacing.
+     *
+     * @param visionText  The raw ML Kit recognition result.
+     * @param imageWidth  Width of the source image in pixels.
+     * @param imageHeight Height of the source image in pixels.
+     * @return A formatted string ready for TTS, or empty if nothing valid remains.
+     */
+    fun processVisionText(
+        visionText: Text,
+        imageWidth: Int,
+        imageHeight: Int
+    ): String {
+        val totalImageArea = imageWidth.toLong() * imageHeight.toLong()
+        if (totalImageArea <= 0) return ""
+
+        val blocks = visionText.textBlocks
+
+        // Step 1 & 2: Filter noise blocks
+        val cleanBlocks = blocks.filter { block ->
+            isNotNoise(block) && !isSmallFloatingNoise(block, totalImageArea)
+        }
+
+        if (cleanBlocks.isEmpty()) return ""
+
+        // Step 3: Sort by bounding-box area (largest first = most prominent)
+        val sortedBlocks = cleanBlocks.sortedByDescending { block ->
+            blockArea(block)
+        }
+
+        // Step 4: Limit to top 3 most prominent blocks
+        val topBlocks = sortedBlocks.take(MAX_PROMINENT_BLOCKS)
+
+        // Step 5: Format output with structural hierarchy
+        return formatStructuredOutput(topBlocks)
+    }
+
+    /**
+     * Determines whether a [Text.TextBlock] is NOT noise.
+     *
+     * A block is considered noise if:
+     *  - Its trimmed text is blank
+     *  - It contains only a single character
+     *  - It consists entirely of non-alphanumeric symbols (regex: no word characters)
+     */
+    private fun isNotNoise(block: Text.TextBlock): Boolean {
+        val text = block.text.trim()
+
+        // Empty or blank
+        if (text.isEmpty()) return false
+
+        // Single-character artifact (e.g. stray "|", ".", "1", "!")
+        if (text.length == 1) return false
+
+        // Pure non-alphanumeric noise (e.g. "---", "///", "***", "...")
+        // A block passes if it contains at least one word character (letter or digit)
+        if (!text.any { it.isLetterOrDigit() }) return false
+
+        return true
+    }
+
+    /**
+     * Determines whether a [Text.TextBlock] is a small floating noise artifact.
+     *
+     * Noise artifacts are typically tiny text fragments detected at edges or in
+     * texture. Their bounding-box area is < 2% of the total image area.
+     */
+    private fun isSmallFloatingNoise(block: Text.TextBlock, totalImageArea: Long): Boolean {
+        val box = block.boundingBox ?: return true // null bbox = treat as noise
+        val boxArea = box.width().toLong() * box.height().toLong()
+        val fraction = boxArea.toFloat() / totalImageArea.toFloat()
+        return fraction < NOISE_AREA_THRESHOLD
+    }
+
+    /**
+     * Returns the bounding-box area of a [Text.TextBlock].
+     * Falls back to 0 if the bounding box is null.
+     */
+    private fun blockArea(block: Text.TextBlock): Long {
+        val box = block.boundingBox ?: return 0L
+        return box.width().toLong() * box.height().toLong()
+    }
+
+    /**
+     * Formats the top blocks into a structured string for TTS.
+     *
+     * The first block is the "headline" (largest / most prominent).
+     * Subsequent blocks are introduced with "Next, " to signal a transition
+     * to the listener.
+     *
+     * Example output:
+     * ```
+     * OPEN HOUSE SATURDAY 10AM TO 4PM
+     * Next, 123 Main Street, Springfield
+     * Next, Call 555-0123 for info
+     * ```
+     */
+    private fun formatStructuredOutput(blocks: List<Text.TextBlock>): String {
+        if (blocks.isEmpty()) return ""
+
+        val parts = mutableListOf<String>()
+
+        blocks.forEachIndexed { index, block ->
+            // Clean block text: collapse internal newlines into single line,
+            // trim whitespace
+            val cleanText = block.text
+                .replace(Regex("\\s+"), " ")
+                .trim()
+
+            if (cleanText.isNotEmpty()) {
+                if (index == 0) {
+                    parts.add(cleanText)
+                } else {
+                    parts.add("Next, $cleanText")
+                }
+            }
+        }
+
+        return parts.joinToString(". ")
+    }
+
+    // ── Bitmap Conversion ───────────────────────────────────────────────────
+
     /**
      * Converts a CameraX [ImageProxy] (RGBA_8888 format) to an Android [Bitmap].
      *
@@ -134,5 +279,15 @@ class TextRecognitionHelper {
 
     companion object {
         private const val TAG = "TextRecognitionHelper"
+
+        /** Maximum number of text blocks to include in TTS output. */
+        const val MAX_PROMINENT_BLOCKS = 3
+
+        /**
+         * Minimum fraction of total image area a text block's bounding box
+         * must occupy to be considered real text (not floating noise).
+         * 2% = 0.02f.
+         */
+        const val NOISE_AREA_THRESHOLD = 0.02f
     }
 }

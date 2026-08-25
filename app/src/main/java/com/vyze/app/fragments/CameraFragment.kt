@@ -356,7 +356,15 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
     }
 
     /**
-     * Announces the highest-confidence detected object via TTS.
+     * Announces detected objects with spatial positioning and speech debouncing.
+     *
+     * Uses [ObjectDetectorHelper.getAnnounceableDetections] which:
+     *  - Computes direction ("on your left", "directly ahead", "on your right")
+     *  - Computes proximity ("close", "far") and skips medium to reduce clutter
+     *  - Enforces a 3500 ms debounce per label+zone, overridden on zone transitions
+     *
+     * Falls back to the highest-confidence detection if spatial analysis produces
+     * no announceable results (e.g. all objects are at medium proximity).
      */
     private fun announceDetectedObject() {
         val resultBundle = latestDetectionResult
@@ -371,15 +379,27 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
             return
         }
 
-        // Find the highest-confidence detection
-        val topDetection = detections.maxByOrNull { it.categories()[0].score() }
-        if (topDetection != null) {
-            val category = topDetection.categories()[0]
-            val name = category.categoryName()
-            val confidence = (category.score() * 100).toInt()
-            ttsManager.speak("Detected: $name, confidence $confidence percent.")
+        // Attempt spatial + debounced announcements
+        val announcements = objectDetectorHelper.getAnnounceableDetections(
+            resultBundle = resultBundle,
+            frameWidth = resultBundle.inputImageWidth,
+            frameHeight = resultBundle.inputImageHeight
+        )
+
+        if (announcements.isNotEmpty()) {
+            // Speak the top-confidence announcement
+            ttsManager.speak(announcements.first())
         } else {
-            ttsManager.speak("No objects detected.")
+            // Fallback: highest-confidence detection without spatial context
+            val topDetection = detections.maxByOrNull { it.categories()[0].score() }
+            if (topDetection != null) {
+                val category = topDetection.categories()[0]
+                val name = category.categoryName()
+                val confidence = (category.score() * 100).toInt()
+                ttsManager.speak("$name, confidence $confidence percent.")
+            } else {
+                ttsManager.speak("No objects detected.")
+            }
         }
     }
 
@@ -515,6 +535,9 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
             objectDetectorHelper.setupObjectDetector()
         }
 
+        // Clear debounce state since detection parameters changed
+        objectDetectorHelper.clearDebounceState()
+
         fragmentCameraBinding.overlay.clear()
         fragmentCameraBinding.highContrastOverlay.clear()
     }
@@ -627,6 +650,13 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
         val luminanceAnalyzer = LuminanceAnalyzer { isDark, meanLuminance ->
             latestIsDark = isDark
             latestMeanLuminance = meanLuminance
+
+            // Auto-torch per frame based on hysteresis state
+            activity?.runOnUiThread {
+                if (isAdded && this::flashlightManager.isInitialized) {
+                    flashlightManager.autoTorch(isDark)
+                }
+            }
         }
 
         return ImageAnalysis.Analyzer { imageProxy ->
