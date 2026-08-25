@@ -1,9 +1,25 @@
-/*\n * Copyright 2022 The TensorFlow Authors. All Rights Reserved.\n *\n * Licensed under the Apache License, Version 2.0 (the "License");\n * you may not use this file except in compliance with the License.\n * You may obtain a copy of the License at\n *\n *             http://www.apache.org/licenses/LICENSE-2.0\n *\n * Unless required by applicable law or agreed to in writing, software\n * distributed under the License is distributed on an "AS IS" BASIS,\n * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n * See the License for the specific language governing permissions and\n * limitations under the License.\n */
+/*
+ * Copyright 2022 The TensorFlow Authors. All Rights Reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *             http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 package com.vyze.app.fragments
 
 import android.annotation.SuppressLint
 import android.content.res.Configuration
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
 import android.view.GestureDetector
@@ -33,6 +49,7 @@ import com.vyze.app.LuminanceAnalyzer
 import com.vyze.app.MainViewModel
 import com.vyze.app.ObjectDetectorHelper
 import com.vyze.app.R
+import com.vyze.app.SceneAggregator
 import com.vyze.app.TextRecognitionHelper
 import com.vyze.app.TTSManager
 import com.vyze.app.VoiceCommandManager
@@ -43,6 +60,7 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
 
@@ -62,6 +80,9 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
 
     /** Blocking ML operations are performed using this executor */
     private lateinit var backgroundExecutor: ExecutorService
+
+    // Main thread handler for periodic scene summaries
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     // Accessibility components
     private lateinit var ttsManager: TTSManager
@@ -86,6 +107,9 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
     // Face detection
     private lateinit var faceDetectorHelper: FaceDetectorHelper
 
+    // Scene Aggregator
+    private lateinit var sceneAggregator: SceneAggregator
+
     // High Contrast Overlay
     private lateinit var highContrastOverlay: HighContrastOverlayView
 
@@ -106,6 +130,37 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
      */
     private val isAnalyzing = AtomicBoolean(false)
 
+    /**
+     * Battery optimization: frame counter for processing 1 out of every 3 frames.
+     * At 30 FPS camera output, this yields ~10 FPS processing, reducing CPU/GPU
+     * load and battery drain by ~66% while maintaining responsive detection.
+     */
+    private val frameCounter = AtomicInteger(0)
+
+    /**
+     * Whether the camera is currently bound and active.
+     * Used to prevent frame processing after onPause().
+     */
+    @Volatile
+    private var isCameraActive = false
+
+    // ── Auto-Scene Summary ───────────────────────────────────────────────
+
+    /**
+     * Periodic scene summary runnable. Fires every [SCENE_SUMMARY_INTERVAL_MS]
+     * to provide automatic room descriptions when the camera is active.
+     */
+    private val sceneSummaryRunnable = object : Runnable {
+        override fun run() {
+            if (isCameraActive && isAdded && this@CameraFragment::sceneAggregator.isInitialized) {
+                triggerSceneSummary()
+            }
+            mainHandler.postDelayed(this, SCENE_SUMMARY_INTERVAL_MS)
+        }
+    }
+
+    // ── Lifecycle ────────────────────────────────────────────────────────
+
     override fun onResume() {
         super.onResume()
         // Make sure that all permissions are still present, since the
@@ -118,15 +173,31 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
                 .navigate(CameraFragmentDirections.actionCameraToPermissions())
         }
 
+        // Re-initialize object detector if it was cleared in onPause
         backgroundExecutor.execute {
             if (::objectDetectorHelper.isInitialized && objectDetectorHelper.isClosed()) {
                 objectDetectorHelper.setupObjectDetector()
             }
         }
+
+        // Re-bind camera if it was unbound in onPause
+        if (cameraProvider != null && imageAnalyzer != null) {
+            bindCameraUseCases()
+        }
+
+        isCameraActive = true
+
+        // Start periodic scene summary timer
+        mainHandler.postDelayed(sceneSummaryRunnable, SCENE_SUMMARY_INTERVAL_MS)
     }
 
     override fun onPause() {
         super.onPause()
+
+        // Stop periodic scene summary
+        mainHandler.removeCallbacks(sceneSummaryRunnable)
+
+        isCameraActive = false
 
         // Stop voice listening when paused
         if (this::voiceCommandManager.isInitialized && voiceCommandManager.isCurrentlyListening()) {
@@ -138,20 +209,38 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
             flashlightManager.toggleTorch(false)
         }
 
-        // Save ObjectDetector settings
+        // Unbind camera to fully release camera resources and stop frame processing
+        cameraProvider?.unbindAll()
+        camera = null
+        flashlightManager.camera = null
+
+        // Save and release ObjectDetector settings
         if (this::objectDetectorHelper.isInitialized) {
             viewModel.setModel(objectDetectorHelper.currentModel)
             viewModel.setDelegate(objectDetectorHelper.currentDelegate)
             viewModel.setThreshold(objectDetectorHelper.threshold)
             viewModel.setMaxResults(objectDetectorHelper.maxResults)
-            // Close the object detector and release resources
             backgroundExecutor.execute { objectDetectorHelper.clearObjectDetector() }
         }
+
+        // Clear overlays
+        if (_fragmentCameraBinding != null) {
+            try { fragmentCameraBinding.overlay.clear() } catch (_: Exception) {}
+            try { fragmentCameraBinding.highContrastOverlay.clear() } catch (_: Exception) {}
+        }
+
+        // Reset frame throttle state
+        isAnalyzing.set(false)
+        ocrRequested.set(false)
+        frameCounter.set(0)
     }
 
     override fun onDestroyView() {
         _fragmentCameraBinding = null
         super.onDestroyView()
+
+        // Stop periodic scene summary
+        mainHandler.removeCallbacks(sceneSummaryRunnable)
 
         // Shut down our background executor
         backgroundExecutor.shutdown()
@@ -209,6 +298,7 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
         // Reset frame throttle flag
         isAnalyzing.set(false)
         ocrRequested.set(false)
+        frameCounter.set(0)
     }
 
     override fun onCreateView(
@@ -231,6 +321,8 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
 
         // Initialize TTS Manager
         ttsManager = TTSManager(requireContext().applicationContext)
+        // Apply saved TTS settings
+        ttsManager.applySettings(requireContext())
 
         // Initialize Text Recognition Helper
         textRecognitionHelper = TextRecognitionHelper()
@@ -250,6 +342,9 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
 
         // Initialize Face Detector
         faceDetectorHelper = FaceDetectorHelper()
+
+        // Initialize Scene Aggregator
+        sceneAggregator = SceneAggregator()
 
         // Reference to High Contrast Overlay
         highContrastOverlay = fragmentCameraBinding.highContrastOverlay
@@ -283,9 +378,8 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
         fragmentCameraBinding.highContrastOverlay.setRunningMode(RunningMode.LIVE_STREAM)
     }
 
-    /**
-     * Sets up voice command callbacks and starts listening.
-     */
+    // ── Voice Commands ───────────────────────────────────────────────────
+
     private fun setupVoiceCommands() {
         voiceCommandManager.onOcrRequested = {
             activity?.runOnUiThread {
@@ -339,11 +433,8 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
         }
     }
 
-    /**
-     * Sets up the full-screen gesture detector for accessibility.
-     * Attaches to the root layout so visually impaired users can tap anywhere.
-     * Each gesture provides haptic feedback for tactile confirmation.
-     */
+    // ── Gesture Detection ────────────────────────────────────────────────
+
     private fun setupGestureDetector() {
         gestureDetectorHelper = GestureDetectorHelper(
             onSingleTap = {
@@ -356,7 +447,7 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
             },
             onLongPress = {
                 hapticManager.vibrateLongPress()
-                announceLightConditions()
+                triggerSceneSummary()
             }
         )
 
@@ -368,30 +459,15 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
         }
     }
 
-    /**
-     * Captures the current camera frame and runs OCR text recognition.
-     * Announces "Reading text..." immediately so the user knows processing has started,
-     * then reads the recognized text aloud when results arrive.
-     */
-    private fun performOcrOnCurrentFrame() {
-        // Provide immediate audio feedback
-        ttsManager.speakImmediate("Reading text...")
+    // ── OCR ──────────────────────────────────────────────────────────────
 
-        // Set the flag so the composite analyzer captures the next frame for OCR
+    private fun performOcrOnCurrentFrame() {
+        ttsManager.speakImmediate("Reading text...")
         ocrRequested.set(true)
     }
 
-    /**
-     * Announces detected objects with spatial positioning and speech debouncing.
-     *
-     * Uses [ObjectDetectorHelper.getAnnounceableDetections] which:
-     *  - Computes direction ("on your left", "directly ahead", "on your right")
-     *  - Computes proximity ("close", "far") and skips medium to reduce clutter
-     *  - Enforces a 3500 ms debounce per label+zone, overridden on zone transitions
-     *
-     * Falls back to the highest-confidence detection if spatial analysis produces
-     * no announceable results (e.g. all objects are at medium proximity).
-     */
+    // ── Object Detection Readout ─────────────────────────────────────────
+
     private fun announceDetectedObject() {
         val resultBundle = latestDetectionResult
         if (resultBundle == null || resultBundle.results.isEmpty()) {
@@ -413,10 +489,8 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
         )
 
         if (announcements.isNotEmpty()) {
-            // Speak the top-confidence announcement
             ttsManager.speak(announcements.first())
         } else {
-            // Fallback: highest-confidence detection without spatial context
             val topDetection = detections.maxByOrNull { it.categories()[0].score() }
             if (topDetection != null) {
                 val category = topDetection.categories()[0]
@@ -429,10 +503,52 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
         }
     }
 
+    // ── Scene Summary ────────────────────────────────────────────────────
+
     /**
-     * Announces current light conditions via TTS.
-     * Also provides haptic warning if the environment is dark, and auto-enables the torch.
+     * Triggers a scene summary using [SceneAggregator].
+     * Collects spatial detections from the latest result bundle and
+     * produces a natural-language room description.
+     *
+     * Called on long-press gesture and periodically every 6 seconds.
      */
+    private fun triggerSceneSummary() {
+        val resultBundle = latestDetectionResult
+        if (resultBundle == null || resultBundle.results.isEmpty()) {
+            ttsManager.speak("No scene data available yet.")
+            return
+        }
+
+        val detections = resultBundle.results[0].detections()
+        if (detections.isNullOrEmpty()) {
+            ttsManager.speak("No objects currently visible.")
+            return
+        }
+
+        // Compute spatial info for all detections
+        val spatialDetections = detections.mapNotNull { detection ->
+            val category = detection.categories().firstOrNull() ?: return@mapNotNull null
+            objectDetectorHelper.computeSpatialInfo(
+                boundingBox = detection.boundingBox(),
+                frameWidth = resultBundle.inputImageWidth,
+                frameHeight = resultBundle.inputImageHeight,
+                categoryName = category.categoryName(),
+                score = category.score()
+            )
+        }
+
+        // Aggregate into a natural sentence
+        val summary = sceneAggregator.aggregate(spatialDetections)
+        if (summary != null) {
+            hapticManager.vibrateLongPress()
+            ttsManager.speak(summary)
+        } else {
+            ttsManager.speak("Scene summary not available. Please wait.")
+        }
+    }
+
+    // ── Light Conditions ─────────────────────────────────────────────────
+
     private fun announceLightConditions() {
         if (latestMeanLuminance == 0.0 && !latestIsDark) {
             ttsManager.speak("Light level not yet measured. Please wait.")
@@ -442,13 +558,11 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
         val brightness = latestMeanLuminance.toInt()
         if (latestIsDark) {
             hapticManager.vibrateWarning()
-            // Auto-enable the torch if the environment is dark
             flashlightManager.autoTorch(true)
             ttsManager.speakImmediate(
                 "Environment is dark. Brightness level: $brightness out of 255. Torch is now on."
             )
         } else {
-            // Auto-disable the torch if the environment is bright enough
             flashlightManager.autoTorch(false)
             ttsManager.speakImmediate(
                 "Lighting is sufficient. Brightness level: $brightness out of 255. Torch is now off."
@@ -456,14 +570,14 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
         }
     }
 
+    // ── Bottom Sheet Controls ────────────────────────────────────────────
+
     private fun initBottomSheetControls() {
-        // Init bottom sheet settings
         fragmentCameraBinding.bottomSheetLayout.maxResultsValue.text =
             viewModel.currentMaxResults.toString()
         fragmentCameraBinding.bottomSheetLayout.thresholdValue.text =
             String.format("%.2f", viewModel.currentThreshold)
 
-        // When clicked, lower detection score threshold floor
         fragmentCameraBinding.bottomSheetLayout.thresholdMinus.setOnClickListener {
             if (objectDetectorHelper.threshold >= 0.1) {
                 objectDetectorHelper.threshold -= 0.1f
@@ -471,7 +585,6 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
             }
         }
 
-        // When clicked, raise detection score threshold floor
         fragmentCameraBinding.bottomSheetLayout.thresholdPlus.setOnClickListener {
             if (objectDetectorHelper.threshold <= 0.8) {
                 objectDetectorHelper.threshold += 0.1f
@@ -479,7 +592,6 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
             }
         }
 
-        // When clicked, reduce the number of objects that can be detected at a time
         fragmentCameraBinding.bottomSheetLayout.maxResultsMinus.setOnClickListener {
             if (objectDetectorHelper.maxResults > 1) {
                 objectDetectorHelper.maxResults--
@@ -487,7 +599,6 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
             }
         }
 
-        // When clicked, increase the number of objects that can be detected at a time
         fragmentCameraBinding.bottomSheetLayout.maxResultsPlus.setOnClickListener {
             if (objectDetectorHelper.maxResults < 5) {
                 objectDetectorHelper.maxResults++
@@ -495,8 +606,6 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
             }
         }
 
-        // When clicked, change the underlying hardware used for inference. Current options are CPU
-        // GPU, and NNAPI
         fragmentCameraBinding.bottomSheetLayout.spinnerDelegate.setSelection(
             viewModel.currentDelegate,
             false
@@ -522,7 +631,6 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
                 }
             }
 
-        // When clicked, change the underlying model used for object detection
         fragmentCameraBinding.bottomSheetLayout.spinnerModel.setSelection(
             viewModel.currentModel,
             false
@@ -549,7 +657,6 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
             }
     }
 
-    // Update the values displayed in the bottom sheet. Reset detector.
     private fun updateControlsUi() {
         fragmentCameraBinding.bottomSheetLayout.maxResultsValue.text =
             objectDetectorHelper.maxResults.toString()
@@ -561,51 +668,43 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
             objectDetectorHelper.setupObjectDetector()
         }
 
-        // Clear debounce state since detection parameters changed
         objectDetectorHelper.clearDebounceState()
+        sceneAggregator.resetCooldown()
 
         fragmentCameraBinding.overlay.clear()
         fragmentCameraBinding.highContrastOverlay.clear()
     }
 
-    // Initialize CameraX, and prepare to bind the camera use cases
+    // ── Camera Setup ─────────────────────────────────────────────────────
+
     private fun setUpCamera() {
         val cameraProviderFuture =
             ProcessCameraProvider.getInstance(requireContext())
         cameraProviderFuture.addListener(
             {
-                // CameraProvider
                 cameraProvider = cameraProviderFuture.get()
-
-                // Build and bind the camera use cases
                 bindCameraUseCases()
             },
             ContextCompat.getMainExecutor(requireContext())
         )
     }
 
-    // Declare and bind preview, capture and analysis use cases
     @SuppressLint("UnsafeOptInUsageError")
     private fun bindCameraUseCases() {
-
-        // CameraProvider
         val cameraProvider =
             cameraProvider
                 ?: throw IllegalStateException("Camera initialization failed.")
 
-        // CameraSelector - makes assumption that we're only using the back camera
         val cameraSelector =
             CameraSelector.Builder()
                 .requireLensFacing(CameraSelector.LENS_FACING_BACK).build()
 
-        // Preview. Only using the 4:3 ratio because this is the closest to our models
         preview =
             Preview.Builder()
                 .setTargetAspectRatio(AspectRatio.RATIO_4_3)
                 .setTargetRotation(fragmentCameraBinding.viewFinder.display.rotation)
                 .build()
 
-        // ImageAnalysis. Using RGBA 8888 to match how our models work
         imageAnalyzer =
             ImageAnalysis.Builder()
                 .setTargetAspectRatio(AspectRatio.RATIO_4_3)
@@ -613,7 +712,6 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(OUTPUT_IMAGE_FORMAT_RGBA_8888)
                 .build()
-                // The analyzer can then be assigned to the instance
                 .also {
                     it.setAnalyzer(
                         backgroundExecutor,
@@ -621,12 +719,9 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
                     )
                 }
 
-        // Must unbind the use-cases before rebinding them
         cameraProvider.unbindAll()
 
         try {
-            // A variable number of use-cases can be passed here -
-            // camera provides access to CameraControl & CameraInfo
             camera = cameraProvider.bindToLifecycle(
                 this,
                 cameraSelector,
@@ -634,52 +729,48 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
                 imageAnalyzer
             )
 
-            // Pass the camera reference to FlashlightManager for torch control
             flashlightManager.camera = camera
-
-            // Attach the viewfinder's surface provider to preview use case
             preview?.setSurfaceProvider(fragmentCameraBinding.viewFinder.surfaceProvider)
 
-            // Start voice listening after camera is ready
             startVoiceListening()
         } catch (exc: Exception) {
             Log.e(TAG, "Use case binding failed", exc)
         }
     }
 
-    /**
-     * Start voice listening after TTS has had time to finish any announcements.
-     */
     private fun startVoiceListening() {
-        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+        mainHandler.postDelayed({
             if (isAdded && this::voiceCommandManager.isInitialized) {
                 voiceCommandManager.startListening()
             }
         }, VOICE_LISTENING_DELAY_MS)
     }
 
+    // ── Composite Analyzer ───────────────────────────────────────────────
+
     /**
-     * Creates a composite analyzer with frame throttling.
+     * Creates a composite analyzer with frame throttling and battery optimization.
      *
-     * Guarantees that only one frame is being processed at a time:
-     * if the previous frame is still analyzing, the new frame is
-     * dropped immediately (closed without processing). This prevents
-     * frame accumulation and ensures zero memory leaks.
+     * **Battery optimization:** Processes 1 out of every 3 frames (~10 FPS instead
+     * of 30 FPS), reducing CPU/GPU load by ~66%. Luminance analysis still runs on
+     * every frame for accurate auto-torch response.
+     *
+     * **Frame throttling:** Prevents frame accumulation when the previous frame
+     * is still being analyzed.
      *
      * Frame processing pipeline:
-     *  1. LuminanceAnalyzer — reads Y plane (no close)
-     *  2. Create shared bitmap from imageProxy, close proxy
-     *  3. BarcodeAnalyzer — scans for UPC/EAN/QR on bitmap
-     *  4. FaceDetectorHelper — detects faces on bitmap
-     *  5. TextRecognitionHelper (if OCR requested) OR ObjectDetectorHelper
-     *  6. Recycle shared bitmap
+     *  1. LuminanceAnalyzer — reads Y plane (every frame, no close)
+     *  2. Frame skip check — skip OD/OCR/barcode/face on 2 of 3 frames
+     *  3. Create shared bitmap from imageProxy, close proxy
+     *  4. BarcodeAnalyzer — scans for UPC/EAN/QR on bitmap
+     *  5. FaceDetectorHelper — detects faces on bitmap
+     *  6. TextRecognitionHelper (if OCR requested) OR ObjectDetectorHelper
      */
     private fun createCompositeAnalyzer(): ImageAnalysis.Analyzer {
         val luminanceAnalyzer = LuminanceAnalyzer { isDark, meanLuminance ->
             latestIsDark = isDark
             latestMeanLuminance = meanLuminance
 
-            // Auto-torch per frame based on hysteresis state
             activity?.runOnUiThread {
                 if (isAdded && this::flashlightManager.isInitialized) {
                     flashlightManager.autoTorch(isDark)
@@ -688,7 +779,17 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
         }
 
         return ImageAnalysis.Analyzer { imageProxy ->
-            // Frame throttling: skip this frame if the previous one is still being analyzed
+            // Always run luminance on every frame for accurate auto-torch
+            luminanceAnalyzer.analyzeLuminance(imageProxy)
+
+            // Battery optimization: process 1 of every 3 frames
+            val count = frameCounter.incrementAndGet()
+            if (count % FRAME_SKIP_RATIO != 0) {
+                imageProxy.close()
+                return@Analyzer
+            }
+
+            // Frame throttling: skip if previous frame still processing
             if (!isAnalyzing.compareAndSet(false, true)) {
                 imageProxy.close()
                 return@Analyzer
@@ -696,10 +797,7 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
 
             var sharedBitmap: android.graphics.Bitmap? = null
             try {
-                // Step 1: Run luminance analysis (reads Y plane, does not close imageProxy)
-                luminanceAnalyzer.analyzeLuminance(imageProxy)
-
-                // Step 2: Create shared bitmap from the RGBA_8888 frame
+                // Create shared bitmap from the RGBA_8888 frame
                 val rotationDegrees = imageProxy.imageInfo.rotationDegrees
                 sharedBitmap = android.graphics.Bitmap.createBitmap(
                     imageProxy.width, imageProxy.height,
@@ -708,19 +806,15 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
                 imageProxy.use { sharedBitmap!!.copyPixelsFromBuffer(imageProxy.planes[0].buffer) }
                 imageProxy.close()
 
-                // Step 3 & 4: Run barcode and face detection on the shared bitmap
-                // Both are async ML Kit tasks — use a CountDownLatch to wait
+                // Run barcode and face detection on the shared bitmap
                 val latch = CountDownLatch(2)
 
-                // Barcode scan
                 barcodeAnalyzer.processBitmap(
                     sharedBitmap, rotationDegrees,
                     onSuccess = { announcements ->
                         if (announcements.isNotEmpty()) {
                             activity?.runOnUiThread {
-                                if (isAdded) {
-                                    ttsManager.speak(announcements.first())
-                                }
+                                if (isAdded) ttsManager.speak(announcements.first())
                             }
                         }
                         latch.countDown()
@@ -728,15 +822,12 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
                     onError = { latch.countDown() }
                 )
 
-                // Face detection
                 faceDetectorHelper.processBitmap(
                     sharedBitmap, rotationDegrees,
                     onSuccess = { announcements ->
                         if (announcements.isNotEmpty()) {
                             activity?.runOnUiThread {
-                                if (isAdded) {
-                                    ttsManager.speak(announcements.first())
-                                }
+                                if (isAdded) ttsManager.speak(announcements.first())
                             }
                         }
                         latch.countDown()
@@ -744,12 +835,10 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
                     onError = { latch.countDown() }
                 )
 
-                // Wait for barcode + face to complete (max 3s timeout)
                 latch.await(3, TimeUnit.SECONDS)
 
-                // Step 5: Route to OCR or OD
+                // Route to OCR or OD
                 if (ocrRequested.compareAndSet(true, false)) {
-                    // OCR path — processBitmap does not close the shared bitmap
                     textRecognitionHelper.processBitmap(
                         sharedBitmap, rotationDegrees,
                         onSuccess = { recognizedText ->
@@ -773,7 +862,6 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
                         }
                     )
                 } else {
-                    // Object detection path — pass bitmap directly
                     objectDetectorHelper.detectLivestreamBitmap(
                         sharedBitmap, SystemClock.uptimeMillis()
                     )
@@ -787,16 +875,15 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
         }
     }
 
+    // ── OD Results Callback ──────────────────────────────────────────────
+
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
         imageAnalyzer?.targetRotation =
             fragmentCameraBinding.viewFinder.display.rotation
     }
 
-    // Update UI after objects have been detected. Extracts original image height/width
-    // to scale and place bounding boxes properly through OverlayView
     override fun onResults(resultBundle: ObjectDetectorHelper.ResultBundle) {
-        // Store latest results for TTS readout on gesture
         latestDetectionResult = resultBundle
 
         activity?.runOnUiThread {
@@ -804,7 +891,6 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
                 fragmentCameraBinding.bottomSheetLayout.inferenceTimeVal.text =
                     String.format("%d ms", resultBundle.inferenceTime)
 
-                // Pass necessary information to both overlays for drawing on the canvas
                 val detectionResult = resultBundle.results[0]
                 if (isAdded) {
                     fragmentCameraBinding.overlay.setResults(
@@ -822,7 +908,6 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
                     )
                 }
 
-                // Force a redraw
                 fragmentCameraBinding.overlay.invalidate()
                 fragmentCameraBinding.highContrastOverlay.invalidate()
             }
@@ -842,5 +927,17 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
 
     companion object {
         private const val VOICE_LISTENING_DELAY_MS = 2000L
+
+        /**
+         * Process 1 out of every 3 frames for battery optimization.
+         * At 30 FPS camera output, this yields ~10 FPS processing.
+         */
+        const val FRAME_SKIP_RATIO = 3
+
+        /**
+         * Interval for automatic scene summary announcements.
+         * Fires every 6 seconds while the camera is active.
+         */
+        const val SCENE_SUMMARY_INTERVAL_MS = 6000L
     }
 }

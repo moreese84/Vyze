@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Vyze</string>
+
+    <!-- ── Spatial Announcements ─────────────────────────────────────── -->
+    <string name="spatial_ahead">正前方</string>
+    <string name="spatial_left">在您左边</string>
+    <string name="spatial_right">在您右边</string>
+    <string name="spatial_close">近处</string>
+    <string name="spatial_far">远处</string>
+    <string name="spatial_facing_you">面对您</string>
+    <string name="spatial_side_profile">侧面</string>
+    <string name="spatial_person_single">一个人%1$s，%2$s，%3$s</string>
+    <string name="spatial_person_multi">检测到%1$d个人%2$s</string>
+    <string name="spatial_scene_summary">您正面对%1$s。</string>
+
+    <!-- ── Onboarding ────────────────────────────────────────────────── -->
+    <string name="onboarding_welcome">欢迎使用Vyze。我是您的眼睛。让我教您如何使用我。</string>
+    <string name="onboarding_single_tap">在屏幕上任意位置点击一次，检测周围的物体。我会告诉您我看到了什么以及它在哪里。</string>
+    <string name="onboarding_double_tap">双击任意位置来读取文字。我会扫描标牌、标签和文件。</string>
+    <string name="onboarding_long_press">长按以检查光线水平。如果环境昏暗，我会打开手电筒。</string>
+    <string name="onboarding_swipe">左右滑动以在相机和图库模式之间切换。</string>
+    <string name="onboarding_complete">这就是全部了。您已经准备好了。我随时在这里帮助您。</string>
+
+    <!-- ── Object Detection ──────────────────────────────────────────── -->
+    <string name="od_no_objects">尚未检测到物体。请稍候。</string>
+    <string name="od_no_visible">当前没有可见的物体。</string>
+    <string name="od_detected">%1$s，置信度%2$d%%。</string>
+    <string name="od_no_detected">未检测到物体。</string>
+
+    <!-- ── OCR ───────────────────────────────────────────────────────── -->
+    <string name="ocr_reading">正在读取文字&#8230;</string>
+    <string name="ocr_no_text">未检测到文字</string>
+    <string name="ocr_failed">文字识别失败。请重试。</string>
+
+    <!-- ── Light Conditions ──────────────────────────────────────────── -->
+    <string name="light_not_measured">光线水平尚未测量。请稍候。</string>
+    <string name="light_dark">环境昏暗。亮度水平：%1$d/255。手电筒已开启。</string>
+    <string name="light_sufficient">光线充足。亮度水平：%1$d/255。手电筒已关闭。</string>
+
+    <!-- ── Currency ──────────────────────────────────────────────────── -->
+    <string name="currency_rm100">检测到100令吉纸币</string>
+    <string name="currency_rm50">检测到50令吉纸币</string>
+    <string name="currency_rm20">检测到20令吉纸币</string>
+    <string name="currency_rm10">检测到10令吉纸币</string>
+    <string name="currency_rm5">检测到5令吉纸币</string>
+    <string name="currency_rm1">检测到1令吉纸币</string>
+    <string name="currency_usd100">检测到100美元纸币</string>
+    <string name="currency_usd50">检测到50美元纸币</string>
+    <string name="currency_usd20">检测到20美元纸币</string>
+    <string name="currency_usd10">检测到10美元纸币</string>
+    <string name="currency_usd5">检测到5美元纸币</string>
+    <string name="currency_usd1">检测到1美元纸币</string>
+    <string name="currency_sen50">检测到50分硬币</string>
+    <string name="currency_sen20">检测到20分硬币</string>
+    <string name="currency_sen10">检测到10分硬币</string>
+    <string name="currency_sen5">检测到5分硬币</string>
+
+    <!-- ── Color Labels ──────────────────────────────────────────────── -->
+    <string name="color_black">黑色</string>
+    <string name="color_white">白色</string>
+    <string name="color_grey">灰色</string>
+    <string name="color_red">红色</string>
+    <string name="color_orange">橙色</string>
+    <string name="color_yellow">黄色</string>
+    <string name="color_green">绿色</string>
+    <string name="color_cyan">青色</string>
+    <string name="color_blue">蓝色</string>
+    <string name="color_purple">紫色</string>
+    <string name="color_pink">粉色</string>
+    <string name="color_brown">棕色</string>
+    <string name="color_dark_prefix">深色%1$s</string>
+    <string name="color_bright_prefix">亮%1$s</string>
+
+    <!-- ── Barcode ───────────────────────────────────────────────────── -->
+    <string name="barcode_upc">检测到UPC条码：%1$s</string>
+    <string name="barcode_ean13">检测到EAN-13条码：%1$s</string>
+    <string name="barcode_ean8">检测到EAN-8条码：%1$s</string>
+    <string name="barcode_qr">检测到二维码：%1$s</string>
+    <string name="barcode_generic">检测到条码：%1$s</string>
+
+    <!-- ── Voice Commands ────────────────────────────────────────────── -->
+    <string name="voice_listening">正在聆听指令&#8230;</string>
+    <string name="voice_stopped">聆听已停止。</string>
+
+    <!-- ── TTS Settings ──────────────────────────────────────────────── -->
+    <string name="tts_settings_title">语音设置</string>
+    <string name="tts_settings_subtitle">调整Vyze对您说话的方式</string>
+    <string name="tts_speech_speed">语速</string>
+    <string name="tts_voice_pitch">音调</string>
+    <string name="tts_audio_volume">音量</string>
+    <string name="tts_test_voice">测试语音</string>
+    <string name="tts_sample_phrase">这是我使用您选择的设置时的声音。</string>
+    <string name="tts_language">语音语言</string>
+    <string name="tts_lang_english">English</string>
+    <string name="tts_lang_malay">Bahasa Melayu</string>
+    <string name="tts_lang_chinese">普通话</string>
+
+    <!-- ── Scene ─────────────────────────────────────────────────────── -->
+    <string name="scene_no_data">场景数据暂不可用。</string>
+    <string name="scene_no_visible">当前没有可见的物体。</string>
+    <string name="scene_summary_not_available">场景摘要暂不可用。请稍候。</string>
+</resources>

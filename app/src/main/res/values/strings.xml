@@ -1,33 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!--
-    ~ Copyright 2022 The TensorFlow Authors. All Rights Reserved.
-    ~
-    ~ Licensed under the Apache License, Version 2.0 (the "License");
-    ~ you may not use this file except in compliance with the License.
-    ~ You may obtain a copy of the License at
-    ~
-    ~       http://www.apache.org/licenses/LICENSE-2.0
-    ~
-    ~ Unless required by applicable law or agreed to in writing, software
-    ~ distributed under the License is distributed on an "AS IS" BASIS,
-    ~ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-    ~ See the License for the specific language governing permissions and
-    ~ limitations under the License.
--->
 <resources>
     <string name="app_name">Vyze</string>
 
+    <!-- ── UI Labels ─────────────────────────────────────────────────── -->
     <string name="alt_bottom_sheet_chevron">Bottom sheet expandable indicator</string>
-
-    <string name="alt_bottom_sheet_max_results_button_minus">Decreasing maxium detected results
-        button</string>
-    <string name="alt_bottom_sheet_max_results_button_plus">Increasing maxium detected results
-        button</string>
-    <string name="alt_bottom_sheet_threshold_button_minus">Decreasing threshold of detected object
-        results button</string>
-    <string name="alt_bottom_sheet_threshold_button_plus">Increasing threshold of detected object
-        results button</string>
-
+    <string name="alt_bottom_sheet_max_results_button_minus">Decreasing maxium detected results button</string>
+    <string name="alt_bottom_sheet_max_results_button_plus">Increasing maxium detected results button</string>
+    <string name="alt_bottom_sheet_threshold_button_minus">Decreasing threshold of detected object results button</string>
+    <string name="alt_bottom_sheet_threshold_button_plus">Increasing threshold of detected object results button</string>
     <string name="label_inference_time">Inference Time</string>
     <string name="label_fps">Frames per Second</string>
     <string name="label_confidence_threshold">Threshold</string>
@@ -36,16 +16,113 @@
     <string name="label_models">ML Model</string>
     <string name="menu_camera">Camera</string>
     <string name="menu_gallery">Gallery</string>
-    <string name="tv_gallery_placeholder">Click + to add an image or a video
-        to begin running the object detection.</string>
+    <string name="tv_gallery_placeholder">Click + to add an image or a video to begin running the object detection.</string>
 
     <string-array name="delegate_spinner_titles">
         <item>CPU</item>
         <item>GPU</item>
     </string-array>
-
     <string-array name="models_spinner_titles">
         <item>EfficientDet Lite0</item>
         <item>EfficientDet Lite2</item>
     </string-array>
+
+    <!-- ── Spatial Announcements ─────────────────────────────────────── -->
+    <string name="spatial_ahead">directly ahead</string>
+    <string name="spatial_left">on your left</string>
+    <string name="spatial_right">on your right</string>
+    <string name="spatial_close">close</string>
+    <string name="spatial_far">far</string>
+    <string name="spatial_facing_you">facing you</string>
+    <string name="spatial_side_profile">side profile</string>
+    <string name="spatial_person_single">Person %1$s, %2$s, %3$s</string>
+    <string name="spatial_person_multi">%1$d people detected %2$s</string>
+    <string name="spatial_scene_summary">You are facing %1$s.</string>
+
+    <!-- ── Onboarding ────────────────────────────────────────────────── -->
+    <string name="onboarding_welcome">Welcome to Vyze. I am your eyes. Let me teach you how to use me.</string>
+    <string name="onboarding_single_tap">Tap once anywhere on the screen to detect objects around you. I will tell you what I see and where it is.</string>
+    <string name="onboarding_double_tap">Double tap anywhere to read text. I will scan for signs, labels, and documents.</string>
+    <string name="onboarding_long_press">Press and hold to check the light level. I will turn on the flashlight if it is dark.</string>
+    <string name="onboarding_swipe">Swipe left or right to switch between camera and gallery modes.</string>
+    <string name="onboarding_complete">That is everything. You are ready to go. I am always here to help.</string>
+
+    <!-- ── Object Detection ──────────────────────────────────────────── -->
+    <string name="od_no_objects">No objects detected yet. Please wait.</string>
+    <string name="od_no_visible">No objects currently visible.</string>
+    <string name="od_detected">%1$s, confidence %2$d percent.</string>
+    <string name="od_no_detected">No objects detected.</string>
+
+    <!-- ── OCR ───────────────────────────────────────────────────────── -->
+    <string name="ocr_reading">Reading text&#8230;</string>
+    <string name="ocr_no_text">No text detected</string>
+    <string name="ocr_failed">Text recognition failed. Please try again.</string>
+
+    <!-- ── Light Conditions ──────────────────────────────────────────── -->
+    <string name="light_not_measured">Light level not yet measured. Please wait.</string>
+    <string name="light_dark">Environment is dark. Brightness level: %1$d out of 255. Torch is now on.</string>
+    <string name="light_sufficient">Lighting is sufficient. Brightness level: %1$d out of 255. Torch is now off.</string>
+
+    <!-- ── Currency ──────────────────────────────────────────────────── -->
+    <string name="currency_rm100">100 Ringgit note detected</string>
+    <string name="currency_rm50">50 Ringgit note detected</string>
+    <string name="currency_rm20">20 Ringgit note detected</string>
+    <string name="currency_rm10">10 Ringgit note detected</string>
+    <string name="currency_rm5">5 Ringgit note detected</string>
+    <string name="currency_rm1">1 Ringgit note detected</string>
+    <string name="currency_usd100">100 Dollar note detected</string>
+    <string name="currency_usd50">50 Dollar note detected</string>
+    <string name="currency_usd20">20 Dollar note detected</string>
+    <string name="currency_usd10">10 Dollar note detected</string>
+    <string name="currency_usd5">5 Dollar note detected</string>
+    <string name="currency_usd1">1 Dollar note detected</string>
+    <string name="currency_sen50">50 sen coin detected</string>
+    <string name="currency_sen20">20 sen coin detected</string>
+    <string name="currency_sen10">10 sen coin detected</string>
+    <string name="currency_sen5">5 sen coin detected</string>
+
+    <!-- ── Color Labels ──────────────────────────────────────────────── -->
+    <string name="color_black">Black</string>
+    <string name="color_white">White</string>
+    <string name="color_grey">Grey</string>
+    <string name="color_red">Red</string>
+    <string name="color_orange">Orange</string>
+    <string name="color_yellow">Yellow</string>
+    <string name="color_green">Green</string>
+    <string name="color_cyan">Cyan</string>
+    <string name="color_blue">Blue</string>
+    <string name="color_purple">Purple</string>
+    <string name="color_pink">Pink</string>
+    <string name="color_brown">Brown</string>
+    <string name="color_dark_prefix">Dark %1$s</string>
+    <string name="color_bright_prefix">Bright %1$s</string>
+
+    <!-- ── Barcode ───────────────────────────────────────────────────── -->
+    <string name="barcode_upc">UPC code detected: %1$s</string>
+    <string name="barcode_ean13">EAN-13 code detected: %1$s</string>
+    <string name="barcode_ean8">EAN-8 code detected: %1$s</string>
+    <string name="barcode_qr">QR Code detected: %1$s</string>
+    <string name="barcode_generic">Code detected: %1$s</string>
+
+    <!-- ── Voice Commands ────────────────────────────────────────────── -->
+    <string name="voice_listening">Listening for commands&#8230;</string>
+    <string name="voice_stopped">Listening stopped.</string>
+
+    <!-- ── TTS Settings ──────────────────────────────────────────────── -->
+    <string name="tts_settings_title">Voice Settings</string>
+    <string name="tts_settings_subtitle">Adjust how Vyze speaks to you</string>
+    <string name="tts_speech_speed">Speech Speed</string>
+    <string name="tts_voice_pitch">Voice Pitch</string>
+    <string name="tts_audio_volume">Audio Volume</string>
+    <string name="tts_test_voice">Test Voice</string>
+    <string name="tts_sample_phrase">This is how I will sound with your chosen settings.</string>
+    <string name="tts_language">Speech Language</string>
+    <string name="tts_lang_english">English</string>
+    <string name="tts_lang_malay">Bahasa Melayu</string>
+    <string name="tts_lang_chinese">Mandarin</string>
+
+    <!-- ── Scene ─────────────────────────────────────────────────────── -->
+    <string name="scene_no_data">No scene data available yet.</string>
+    <string name="scene_no_visible">No objects currently visible.</string>
+    <string name="scene_summary_not_available">Scene summary not available. Please wait.</string>
 </resources>

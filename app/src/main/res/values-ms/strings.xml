@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Vyze</string>
+
+    <!-- ── Spatial Announcements ─────────────────────────────────────── -->
+    <string name="spatial_ahead">terus di hadapan</string>
+    <string name="spatial_left">di sebelah kiri anda</string>
+    <string name="spatial_right">di sebelah kanan anda</string>
+    <string name="spatial_close">dekat</string>
+    <string name="spatial_far">jauh</string>
+    <string name="spatial_facing_you">menghadap anda</string>
+    <string name="spatial_side_profile">profil sisi</string>
+    <string name="spatial_person_single">Orang %1$s, %2$s, %3$s</string>
+    <string name="spatial_person_multi">%1$d orang dikesan %2$s</string>
+    <string name="spatial_scene_summary">Anda sedang menghadap %1$s.</string>
+
+    <!-- ── Onboarding ────────────────────────────────────────────────── -->
+    <string name="onboarding_welcome">Selamat datang ke Vyze. Saya mata anda. Biar saya ajar anda cara mengguna saya.</string>
+    <string name="onboarding_single_tap">Sentuh sekali di mana-mana skrin untuk mengesan objek di sekeliling anda. Saya akan beritahu apa yang saya nampak dan di mana ia berada.</string>
+    <string name="onboarding_double_tap">Sentuh dua kali di mana-mana untuk membaca teks. Saya akan mengimbas tanda, label, dan dokumen.</string>
+    <string name="onboarding_long_press">Tekan dan tahan untuk menyemak tahap cahaya. Saya akan menghidupkan suluh jika keadaan gelap.</string>
+    <string name="onboarding_swipe">Geser ke kiri atau kanan untuk bertukar antara mod kamera dan galeri.</string>
+    <string name="onboarding_complete">Itu sahaja. Anda sudah bersedia. Saya sentiasa di sini untuk membantu.</string>
+
+    <!-- ── Object Detection ──────────────────────────────────────────── -->
+    <string name="od_no_objects">Tiada objek dikesan lagi. Sila tunggu.</string>
+    <string name="od_no_visible">Tiada objek kelihatan buat masa ini.</string>
+    <string name="od_detected">%1$s, keyakinan %2$d peratus.</string>
+    <string name="od_no_detected">Tiada objek dikesan.</string>
+
+    <!-- ── OCR ───────────────────────────────────────────────────────── -->
+    <string name="ocr_reading">Membaca teks&#8230;</string>
+    <string name="ocr_no_text">Tiada teks dikesan</string>
+    <string name="ocr_failed">Pengecaman teks gagal. Sila cuba lagi.</string>
+
+    <!-- ── Light Conditions ──────────────────────────────────────────── -->
+    <string name="light_not_measured">Tahap cahaya belum diukur. Sila tunggu.</string>
+    <string name="light_dark">Keadaan gelap. Tahap kecerahan: %1$d daripada 255. Suluh kini dihidupkan.</string>
+    <string name="light_sufficient">Pencahayaan mencukupi. Tahap kecerahan: %1$d daripada 255. Suluh kini dimatikan.</string>
+
+    <!-- ── Currency ──────────────────────────────────────────────────── -->
+    <string name="currency_rm100">Wang kertas 100 Ringgit dikesan</string>
+    <string name="currency_rm50">Wang kertas 50 Ringgit dikesan</string>
+    <string name="currency_rm20">Wang kertas 20 Ringgit dikesan</string>
+    <string name="currency_rm10">Wang kertas 10 Ringgit dikesan</string>
+    <string name="currency_rm5">Wang kertas 5 Ringgit dikesan</string>
+    <string name="currency_rm1">Wang kertas 1 Ringgit dikesan</string>
+    <string name="currency_usd100">Wang kertas 100 Dolar dikesan</string>
+    <string name="currency_usd50">Wang kertas 50 Dolar dikesan</string>
+    <string name="currency_usd20">Wang kertas 20 Dolar dikesan</string>
+    <string name="currency_usd10">Wang kertas 10 Dolar dikesan</string>
+    <string name="currency_usd5">Wang kertas 5 Dolar dikesan</string>
+    <string name="currency_usd1">Wang kertas 1 Dolar dikesan</string>
+    <string name="currency_sen50">Syiling 50 sen dikesan</string>
+    <string name="currency_sen20">Syiling 20 sen dikesan</string>
+    <string name="currency_sen10">Syiling 10 sen dikesan</string>
+    <string name="currency_sen5">Syiling 5 sen dikesan</string>
+
+    <!-- ── Color Labels ──────────────────────────────────────────────── -->
+    <string name="color_black">Hitam</string>
+    <string name="color_white">Putih</string>
+    <string name="color_grey">Kelabu</string>
+    <string name="color_red">Merah</string>
+    <string name="color_orange">Oren</string>
+    <string name="color_yellow">Kuning</string>
+    <string name="color_green">Hijau</string>
+    <string name="color_cyan">Sian</string>
+    <string name="color_blue">Biru</string>
+    <string name="color_purple">Ungu</string>
+    <string name="color_pink">Merah jambu</string>
+    <string name="color_brown">Coklat</string>
+    <string name="color_dark_prefix">%1$s gelap</string>
+    <string name="color_bright_prefix">%1$s terang</string>
+
+    <!-- ── Barcode ───────────────────────────────────────────────────── -->
+    <string name="barcode_upc">Kod UPC dikesan: %1$s</string>
+    <string name="barcode_ean13">Kod EAN-13 dikesan: %1$s</string>
+    <string name="barcode_ean8">Kod EAN-8 dikesan: %1$s</string>
+    <string name="barcode_qr">Kod QR dikesan: %1$s</string>
+    <string name="barcode_generic">Kod dikesan: %1$s</string>
+
+    <!-- ── Voice Commands ────────────────────────────────────────────── -->
+    <string name="voice_listening">Mendengar arahan&#8230;</string>
+    <string name="voice_stopped">Dengar berhenti.</string>
+
+    <!-- ── TTS Settings ──────────────────────────────────────────────── -->
+    <string name="tts_settings_title">Tetapan Suara</string>
+    <string name="tts_settings_subtitle">Suaikan bagaimana Vyze bercakap dengan anda</string>
+    <string name="tts_speech_speed">Kelajuan Pertuturan</string>
+    <string name="tts_voice_pitch">Nada Suara</string>
+    <string name="tts_audio_volume">Volum Audio</string>
+    <string name="tts_test_voice">Uji Suara</string>
+    <string name="tts_sample_phrase">Ini adalah bagaimana saya akan berbunyi dengan tetapan pilihan anda.</string>
+    <string name="tts_language">Bahasa Pertuturan</string>
+    <string name="tts_lang_english">English</string>
+    <string name="tts_lang_malay">Bahasa Melayu</string>
+    <string name="tts_lang_chinese">Mandarin</string>
+
+    <!-- ── Scene ─────────────────────────────────────────────────────── -->
+    <string name="scene_no_data">Data pemandangan belum tersedia.</string>
+    <string name="scene_no_visible">Tiada objek kelihatan buat masa ini.</string>
+    <string name="scene_summary_not_available">Ringkasan pemandangan belum tersedia. Sila tunggu.</string>
+</resources>

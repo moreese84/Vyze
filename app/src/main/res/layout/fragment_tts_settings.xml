@@ -17,28 +17,59 @@
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Voice Settings"
+            android:text="@string/tts_settings_title"
             android:textSize="28sp"
             android:textStyle="bold"
             android:textColor="@android:color/white"
             android:layout_marginBottom="8dp"
-            android:importantForAccessibility="yes"
-            android:labelFor="@id/slider_speech_rate" />
+            android:importantForAccessibility="yes" />
 
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Adjust how Vyze speaks to you"
+            android:text="@string/tts_settings_subtitle"
             android:textSize="16sp"
             android:textColor="#AAAAAA"
+            android:layout_marginBottom="24dp" />
+
+        <!-- Language Selector -->
+        <TextView
+            android:id="@+id/label_language"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/tts_language"
+            android:textSize="22sp"
+            android:textStyle="bold"
+            android:textColor="@android:color/white"
+            android:layout_marginBottom="4dp" />
+
+        <TextView
+            android:id="@+id/value_language"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="English"
+            android:textSize="36sp"
+            android:textStyle="bold"
+            android:textColor="#FFD700"
+            android:layout_marginBottom="8dp" />
+
+        <Spinner
+            android:id="@+id/spinner_language"
+            android:layout_width="match_parent"
+            android:layout_height="56dp"
+            android:background="#FFD700"
+            android:minHeight="48dp"
+            android:contentDescription="Speech language selector"
             android:layout_marginBottom="32dp" />
+
+        <!-- Speech Rate -->
 
         <!-- Speech Rate -->
         <TextView
             android:id="@+id/label_speech_rate"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="Speech Speed"
+            android:text="@string/tts_speech_speed"
             android:textSize="22sp"
             android:textStyle="bold"
             android:textColor="@android:color/white"
@@ -71,7 +102,7 @@
             android:id="@+id/label_pitch"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="Voice Pitch"
+            android:text="@string/tts_voice_pitch"
             android:textSize="22sp"
             android:textStyle="bold"
             android:textColor="@android:color/white"
@@ -104,7 +135,7 @@
             android:id="@+id/label_volume"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="Audio Volume"
+            android:text="@string/tts_audio_volume"
             android:textSize="22sp"
             android:textStyle="bold"
             android:textColor="@android:color/white"
@@ -137,7 +168,7 @@
             android:id="@+id/btn_test_voice"
             android:layout_width="match_parent"
             android:layout_height="64dp"
-            android:text="Test Voice"
+            android:text="@string/tts_test_voice"
             android:textSize="20sp"
             android:textStyle="bold"
             android:backgroundTint="#FFD700"

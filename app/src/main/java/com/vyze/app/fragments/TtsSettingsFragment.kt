@@ -5,8 +5,11 @@ import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.SeekBar
+import android.widget.Spinner
 import android.widget.TextView
 import androidx.fragment.app.Fragment
 import com.vyze.app.R
@@ -38,6 +41,8 @@ class TtsSettingsFragment : Fragment() {
     private lateinit var prefs: android.content.SharedPreferences
 
     // Views
+    private lateinit var valueLanguage: TextView
+    private lateinit var spinnerLanguage: Spinner
     private lateinit var valueSpeechRate: TextView
     private lateinit var sliderSpeechRate: SeekBar
     private lateinit var valuePitch: TextView
@@ -71,6 +76,8 @@ class TtsSettingsFragment : Fragment() {
         ttsManager.applySettings(requireContext())
 
         // Bind views
+        valueLanguage = view.findViewById(R.id.value_language)
+        spinnerLanguage = view.findViewById(R.id.spinner_language)
         valueSpeechRate = view.findViewById(R.id.value_speech_rate)
         sliderSpeechRate = view.findViewById(R.id.slider_speech_rate)
         valuePitch = view.findViewById(R.id.value_pitch)
@@ -83,6 +90,7 @@ class TtsSettingsFragment : Fragment() {
         loadSavedSettings()
 
         // Setup listeners
+        setupLanguageSpinner()
         setupSpeechRateSlider()
         setupPitchSlider()
         setupVolumeSlider()
@@ -93,20 +101,25 @@ class TtsSettingsFragment : Fragment() {
      * Loads saved settings from SharedPreferences and positions sliders accordingly.
      */
     private fun loadSavedSettings() {
-        val savedRate = prefs.getFloat(TTSManager.KEY_SPEECH_RATE, TTSManager.DEFAULT_SPEECH_RATE)
-        val savedPitch = prefs.getFloat(TTSManager.KEY_PITCH, TTSManager.DEFAULT_PITCH)
-        val savedVolume = prefs.getFloat(TTSManager.KEY_VOLUME, TTSManager.DEFAULT_VOLUME)
+        // Language
+        val savedLang = prefs.getString(TTSManager.KEY_LANGUAGE, TTSManager.LANGUAGE_ENGLISH)
+            ?: TTSManager.LANGUAGE_ENGLISH
+        val langIndex = TTSManager.SUPPORTED_LANGUAGES.indexOf(savedLang).coerceAtLeast(0)
+        spinnerLanguage.setSelection(langIndex)
+        valueLanguage.text = languageDisplayName(savedLang)
 
-        // Convert values to SeekBar positions
-        // Rate: 0.5–2.0 mapped to 0–150 (each step = 0.01)
+        // Rate
+        val savedRate = prefs.getFloat(TTSManager.KEY_SPEECH_RATE, TTSManager.DEFAULT_SPEECH_RATE)
         sliderSpeechRate.progress = ((savedRate - RATE_MIN) / RATE_STEP).toInt()
         valueSpeechRate.text = formatRate(savedRate)
 
-        // Pitch: 0.5–1.5 mapped to 0–100 (each step = 0.01)
+        // Pitch
+        val savedPitch = prefs.getFloat(TTSManager.KEY_PITCH, TTSManager.DEFAULT_PITCH)
         sliderPitch.progress = ((savedPitch - PITCH_MIN) / PITCH_STEP).toInt()
         valuePitch.text = String.format("%.2f", savedPitch)
 
-        // Volume: 0–1 mapped to 0–100
+        // Volume
+        val savedVolume = prefs.getFloat(TTSManager.KEY_VOLUME, TTSManager.DEFAULT_VOLUME)
         sliderVolume.progress = (savedVolume * 100).toInt()
         valueVolume.text = "${(savedVolume * 100).toInt()}%"
     }
@@ -222,13 +235,54 @@ class TtsSettingsFragment : Fragment() {
         editor.apply()
     }
 
+    // ── Language Selector ───────────────────────────────────────────────
+
+    private fun setupLanguageSpinner() {
+        val languageLabels = TTSManager.SUPPORTED_LANGUAGES.map { languageDisplayName(it) }
+        val adapter = ArrayAdapter(
+            requireContext(),
+            android.R.layout.simple_spinner_item,
+            languageLabels
+        )
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        spinnerLanguage.adapter = adapter
+
+        spinnerLanguage.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                val selectedKey = TTSManager.SUPPORTED_LANGUAGES[position]
+                val currentKey = prefs.getString(TTSManager.KEY_LANGUAGE, TTSManager.LANGUAGE_ENGLISH)
+
+                if (selectedKey != currentKey) {
+                    ttsManager.setLanguage(selectedKey, requireContext())
+                    valueLanguage.text = languageDisplayName(selectedKey)
+                    speakSample()
+                }
+            }
+
+            override fun onNothingSelected(parent: AdapterView<*>?) { /* no op */ }
+        }
+    }
+
+    private fun languageDisplayName(key: String): String {
+        return when (key) {
+            TTSManager.LANGUAGE_MALAY  -> requireContext().getString(R.string.tts_lang_malay)
+            TTSManager.LANGUAGE_CHINESE -> requireContext().getString(R.string.tts_lang_chinese)
+            else           -> requireContext().getString(R.string.tts_lang_english)
+        }
+    }
+
     // ── Sample Speaking ─────────────────────────────────────────────────────
 
     /**
      * Speaks a sample phrase so the user can hear the current TTS settings.
      */
     private fun speakSample() {
-        ttsManager.speakImmediate(SAMPLE_PHRASE)
+        val phrase = when (ttsManager.getCurrentLanguageKey()) {
+            TTSManager.LANGUAGE_MALAY  -> SAMPLE_PHRASE_MS
+            TTSManager.LANGUAGE_CHINESE -> SAMPLE_PHRASE_ZH
+            else           -> SAMPLE_PHRASE_EN
+        }
+        ttsManager.speakImmediate(phrase)
     }
 
     /**
@@ -265,7 +319,9 @@ class TtsSettingsFragment : Fragment() {
         private const val TAG = "TtsSettingsFragment"
 
         /** Sample phrase spoken on slider change and test button. */
-        const val SAMPLE_PHRASE = "This is how I will sound with your chosen settings."
+        const val SAMPLE_PHRASE_EN = "This is how I will sound with your chosen settings."
+        const val SAMPLE_PHRASE_MS = "Ini adalah bagaimana saya akan berbunyi dengan tetapan pilihan anda."
+        const val SAMPLE_PHRASE_ZH = "这是我使用您选择的设置时的声音。"
 
         /** Delay before speaking sample after slider stops moving (ms). */
         const val SAMPLE_DELAY_MS = 500L
