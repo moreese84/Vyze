@@ -101,8 +101,8 @@ dependencies {
     implementation("androidx.camera:camera-lifecycle:$camerax_version")
     implementation("androidx.camera:camera-view:$camerax_version")
 
-    // ML Kit Text Recognition
-    implementation("com.google.android.gms:play-services-mlkit-text-recognition:19.0.0")
+    // ML Kit Text Recognition (bundled — model is statically linked in the APK, fully offline)
+    implementation("com.google.mlkit:text-recognition:16.0.0")
 
     // MediaPipe
     implementation("com.google.mediapipe:tasks-vision:0.10.8")
