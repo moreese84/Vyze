@@ -54,7 +54,23 @@ class VyzeApplication : Application() {
     override fun onCreate() {
         super.onCreate()
         installGlobalErrorHandler()
+        pruneOldErrorLogs()
         Log.d(TAG, "VyzeApplication created")
+    }
+
+    /**
+     * Prune diagnostic error logs older than 7 days on every cold start.
+     * Prevents unbounded growth of the error_log table and limits the
+     * retention window for potentially sensitive diagnostic data.
+     */
+    private fun pruneOldErrorLogs() {
+        applicationScope.launch {
+            try {
+                errorLogRepository.pruneOldLogs(daysOld = 7)
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to prune old error logs", e)
+            }
+        }
     }
 
     // ── Global Error Handler ──────────────────────────────────────────

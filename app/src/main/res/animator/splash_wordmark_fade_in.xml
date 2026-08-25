@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<set xmlns:android="http://schemas.android.com/apk/res/android"
+    android:ordering="together">
+
+    <!-- Fade the wordmark in from transparent to opaque -->
+    <objectAnimator
+        android:propertyName="alpha"
+        android:valueFrom="0"
+        android:valueTo="1"
+        android:valueType="floatType"
+        android:duration="400"
+        android:interpolator="@android:interpolator/fast_out_slow_in" />
+
+    <!-- Slide the wordmark up from 6dp below center -->
+    <objectAnimator
+        android:propertyName="translateY"
+        android:valueFrom="6"
+        android:valueTo="0"
+        android:valueType="floatType"
+        android:duration="400"
+        android:interpolator="@android:interpolator/fast_out_slow_in" />
+</set>

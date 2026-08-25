@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<set xmlns:android="http://schemas.android.com/apk/res/android"
+    android:ordering="together">
+
+    <!-- Scale up slightly to 1.05 -->
+    <objectAnimator
+        android:propertyName="scaleX"
+        android:valueFrom="1"
+        android:valueTo="1.05"
+        android:valueType="floatType"
+        android:duration="150"
+        android:interpolator="@android:interpolator/fast_out_slow_in" />
+
+    <objectAnimator
+        android:propertyName="scaleY"
+        android:valueFrom="1"
+        android:valueTo="1.05"
+        android:valueType="floatType"
+        android:duration="150"
+        android:interpolator="@android:interpolator/fast_out_slow_in" />
+</set>

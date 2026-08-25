@@ -81,6 +81,9 @@ class MlPipelineManager(
     /** Called when OD completes. */
     var onOdComplete: (resultBundle: ObjectDetectorHelper.ResultBundle) -> Unit = { _ -> }
 
+    /** Called once after [initialize] finishes — ML models are bound and active. */
+    var onModelsReady: () -> Unit = {}
+
     // ── Initialization ────────────────────────────────────────────────
 
     /**
@@ -109,6 +112,9 @@ class MlPipelineManager(
             objectDetectorListener = detectorListener,
             runningMode = com.google.mediapipe.tasks.vision.core.RunningMode.LIVE_STREAM
         )
+
+        // Notify listeners that all ML models are bound and ready
+        onModelsReady()
     }
 
     // ── Frame Processing ──────────────────────────────────────────────
@@ -188,10 +194,13 @@ class MlPipelineManager(
                     objectDetectorHelper.detectLivestreamBitmap(
                         sharedBitmap, SystemClock.uptimeMillis()
                     )
+                    // Recycle bitmap immediately after OD receives it
+                    recycleBitmap(sharedBitmap)
                     isAnalyzing.set(false)
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Composite analyzer error", e)
+                recycleBitmap(sharedBitmap)
                 imageProxy.close()
                 isAnalyzing.set(false)
             }
@@ -205,12 +214,14 @@ class MlPipelineManager(
         textRecognitionHelper.processBitmap(
             bitmap, rotationDegrees,
             onSuccess = { recognizedText ->
+                recycleBitmap(bitmap)
                 val currencyAnnouncement = currencyAnalyzer.analyzeSingle(recognizedText)
                 val finalText = currencyAnnouncement ?: recognizedText
                 onOcrComplete(recognizedText, finalText)
                 isAnalyzing.set(false)
             },
             onError = { error ->
+                recycleBitmap(bitmap)
                 Log.e(TAG, "OCR processing failed", error)
                 onOcrFailed(error)
                 isAnalyzing.set(false)
@@ -245,6 +256,18 @@ class MlPipelineManager(
     }
 
     // ── Cleanup ───────────────────────────────────────────────────────
+
+    /**
+     * Safely recycle a bitmap if it exists and has not already been recycled.
+     * Prevents frame-to-frame memory accumulation.
+     */
+    private fun recycleBitmap(bitmap: Bitmap?) {
+        bitmap?.let {
+            if (!it.isRecycled) {
+                it.recycle()
+            }
+        }
+    }
 
     /**
      * Releases all ML resources. Must be called on background thread.

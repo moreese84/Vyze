@@ -84,8 +84,8 @@ class ErrorLogRepository(context: Context) {
         } catch (e: Exception) { /* best-effort */ }
     }
 
-    /** Clear all logs older than the specified number of days. */
-    suspend fun pruneOldLogs(daysOld: Int = 14) {
+    /** Clear all logs older than the specified number of days. Default: 7 days. */
+    suspend fun pruneOldLogs(daysOld: Int = 7) {
         try {
             withContext(Dispatchers.IO) {
                 val cutoff = System.currentTimeMillis() - (daysOld * 24L * 60 * 60 * 1000)

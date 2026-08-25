@@ -191,6 +191,11 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
                 }
             }
         }
+        mlPipeline.onModelsReady = {
+            activity?.runOnUiThread {
+                if (isAdded) ttsManager.speakImmediate("Vyze ready")
+            }
+        }
 
         gestureRouter = GestureRouter(
             context = requireContext(),

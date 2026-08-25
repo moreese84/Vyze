@@ -1,0 +1,23 @@
+<animated-vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:drawable="@drawable/ic_launcher_foreground">
+
+    <!-- Root group: pulse animation on the entire mark -->
+    <target
+        android:name="logo_root"
+        android:animation="@animator/splash_pulse" />
+
+    <!-- Wordmark letters: fade in + slide up -->
+    <target
+        android:name="wordmark"
+        android:animation="@animator/splash_wordmark_fade_in" />
+
+    <!-- Red dot: pop in with bounce, delayed 200ms -->
+    <target
+        android:name="dot_red"
+        android:animation="@animator/splash_dot_red_pop" />
+
+    <!-- Yellow dot: pop in with bounce, delayed 350ms -->
+    <target
+        android:name="dot_yellow"
+        android:animation="@animator/splash_dot_yellow_pop" />
+</animated-vector>

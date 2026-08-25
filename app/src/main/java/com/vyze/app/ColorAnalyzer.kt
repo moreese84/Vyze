@@ -46,39 +46,44 @@ class ColorAnalyzer {
 
         val roiBitmap = Bitmap.createBitmap(bitmap, startX, startY, roiWidth, roiHeight)
 
-        // ── Step 2: Sample pixels and accumulate RGB ───────────────────
-        var totalR = 0L
-        var totalG = 0L
-        var totalB = 0L
-        var pixelCount = 0
+        try {
+            // ── Step 2: Sample pixels and accumulate RGB ───────────────────
+            var totalR = 0L
+            var totalG = 0L
+            var totalB = 0L
+            var pixelCount = 0
 
-        val step = max(1, min(roiWidth, roiHeight) / SAMPLE_GRID)
+            val step = max(1, min(roiWidth, roiHeight) / SAMPLE_GRID)
 
-        for (y in 0 until roiHeight step step) {
-            for (x in 0 until roiWidth step step) {
-                val pixel = roiBitmap.getPixel(x, y)
-                totalR += Color.red(pixel)
-                totalG += Color.green(pixel)
-                totalB += Color.blue(pixel)
-                pixelCount++
+            for (y in 0 until roiHeight step step) {
+                for (x in 0 until roiWidth step step) {
+                    val pixel = roiBitmap.getPixel(x, y)
+                    totalR += Color.red(pixel)
+                    totalG += Color.green(pixel)
+                    totalB += Color.blue(pixel)
+                    pixelCount++
+                }
             }
+
+            if (pixelCount == 0) return context.getString(R.string.color_unknown)
+
+            val avgR = (totalR / pixelCount).toInt()
+            val avgG = (totalG / pixelCount).toInt()
+            val avgB = (totalB / pixelCount).toInt()
+
+            // ── Step 3: Convert RGB → HSV ──────────────────────────────────
+            val hsv = FloatArray(3)
+            Color.RGBToHSV(avgR, avgG, avgB, hsv)
+            val hue = hsv[0]        // 0–360
+            val saturation = hsv[1] // 0–1
+            val value = hsv[2]      // 0–1
+
+            // ── Step 4: Classify ───────────────────────────────────────────
+            return classifyColor(context, hue, saturation, value)
+        } finally {
+            // Security: recycle temporary bitmap to prevent memory leaks
+            if (!roiBitmap.isRecycled) roiBitmap.recycle()
         }
-
-        if (pixelCount == 0) return context.getString(R.string.color_unknown)
-
-        val avgR = (totalR / pixelCount).toInt()
-        val avgG = (totalG / pixelCount).toInt()
-        val avgB = (totalB / pixelCount).toInt()
-
-        // ── Step 3: Convert RGB → HSV ──────────────────────────────────
-        val hsv = FloatArray(3)
-        Color.RGBToHSV(avgR, avgG, avgB, hsv)
-        val hue = hsv[0]        // 0–360
-        val saturation = hsv[1] // 0–1
-        val value = hsv[2]      // 0–1
-
-        // ── Step 4: Classify ───────────────────────────────────────────
-        return classifyColor(context, hue, saturation, value)
     }
 
     /**
@@ -134,25 +139,30 @@ class ColorAnalyzer {
         val startY = ((bitmap.height - roiHeight) / 2).coerceAtLeast(0)
         val roiBitmap = Bitmap.createBitmap(bitmap, startX, startY, roiWidth, roiHeight)
 
-        var totalR = 0L; var totalG = 0L; var totalB = 0L; var pixelCount = 0
-        val step = max(1, min(roiWidth, roiHeight) / SAMPLE_GRID)
-        for (y in 0 until roiHeight step step) {
-            for (x in 0 until roiWidth step step) {
-                val pixel = roiBitmap.getPixel(x, y)
-                totalR += Color.red(pixel); totalG += Color.green(pixel); totalB += Color.blue(pixel)
-                pixelCount++
+        try {
+            var totalR = 0L; var totalG = 0L; var totalB = 0L; var pixelCount = 0
+            val step = max(1, min(roiWidth, roiHeight) / SAMPLE_GRID)
+            for (y in 0 until roiHeight step step) {
+                for (x in 0 until roiWidth step step) {
+                    val pixel = roiBitmap.getPixel(x, y)
+                    totalR += Color.red(pixel); totalG += Color.green(pixel); totalB += Color.blue(pixel)
+                    pixelCount++
+                }
             }
+            if (pixelCount == 0) return UNKNOWN_COLOR
+            val avgR = (totalR / pixelCount).toInt()
+            val avgG = (totalG / pixelCount).toInt()
+            val avgB = (totalB / pixelCount).toInt()
+
+            val hsv = FloatArray(3)
+            Color.RGBToHSV(avgR, avgG, avgB, hsv)
+            val hue = hsv[0]; val saturation = hsv[1]; val value = hsv[2]
+
+            return classifyColorEnglish(hue, saturation, value)
+        } finally {
+            // Security: recycle temporary bitmap to prevent memory leaks
+            if (!roiBitmap.isRecycled) roiBitmap.recycle()
         }
-        if (pixelCount == 0) return UNKNOWN_COLOR
-        val avgR = (totalR / pixelCount).toInt()
-        val avgG = (totalG / pixelCount).toInt()
-        val avgB = (totalB / pixelCount).toInt()
-
-        val hsv = FloatArray(3)
-        Color.RGBToHSV(avgR, avgG, avgB, hsv)
-        val hue = hsv[0]; val saturation = hsv[1]; val value = hsv[2]
-
-        return classifyColorEnglish(hue, saturation, value)
     }
 
     private fun classifyColorEnglish(hue: Float, saturation: Float, value: Float): String {

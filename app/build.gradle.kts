@@ -147,6 +147,9 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-service:2.7.0")
     implementation("androidx.activity:activity-ktx:1.8.2")
 
+    // Splash Screen API (AndroidX compat for API 31+ splash)
+    implementation("androidx.core:core-splashscreen:1.0.1")
+
     // Instrumented testing — Room
     androidTestImplementation("androidx.room:room-testing:2.7.0")
     androidTestImplementation("androidx.test.espresso:espresso-contrib:3.5.1")

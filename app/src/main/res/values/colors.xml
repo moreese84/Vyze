@@ -15,10 +15,19 @@
     ~ limitations under the License.
 -->
 <resources>
+    <!-- Brand (from vyze_logo.svg) -->
+    <color name="vyze_black">#231f20</color>
+    <color name="vyze_red">#ce2028</color>
+    <color name="vyze_yellow">#fbd10a</color>
+    <color name="vyze_foreground">#F5F6F7</color>
+
+    <!-- Adaptive icon -->
+    <color name="ic_launcher_background">#F5F6F7</color>
+
+    <!-- Legacy -->
     <color name="mp_primary">#007F8B</color>
     <color name="mp_variant">#12B5CB</color>
     <color name="toolbar_background">#EEEEEE</color>
-    <color name="ic_launcher_background">#FFFFFF</color>
     <color name="bottom_sheet_background">#EEEEEE</color>
     <color name="bottom_sheet_text_color">@android:color/black</color>
     <color name="icActive">#FFFFFFFF</color>

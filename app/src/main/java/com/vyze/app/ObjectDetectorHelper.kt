@@ -398,6 +398,8 @@ class ObjectDetectorHelper(
         val firstFrame = retriever.getFrameAtTime(0)
         val width = firstFrame?.width
         val height = firstFrame?.height
+        // Security: recycle probe frame immediately after reading dimensions
+        if (firstFrame != null && !firstFrame.isRecycled) firstFrame.recycle()
 
         // If the video is invalid, returns a null detection result
         if ((videoLengthMs == null) || (width == null) || (height == null)) return null
@@ -418,18 +420,26 @@ class ObjectDetectorHelper(
                     if (frame.config == Bitmap.Config.ARGB_8888) frame
                     else frame.copy(Bitmap.Config.ARGB_8888, false)
 
-                // Convert the input Bitmap object to an MPImage object to run inference
-                val mpImage = BitmapImageBuilder(argb8888Frame).build()
+                try {
+                    // Convert the input Bitmap object to an MPImage object to run inference
+                    val mpImage = BitmapImageBuilder(argb8888Frame).build()
 
-                // Run object detection using MediaPipe Object Detector API
-                objectDetector?.detectForVideo(mpImage, timestampMs)
-                    ?.let { detectionResult ->
-                        resultList.add(detectionResult)
-                    } ?: {
-                    didErrorOccurred = true
-                    objectDetectorListener?.onError(
-                        "ResultBundle could not be returned" + " in detectVideoFile"
-                    )
+                    // Run object detection using MediaPipe Object Detector API
+                    objectDetector?.detectForVideo(mpImage, timestampMs)
+                        ?.let { detectionResult ->
+                            resultList.add(detectionResult)
+                        } ?: {
+                        didErrorOccurred = true
+                        objectDetectorListener?.onError(
+                            "ResultBundle could not be returned" + " in detectVideoFile"
+                        )
+                    }
+                } finally {
+                    // Security: recycle frame bitmaps to prevent accumulation
+                    if (!argb8888Frame.isRecycled) argb8888Frame.recycle()
+                    if (argb8888Frame != frame && !frame.isRecycled) {
+                        frame.recycle()
+                    }
                 }
             } ?: run {
                 didErrorOccurred = true
@@ -473,6 +483,7 @@ class ObjectDetectorHelper(
         // If the input image rotation is change, stop all detector
         if (imageProxy.imageInfo.rotationDegrees != imageRotation) {
             imageRotation = imageProxy.imageInfo.rotationDegrees
+            if (!bitmapBuffer.isRecycled) bitmapBuffer.recycle()
             clearObjectDetector()
             setupObjectDetector()
             return
@@ -482,6 +493,8 @@ class ObjectDetectorHelper(
         val mpImage = BitmapImageBuilder(bitmapBuffer).build()
 
         detectAsync(mpImage, frameTime)
+        // Security: recycle bitmap buffer after MPImage wraps it
+        if (!bitmapBuffer.isRecycled) bitmapBuffer.recycle()
     }
 
     /**

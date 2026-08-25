@@ -19,6 +19,7 @@ package com.vyze.app
 import android.os.Bundle
 import androidx.activity.viewModels
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.navigation.fragment.NavHostFragment
 import androidx.navigation.ui.setupWithNavController
 import com.vyze.app.databinding.ActivityMainBinding
@@ -32,8 +33,21 @@ class MainActivity : AppCompatActivity() {
     private lateinit var activityMainBinding: ActivityMainBinding
     private val viewModel: MainViewModel by viewModels()
 
+    private lateinit var hapticManager: HapticManager
+
     override fun onCreate(savedInstanceState: Bundle?) {
+        // Install splash screen BEFORE super.onCreate() — reads Theme.App.Starting
+        // from the manifest and renders the dark background with the Vyze mark.
+        installSplashScreen()
+
         super.onCreate(savedInstanceState)
+
+        // ── Immediate haptic confirmation ──────────────────────────────
+        // Low-vision users need tactile proof that the process is alive
+        // before ML models finish binding. This fires instantly on launch.
+        hapticManager = HapticManager(applicationContext)
+        hapticManager.vibrateTap()
+
         activityMainBinding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(activityMainBinding.root)
 
@@ -48,5 +62,10 @@ class MainActivity : AppCompatActivity() {
 
     override fun onBackPressed() {
         finish()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        if (::hapticManager.isInitialized) hapticManager.cancel()
     }
 }
