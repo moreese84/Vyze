@@ -100,4 +100,91 @@
     <string name="scene_no_data">Data pemandangan belum tersedia.</string>
     <string name="scene_no_visible">Tiada objek kelihatan buat masa ini.</string>
     <string name="scene_summary_not_available">Ringkasan pemandangan belum tersedia. Sila tunggu.</string>
+
+    <!-- ── Accessibility (TalkBack) ────────────────────────────────── -->
+    <string name="camera_container_desc">Skrin kamera Vyze. Sentuh untuk mengesan objek. Sentuh dua kali untuk membaca teks. Tekan tahan untuk ringkasan pemandangan.</string>
+    <string name="view_finder_desc">Suapan pratonton kamera dengan hasil pengesanan langsung</string>
+    <string name="overlay_desc">Tindanan kotak sempadan pengesanan objek</string>
+    <string name="high_contrast_overlay_desc">Tindanan pengesanan kontras tinggi untuk pengguna penglihatan rendah</string>
+    <string name="bottom_sheet_desc">Panel tetapan pengesanan objek</string>
+
+    <!-- ── Emergency SOS ───────────────────────────────────────────── -->
+    <string name="sos_activated">Mod kecemasan diaktifkan. Membuka dialer.</string>
+    <string name="sos_deactivated">Mod kecemasan dinyahaktifkan.</string>
+
+    <!-- ── Battery ─────────────────────────────────────────────────── -->
+    <string name="battery_low_warning">Bateri rendah: %1$d peratus. Pertimbangkan untuk mengurangkan kekerapan ML.</string>
+    <string name="battery_critical_warning">Bateri kritikal: %1$d peratus. Sila cas peranti anda.</string>
+
+    <!-- ── Color Analysis ──────────────────────────────────────────── -->
+    <string name="color_analyzing">Menganalisis warna&#8230;</string>
+    <string name="color_result">Warna dikesan: %1$s</string>
+    <string name="color_unknown">Tidak diketahui</string>
+
+    <!-- ── Reading Mode ──────────────────────────────────────────── -->
+    <string name="reading_mode_activated">Mod membaca diaktifkan. Tunjuk pada teks untuk membaca.</string>
+    <string name="reading_mode_deactivated">Mod membaca dinyahaktifkan.</string>
+    <string name="reading_next_lines">Membaca baris seterusnya.</string>
+    <string name="reading_previous_lines">Membaca baris sebelumnya.</string>
+    <string name="reading_bookmark">Penanda disimpan pada baris %1$d.</string>
+    <string name="reading_resume">Sambung dari penanda pada baris %1$d.</string>
+    <string name="reading_page_summary">Halaman %1$d. %2$d baris. Pada baris %3$d.</string>
+    <string name="reading_no_text">Tiada teks dikesan. Tunjuk lebih dekat pada dokumen.</string>
+    <string name="reading_end_of_page">Mencapai penghujung halaman.</string>
+
+    <!-- ── Medicine Mode ─────────────────────────────────────────── -->
+    <string name="medicine_mode_activated">Pembaca ubat diaktifkan. Tunjuk pada label preskripsi.</string>
+    <string name="medicine_mode_deactivated">Pembaca ubat dinyahaktifkan.</string>
+    <string name="medicine_drug_name">Ubat: %1$s</string>
+    <string name="medicine_dosage">Dos: %1$s</string>
+    <string name="medicine_frequency">Cara mengambil: %1$s</string>
+    <string name="medicine_warning">Amaran! %1$s</string>
+    <string name="medicine_expired">Ubat ini mungkin telah tamat tempoh. Tamat tempoh: %1$s</string>
+    <string name="medicine_no_label">Label ubat tidak dikesan. Tunjuk lebih dekat pada label.</string>
+
+    <!-- ── Night Mode ────────────────────────────────────────────── -->
+    <string name="night_mode_title">Tema</string>
+    <string name="night_mode_light">Cahaya</string>
+    <string name="night_mode_dark">Gelap</string>
+    <string name="night_mode_system">Sistem</string>
+    <string name="night_mode_toggled">Tema ditukar kepada %1$s</string>
+
+    <!-- ── Gesture Tutorial ──────────────────────────────────────── -->
+    <string name="tutorial_title">Tutorial Gestur</string>
+    <string name="tutorial_start">Memulakan tutorial gestur. Ikut arahan.</string>
+    <string name="tutorial_step_single_tap">Sentuh sekali di mana-mana bulatan</string>
+    <string name="tutorial_step_double_tap">Sentuh dua kali dengan pantas</string>
+    <string name="tutorial_step_long_press">Tekan dan tahan selama 2 saat</string>
+    <string name="tutorial_step_triple_tap">Sentuh tiga kali dengan pantas</string>
+    <string name="tutorial_step_triple_hold">Sentuh tiga kali dan tahan pada yang terakhir</string>
+    <string name="tutorial_success">Betul! Bagus.</string>
+    <string name="tutorial_wrong">Belum tepat. Cuba lagi.</string>
+    <string name="tutorial_complete">Tutorial selesai! Anda sudah bersedia menggunakan Vyze.</string>
+
+    <!-- ── Error Log ─────────────────────────────────────────────── -->
+    <string name="error_log_title">Log Ralat</string>
+    <string name="error_log_empty">Tiada ralat direkodkan.</string>
+    <string name="error_log_count">%1$d ralat direkodkan</string>
+    <string name="error_log_cleared">Log ralat dibersihkan.</string>
+
+    <!-- ── Accessibility Service ─────────────────────────────────── -->
+    <string name="accessibility_service_description">Perkhidmatan kebolehcapaian Vyze menyediakan integrasi TalkBack dan sokongan gestur untuk pengguna penglihatan rendah.</string>
+    <string name="accessibility_service_enabled">Perkhidmatan kebolehcapaian Vyze diaktifkan.</string>
+    <string name="accessibility_service_disabled">Perkhidmatan kebolehcapaian Vyze dinyahaktifkan.</string>
+
+    <!-- ── UI Labels ─────────────────────────────────────────────── -->
+    <string name="alt_bottom_sheet_chevron">Penunjuk panel boleh kembang</string>
+    <string name="alt_bottom_sheet_max_results_button_minus">Butang mengurangkan jumlah hasil yang dikesan</string>
+    <string name="alt_bottom_sheet_max_results_button_plus">Butang menambah jumlah hasil yang dikesan</string>
+    <string name="alt_bottom_sheet_threshold_button_minus">Butang mengurangkan ambang hasil pengesanan</string>
+    <string name="alt_bottom_sheet_threshold_button_plus">Butang menambah ambang hasil pengesanan</string>
+    <string name="label_inference_time">Masa Inferens</string>
+    <string name="label_fps">Bingkai sesaat</string>
+    <string name="label_confidence_threshold">Ambang</string>
+    <string name="label_max_results">Jumlah Maksimum</string>
+    <string name="label_delegate">Delegasi</string>
+    <string name="label_models">Model ML</string>
+    <string name="menu_camera">Kamera</string>
+    <string name="menu_gallery">Galeri</string>
+    <string name="tv_gallery_placeholder">Klik + untuk menambah imej atau video untuk menjalankan pengesanan objek.</string>
 </resources>

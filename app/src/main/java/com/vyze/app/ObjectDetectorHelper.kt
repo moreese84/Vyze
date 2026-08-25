@@ -52,6 +52,15 @@ class ObjectDetectorHelper(
     private var imageRotation = 0
     private lateinit var imageProcessingOptions: ImageProcessingOptions
 
+    /**
+     * Stores the most recent detection result bundle.
+     * Used by GestureRouter / CameraFragment to access the latest OD results
+     * on-demand (e.g., when the user taps to hear detected objects).
+     */
+    @Volatile
+    var lastResultBundle: ResultBundle? = null
+        private set
+
     // ── Spatial Mapping & Speech Debouncing ───────────────────────────────────
 
     /**
@@ -511,15 +520,16 @@ class ObjectDetectorHelper(
         val finishTimeMs = SystemClock.uptimeMillis()
         val inferenceTime = finishTimeMs - result.timestampMs()
 
-        objectDetectorListener?.onResults(
-            ResultBundle(
-                listOf(result),
-                inferenceTime,
-                input.height,
-                input.width,
-                imageRotation
-            )
+        val bundle = ResultBundle(
+            listOf(result),
+            inferenceTime,
+            input.height,
+            input.width,
+            imageRotation
         )
+
+        lastResultBundle = bundle
+        objectDetectorListener?.onResults(bundle)
     }
 
     // Return errors thrown during detection to this ObjectDetectorHelper's caller

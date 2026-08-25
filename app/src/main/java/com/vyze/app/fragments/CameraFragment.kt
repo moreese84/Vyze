@@ -17,298 +17,118 @@ package com.vyze.app.fragments
 
 import android.annotation.SuppressLint
 import android.content.res.Configuration
+import android.os.BatteryManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.os.SystemClock
 import android.util.Log
-import android.view.GestureDetector
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.widget.AdapterView
 import android.widget.Toast
-import androidx.camera.core.AspectRatio
-import androidx.camera.core.Camera
-import androidx.camera.core.CameraSelector
-import androidx.camera.core.ImageAnalysis
-import androidx.camera.core.ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888
-import androidx.camera.core.Preview
-import androidx.camera.lifecycle.ProcessCameraProvider
-import androidx.core.content.ContextCompat
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.activityViewModels
 import androidx.navigation.Navigation
-import com.vyze.app.BarcodeAnalyzer
-import com.vyze.app.FaceDetectorHelper
-import com.vyze.app.FlashlightManager
-import com.vyze.app.GestureDetectorHelper
-import com.vyze.app.HapticManager
-import com.vyze.app.HighContrastOverlayView
-import com.vyze.app.LuminanceAnalyzer
-import com.vyze.app.MainViewModel
-import com.vyze.app.ObjectDetectorHelper
-import com.vyze.app.R
-import com.vyze.app.SceneAggregator
-import com.vyze.app.TextRecognitionHelper
-import com.vyze.app.TTSManager
-import com.vyze.app.VoiceCommandManager
+import com.vyze.app.*
+import com.vyze.app.data.ScanRepository
+import com.vyze.app.delegates.CameraSetupDelegate
+import com.vyze.app.delegates.GestureRouter
+import com.vyze.app.delegates.MlPipelineManager
 import com.vyze.app.databinding.FragmentCameraBinding
 import com.google.mediapipe.tasks.vision.core.RunningMode
-import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicInteger
 
+/**
+ * Main camera fragment for Vyze accessibility app.
+ *
+ * ## Architecture (Post P1 Refactoring)
+ * This fragment is now a thin lifecycle shell that delegates all heavy
+ * lifting to focused, testable components:
+ *
+ * - **[CameraSetupDelegate]** — CameraX lifecycle, preview binding, torch
+ * - **[MlPipelineManager]** — Frame throttle, bitmap sharing, OCR/OD/barcode/face/luminance
+ * - **[GestureRouter]** — Gesture-to-action routing (tap/double-tap/long-press/triple-tap/SOS)
+ * - **[MainViewModel]** — Shared state with SavedStateHandle persistence
+ * - **[TtsViewModel]** — Singleton TTSManager across fragments
+ * - **[ScanRepository]** — Room-backed scan history
+ */
 class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
 
     private val TAG = "ObjectDetection"
 
     private var _fragmentCameraBinding: FragmentCameraBinding? = null
+    private val fragmentCameraBinding get() = _fragmentCameraBinding!!
 
-    private val fragmentCameraBinding
-        get() = _fragmentCameraBinding!!
-
-    private lateinit var objectDetectorHelper: ObjectDetectorHelper
     private val viewModel: MainViewModel by activityViewModels()
-    private var preview: Preview? = null
-    private var imageAnalyzer: ImageAnalysis? = null
-    private var camera: Camera? = null
-    private var cameraProvider: ProcessCameraProvider? = null
+    private val ttsViewModel: TtsViewModel by activityViewModels()
 
-    /** Blocking ML operations are performed using this executor */
+    // ── Delegates ─────────────────────────────────────────────────────
+
+    private lateinit var cameraSetup: CameraSetupDelegate
+    private lateinit var mlPipeline: MlPipelineManager
+    private lateinit var gestureRouter: GestureRouter
+
+    // ── Managers ──────────────────────────────────────────────────────
+
+    private lateinit var ttsManager: TTSManager
+    private lateinit var hapticManager: HapticManager
+    private lateinit var flashlightManager: FlashlightManager
+    private lateinit var voiceCommandManager: VoiceCommandManager
+    private lateinit var sceneAggregator: SceneAggregator
+    private lateinit var onboardingManager: OnboardingManager
+    private lateinit var highContrastOverlay: HighContrastOverlayView
+    private lateinit var scanRepository: ScanRepository
+
+    // ── P2: Specialized Modes ─────────────────────────────────────────
+    private lateinit var readingModeHelper: ReadingModeHelper
+    private lateinit var medicineReaderHelper: MedicineReaderHelper
+    @Volatile private var isReadingMode = false
+    @Volatile private var isMedicineMode = false
+
+    // ── Executors & Handlers ──────────────────────────────────────────
+
     private lateinit var backgroundExecutor: ExecutorService
-
-    // Main thread handler for periodic scene summaries
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    // Accessibility components
-    private lateinit var ttsManager: TTSManager
-    private lateinit var gestureDetector: GestureDetector
-    private lateinit var gestureDetectorHelper: GestureDetectorHelper
+    // ── Cross-Thread State ────────────────────────────────────────────
 
-    // Text Recognition (OCR)
-    private lateinit var textRecognitionHelper: TextRecognitionHelper
+    @Volatile private var isCameraActive = false
 
-    // Haptic feedback
-    private lateinit var hapticManager: HapticManager
+    // ── Battery Monitoring ────────────────────────────────────────────
 
-    // Flashlight / Torch control
-    private lateinit var flashlightManager: FlashlightManager
+    @Volatile private var lastBatteryWarningLevel: Int = -1
 
-    // Voice Command
-    private lateinit var voiceCommandManager: VoiceCommandManager
+    // ── Auto-Scene Summary ────────────────────────────────────────────
 
-    // Barcode scanning
-    private lateinit var barcodeAnalyzer: BarcodeAnalyzer
-
-    // Face detection
-    private lateinit var faceDetectorHelper: FaceDetectorHelper
-
-    // Scene Aggregator
-    private lateinit var sceneAggregator: SceneAggregator
-
-    // High Contrast Overlay
-    private lateinit var highContrastOverlay: HighContrastOverlayView
-
-    // Luminance tracking
-    private var latestMeanLuminance: Double = 0.0
-    private var latestIsDark: Boolean = false
-
-    // Latest detection results for TTS readout
-    private var latestDetectionResult: ObjectDetectorHelper.ResultBundle? = null
-
-    // OCR request flag: when true, the next frame is captured for text recognition
-    // instead of normal object detection processing
-    private val ocrRequested = AtomicBoolean(false)
-
-    /**
-     * Frame throttling: prevents frame accumulation when the previous frame
-     * is still being analyzed. Guarantees zero memory leaks from unprocessed frames.
-     */
-    private val isAnalyzing = AtomicBoolean(false)
-
-    /**
-     * Battery optimization: frame counter for processing 1 out of every 3 frames.
-     * At 30 FPS camera output, this yields ~10 FPS processing, reducing CPU/GPU
-     * load and battery drain by ~66% while maintaining responsive detection.
-     */
-    private val frameCounter = AtomicInteger(0)
-
-    /**
-     * Whether the camera is currently bound and active.
-     * Used to prevent frame processing after onPause().
-     */
-    @Volatile
-    private var isCameraActive = false
-
-    // ── Auto-Scene Summary ───────────────────────────────────────────────
-
-    /**
-     * Periodic scene summary runnable. Fires every [SCENE_SUMMARY_INTERVAL_MS]
-     * to provide automatic room descriptions when the camera is active.
-     */
     private val sceneSummaryRunnable = object : Runnable {
         override fun run() {
-            if (isCameraActive && isAdded && this@CameraFragment::sceneAggregator.isInitialized) {
+            if (isCameraActive && isAdded) {
                 triggerSceneSummary()
             }
             mainHandler.postDelayed(this, SCENE_SUMMARY_INTERVAL_MS)
         }
     }
 
-    // ── Lifecycle ────────────────────────────────────────────────────────
+    // ── Battery Check Runnable ────────────────────────────────────────
 
-    override fun onResume() {
-        super.onResume()
-        // Make sure that all permissions are still present, since the
-        // user could have removed them while the app was in paused state.
-        if (!PermissionsFragment.hasPermissions(requireContext())) {
-            Navigation.findNavController(
-                requireActivity(),
-                R.id.fragment_container
-            )
-                .navigate(CameraFragmentDirections.actionCameraToPermissions())
-        }
-
-        // Re-initialize object detector if it was cleared in onPause
-        backgroundExecutor.execute {
-            if (::objectDetectorHelper.isInitialized && objectDetectorHelper.isClosed()) {
-                objectDetectorHelper.setupObjectDetector()
+    private val batteryCheckRunnable = object : Runnable {
+        override fun run() {
+            if (isCameraActive && isAdded) {
+                checkBatteryLevel()
             }
+            mainHandler.postDelayed(this, BATTERY_CHECK_INTERVAL_MS)
         }
-
-        // Re-bind camera if it was unbound in onPause
-        if (cameraProvider != null && imageAnalyzer != null) {
-            bindCameraUseCases()
-        }
-
-        isCameraActive = true
-
-        // Start periodic scene summary timer
-        mainHandler.postDelayed(sceneSummaryRunnable, SCENE_SUMMARY_INTERVAL_MS)
     }
 
-    override fun onPause() {
-        super.onPause()
+    // ══════════════════════════════════════════════════════════════════
+    // Lifecycle
+    // ══════════════════════════════════════════════════════════════════
 
-        // Stop periodic scene summary
-        mainHandler.removeCallbacks(sceneSummaryRunnable)
-
-        isCameraActive = false
-
-        // Stop voice listening when paused
-        if (this::voiceCommandManager.isInitialized && voiceCommandManager.isCurrentlyListening()) {
-            voiceCommandManager.stopListening()
-        }
-
-        // Turn off torch when the fragment is paused
-        if (this::flashlightManager.isInitialized && flashlightManager.isTorchOn()) {
-            flashlightManager.toggleTorch(false)
-        }
-
-        // Unbind camera to fully release camera resources and stop frame processing
-        cameraProvider?.unbindAll()
-        camera = null
-        flashlightManager.camera = null
-
-        // Save and release ObjectDetector settings
-        if (this::objectDetectorHelper.isInitialized) {
-            viewModel.setModel(objectDetectorHelper.currentModel)
-            viewModel.setDelegate(objectDetectorHelper.currentDelegate)
-            viewModel.setThreshold(objectDetectorHelper.threshold)
-            viewModel.setMaxResults(objectDetectorHelper.maxResults)
-            backgroundExecutor.execute { objectDetectorHelper.clearObjectDetector() }
-        }
-
-        // Clear overlays
-        if (_fragmentCameraBinding != null) {
-            try { fragmentCameraBinding.overlay.clear() } catch (_: Exception) {}
-            try { fragmentCameraBinding.highContrastOverlay.clear() } catch (_: Exception) {}
-        }
-
-        // Reset frame throttle state
-        isAnalyzing.set(false)
-        ocrRequested.set(false)
-        frameCounter.set(0)
-    }
-
-    override fun onDestroyView() {
-        _fragmentCameraBinding = null
-        super.onDestroyView()
-
-        // Stop periodic scene summary
-        mainHandler.removeCallbacks(sceneSummaryRunnable)
-
-        // Shut down our background executor
-        backgroundExecutor.shutdown()
-        backgroundExecutor.awaitTermination(
-            Long.MAX_VALUE,
-            TimeUnit.NANOSECONDS
-        )
-
-        // Cleanup TTS
-        if (this::ttsManager.isInitialized) {
-            ttsManager.onDestroy()
-        }
-
-        // Cleanup Text Recognition
-        if (this::textRecognitionHelper.isInitialized) {
-            textRecognitionHelper.close()
-        }
-
-        // Cleanup Haptic feedback
-        if (this::hapticManager.isInitialized) {
-            hapticManager.cancel()
-        }
-
-        // Cleanup Voice Commands
-        if (this::voiceCommandManager.isInitialized) {
-            voiceCommandManager.destroy()
-        }
-
-        // Cleanup Barcode Analyzer
-        if (this::barcodeAnalyzer.isInitialized) {
-            barcodeAnalyzer.close()
-        }
-
-        // Cleanup Face Detector
-        if (this::faceDetectorHelper.isInitialized) {
-            faceDetectorHelper.close()
-        }
-
-        // Null out camera reference held by FlashlightManager
-        if (this::flashlightManager.isInitialized) {
-            flashlightManager.camera = null
-        }
-
-        // Unbind camera provider to fully release CameraX resources
-        cameraProvider?.unbindAll()
-        cameraProvider = null
-        camera = null
-
-        // Clear overlays to release any bitmap / canvas references
-        if (_fragmentCameraBinding != null) {
-            try { fragmentCameraBinding.overlay.clear() } catch (_: Exception) {}
-            try { fragmentCameraBinding.highContrastOverlay.clear() } catch (_: Exception) {}
-        }
-
-        // Reset frame throttle flag
-        isAnalyzing.set(false)
-        ocrRequested.set(false)
-        frameCounter.set(0)
-    }
-
-    override fun onCreateView(
-        inflater: LayoutInflater,
-        container: ViewGroup?,
-        savedInstanceState: Bundle?
-    ): View {
-        _fragmentCameraBinding =
-            FragmentCameraBinding.inflate(inflater, container, false)
-
+    override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View {
+        _fragmentCameraBinding = FragmentCameraBinding.inflate(inflater, container, false)
         return fragmentCameraBinding.root
     }
 
@@ -316,426 +136,205 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
 
-        // Initialize our background executor
         backgroundExecutor = Executors.newSingleThreadExecutor()
 
-        // Initialize TTS Manager
-        ttsManager = TTSManager(requireContext().applicationContext)
-        // Apply saved TTS settings
-        ttsManager.applySettings(requireContext())
-
-        // Initialize Text Recognition Helper
-        textRecognitionHelper = TextRecognitionHelper()
-
-        // Initialize Haptic feedback
+        // ── Initialize Managers ──────────────────────────────────────
+        ttsManager = ttsViewModel.ttsManager
         hapticManager = HapticManager(requireContext().applicationContext)
-
-        // Initialize Flashlight Manager
         flashlightManager = FlashlightManager()
-
-        // Initialize Voice Command Manager
         voiceCommandManager = VoiceCommandManager(requireContext().applicationContext)
-        setupVoiceCommands()
-
-        // Initialize Barcode Analyzer
-        barcodeAnalyzer = BarcodeAnalyzer()
-
-        // Initialize Face Detector
-        faceDetectorHelper = FaceDetectorHelper()
-
-        // Initialize Scene Aggregator
         sceneAggregator = SceneAggregator()
+        scanRepository = ScanRepository(requireContext().applicationContext)
 
-        // Reference to High Contrast Overlay
+        // P2: Specialized mode helpers
+        readingModeHelper = ReadingModeHelper()
+        medicineReaderHelper = MedicineReaderHelper()
+
         highContrastOverlay = fragmentCameraBinding.highContrastOverlay
 
-        // Setup gesture detector for full-screen accessibility taps
-        setupGestureDetector()
+        // ── Initialize Delegates ─────────────────────────────────────
+        cameraSetup = CameraSetupDelegate()
 
-        // Create the ObjectDetectionHelper that will handle the inference
-        backgroundExecutor.execute {
-            objectDetectorHelper =
-                ObjectDetectorHelper(
-                    context = requireContext(),
-                    threshold = viewModel.currentThreshold,
-                    currentDelegate = viewModel.currentDelegate,
-                    currentModel = viewModel.currentModel,
-                    maxResults = viewModel.currentMaxResults,
-                    objectDetectorListener = this,
-                    runningMode = RunningMode.LIVE_STREAM
-                )
-
-            // Wait for the views to be properly laid out
-            fragmentCameraBinding.viewFinder.post {
-                // Set up the camera and its use cases
-                setUpCamera()
+        mlPipeline = MlPipelineManager(requireContext(), backgroundExecutor)
+        mlPipeline.onLuminanceChanged = { isDark, meanLuminance ->
+            activity?.runOnUiThread {
+                if (isAdded) flashlightManager.autoTorch(isDark)
+            }
+        }
+        mlPipeline.onBarcodeDetected = { announcements ->
+            activity?.runOnUiThread {
+                if (isAdded) {
+                    ttsManager.speak(announcements.first())
+                    viewModel.saveBarcodeScan(announcements.first())
+                }
+            }
+        }
+        mlPipeline.onFaceDetected = { announcements ->
+            activity?.runOnUiThread {
+                if (isAdded) ttsManager.speak(announcements.first())
+            }
+        }
+        mlPipeline.onOcrComplete = { recognizedText, finalText ->
+            activity?.runOnUiThread {
+                if (isAdded) {
+                    highContrastOverlay.setOcrText(finalText)
+                    ttsManager.speakImmediate(finalText)
+                    viewModel.saveOcrScan(finalText)
+                }
+            }
+        }
+        mlPipeline.onOcrFailed = { _ ->
+            activity?.runOnUiThread {
+                if (isAdded) {
+                    highContrastOverlay.clearOcrText()
+                    ttsManager.speakImmediate("Text recognition failed.")
+                }
             }
         }
 
-        // Attach listeners to UI control widgets
+        gestureRouter = GestureRouter(
+            context = requireContext(),
+            ttsManager = ttsManager,
+            hapticManager = hapticManager,
+            colorAnalyzer = ColorAnalyzer(),
+            scanRepository = scanRepository,
+            mainHandler = mainHandler
+        )
+        gestureRouter.onSingleTapAction = { announceDetectedObject() }
+        gestureRouter.onDoubleTapAction = { performOcrOnCurrentFrame() }
+        gestureRouter.onLongPressAction = { triggerSceneSummary() }
+
+        // ── Attach Gesture Router ────────────────────────────────────
+        gestureRouter.attach(fragmentCameraBinding.cameraContainer)
+
+        // ── Initialize ML Pipeline on background thread ───────────────
+        backgroundExecutor.execute {
+            mlPipeline.initialize(
+                context = requireContext(),
+                threshold = viewModel.currentThreshold,
+                delegate = viewModel.currentDelegate,
+                model = viewModel.currentModel,
+                maxResults = viewModel.currentMaxResults,
+                detectorListener = this
+            )
+            fragmentCameraBinding.viewFinder.post { setUpCamera() }
+        }
+
         initBottomSheetControls()
         fragmentCameraBinding.overlay.setRunningMode(RunningMode.LIVE_STREAM)
         fragmentCameraBinding.highContrastOverlay.setRunningMode(RunningMode.LIVE_STREAM)
-    }
 
-    // ── Voice Commands ───────────────────────────────────────────────────
-
-    private fun setupVoiceCommands() {
-        voiceCommandManager.onOcrRequested = {
-            activity?.runOnUiThread {
-                if (isAdded) {
-                    performOcrOnCurrentFrame()
-                }
-            }
-        }
-
-        voiceCommandManager.onObjectDetectionRequested = {
-            activity?.runOnUiThread {
-                if (isAdded) {
-                    announceDetectedObject()
-                }
-            }
-        }
-
-        voiceCommandManager.onLightCheckRequested = {
-            activity?.runOnUiThread {
-                if (isAdded) {
-                    announceLightConditions()
-                }
-            }
-        }
-
-        voiceCommandManager.onListeningStateChanged = { listening ->
-            activity?.runOnUiThread {
-                if (isAdded) {
-                    if (listening) {
-                        ttsManager.stop()
-                        ttsManager.speakImmediate("Listening for commands...")
-                    } else {
-                        ttsManager.speakImmediate("Listening stopped.")
-                    }
-                }
-            }
-        }
-
-        voiceCommandManager.onError = { error ->
-            Log.w(TAG, "Voice command error: $error")
-        }
-
-        voiceCommandManager.onTextRecognized = { text ->
-            if (text.isNotEmpty()) {
-                activity?.runOnUiThread {
-                    if (isAdded) {
-                        voiceCommandManager.parseAndTrigger(text)
-                    }
-                }
-            }
-        }
-    }
-
-    // ── Gesture Detection ────────────────────────────────────────────────
-
-    private fun setupGestureDetector() {
-        gestureDetectorHelper = GestureDetectorHelper(
-            onSingleTap = {
-                hapticManager.vibrateTap()
-                announceDetectedObject()
-            },
-            onDoubleTap = {
-                hapticManager.vibrateDoubleTap()
-                performOcrOnCurrentFrame()
-            },
-            onLongPress = {
-                hapticManager.vibrateLongPress()
-                triggerSceneSummary()
-            }
+        // ── Onboarding ───────────────────────────────────────────────
+        onboardingManager = OnboardingManager(
+            requireContext().applicationContext, ttsManager, hapticManager
         )
+        mainHandler.postDelayed({
+            if (isAdded) onboardingManager.playTutorialIfFirstRun()
+        }, ONBOARDING_DELAY_MS)
 
-        gestureDetector = GestureDetector(requireContext(), gestureDetectorHelper)
-
-        // Attach to the full-screen layout so taps anywhere work
-        fragmentCameraBinding.cameraContainer.setOnTouchListener { _, event ->
-            gestureDetector.onTouchEvent(event)
-        }
+        // ── Voice Commands ───────────────────────────────────────────
+        setupVoiceCommands()
     }
 
-    // ── OCR ──────────────────────────────────────────────────────────────
-
-    private fun performOcrOnCurrentFrame() {
-        ttsManager.speakImmediate("Reading text...")
-        ocrRequested.set(true)
-    }
-
-    // ── Object Detection Readout ─────────────────────────────────────────
-
-    private fun announceDetectedObject() {
-        val resultBundle = latestDetectionResult
-        if (resultBundle == null || resultBundle.results.isEmpty()) {
-            ttsManager.speak("No objects detected yet. Please wait.")
-            return
+    override fun onResume() {
+        super.onResume()
+        if (!PermissionsFragment.hasPermissions(requireContext())) {
+            Navigation.findNavController(requireActivity(), R.id.fragment_container)
+                .navigate(CameraFragmentDirections.actionCameraToPermissions())
         }
-
-        val detections = resultBundle.results[0].detections()
-        if (detections.isNullOrEmpty()) {
-            ttsManager.speak("No objects currently visible.")
-            return
-        }
-
-        // Attempt spatial + debounced announcements
-        val announcements = objectDetectorHelper.getAnnounceableDetections(
-            resultBundle = resultBundle,
-            frameWidth = resultBundle.inputImageWidth,
-            frameHeight = resultBundle.inputImageHeight
-        )
-
-        if (announcements.isNotEmpty()) {
-            ttsManager.speak(announcements.first())
-        } else {
-            val topDetection = detections.maxByOrNull { it.categories()[0].score() }
-            if (topDetection != null) {
-                val category = topDetection.categories()[0]
-                val name = category.categoryName()
-                val confidence = (category.score() * 100).toInt()
-                ttsManager.speak("$name, confidence $confidence percent.")
-            } else {
-                ttsManager.speak("No objects detected.")
-            }
-        }
-    }
-
-    // ── Scene Summary ────────────────────────────────────────────────────
-
-    /**
-     * Triggers a scene summary using [SceneAggregator].
-     * Collects spatial detections from the latest result bundle and
-     * produces a natural-language room description.
-     *
-     * Called on long-press gesture and periodically every 6 seconds.
-     */
-    private fun triggerSceneSummary() {
-        val resultBundle = latestDetectionResult
-        if (resultBundle == null || resultBundle.results.isEmpty()) {
-            ttsManager.speak("No scene data available yet.")
-            return
-        }
-
-        val detections = resultBundle.results[0].detections()
-        if (detections.isNullOrEmpty()) {
-            ttsManager.speak("No objects currently visible.")
-            return
-        }
-
-        // Compute spatial info for all detections
-        val spatialDetections = detections.mapNotNull { detection ->
-            val category = detection.categories().firstOrNull() ?: return@mapNotNull null
-            objectDetectorHelper.computeSpatialInfo(
-                boundingBox = detection.boundingBox(),
-                frameWidth = resultBundle.inputImageWidth,
-                frameHeight = resultBundle.inputImageHeight,
-                categoryName = category.categoryName(),
-                score = category.score()
-            )
-        }
-
-        // Aggregate into a natural sentence
-        val summary = sceneAggregator.aggregate(spatialDetections)
-        if (summary != null) {
-            hapticManager.vibrateLongPress()
-            ttsManager.speak(summary)
-        } else {
-            ttsManager.speak("Scene summary not available. Please wait.")
-        }
-    }
-
-    // ── Light Conditions ─────────────────────────────────────────────────
-
-    private fun announceLightConditions() {
-        if (latestMeanLuminance == 0.0 && !latestIsDark) {
-            ttsManager.speak("Light level not yet measured. Please wait.")
-            return
-        }
-
-        val brightness = latestMeanLuminance.toInt()
-        if (latestIsDark) {
-            hapticManager.vibrateWarning()
-            flashlightManager.autoTorch(true)
-            ttsManager.speakImmediate(
-                "Environment is dark. Brightness level: $brightness out of 255. Torch is now on."
-            )
-        } else {
-            flashlightManager.autoTorch(false)
-            ttsManager.speakImmediate(
-                "Lighting is sufficient. Brightness level: $brightness out of 255. Torch is now off."
-            )
-        }
-    }
-
-    // ── Bottom Sheet Controls ────────────────────────────────────────────
-
-    private fun initBottomSheetControls() {
-        fragmentCameraBinding.bottomSheetLayout.maxResultsValue.text =
-            viewModel.currentMaxResults.toString()
-        fragmentCameraBinding.bottomSheetLayout.thresholdValue.text =
-            String.format("%.2f", viewModel.currentThreshold)
-
-        fragmentCameraBinding.bottomSheetLayout.thresholdMinus.setOnClickListener {
-            if (objectDetectorHelper.threshold >= 0.1) {
-                objectDetectorHelper.threshold -= 0.1f
-                updateControlsUi()
-            }
-        }
-
-        fragmentCameraBinding.bottomSheetLayout.thresholdPlus.setOnClickListener {
-            if (objectDetectorHelper.threshold <= 0.8) {
-                objectDetectorHelper.threshold += 0.1f
-                updateControlsUi()
-            }
-        }
-
-        fragmentCameraBinding.bottomSheetLayout.maxResultsMinus.setOnClickListener {
-            if (objectDetectorHelper.maxResults > 1) {
-                objectDetectorHelper.maxResults--
-                updateControlsUi()
-            }
-        }
-
-        fragmentCameraBinding.bottomSheetLayout.maxResultsPlus.setOnClickListener {
-            if (objectDetectorHelper.maxResults < 5) {
-                objectDetectorHelper.maxResults++
-                updateControlsUi()
-            }
-        }
-
-        fragmentCameraBinding.bottomSheetLayout.spinnerDelegate.setSelection(
-            viewModel.currentDelegate,
-            false
-        )
-        fragmentCameraBinding.bottomSheetLayout.spinnerDelegate.onItemSelectedListener =
-            object : AdapterView.OnItemSelectedListener {
-                override fun onItemSelected(
-                    p0: AdapterView<*>?,
-                    p1: View?,
-                    p2: Int,
-                    p3: Long
-                ) {
-                    try {
-                        objectDetectorHelper.currentDelegate = p2
-                        updateControlsUi()
-                    } catch (e: UninitializedPropertyAccessException) {
-                        Log.e(TAG, "ObjectDetectorHelper has not been initialized yet.")
-                    }
-                }
-
-                override fun onNothingSelected(p0: AdapterView<*>?) {
-                    /* no op */
-                }
-            }
-
-        fragmentCameraBinding.bottomSheetLayout.spinnerModel.setSelection(
-            viewModel.currentModel,
-            false
-        )
-        fragmentCameraBinding.bottomSheetLayout.spinnerModel.onItemSelectedListener =
-            object : AdapterView.OnItemSelectedListener {
-                override fun onItemSelected(
-                    p0: AdapterView<*>?,
-                    p1: View?,
-                    p2: Int,
-                    p3: Long
-                ) {
-                    try {
-                        objectDetectorHelper.currentModel = p2
-                        updateControlsUi()
-                    } catch (e: UninitializedPropertyAccessException) {
-                        Log.e(TAG, "ObjectDetectorHelper has not been initialized yet.")
-                    }
-                }
-
-                override fun onNothingSelected(p0: AdapterView<*>?) {
-                    /* no op */
-                }
-            }
-    }
-
-    private fun updateControlsUi() {
-        fragmentCameraBinding.bottomSheetLayout.maxResultsValue.text =
-            objectDetectorHelper.maxResults.toString()
-        fragmentCameraBinding.bottomSheetLayout.thresholdValue.text =
-            String.format("%.2f", objectDetectorHelper.threshold)
 
         backgroundExecutor.execute {
-            objectDetectorHelper.clearObjectDetector()
-            objectDetectorHelper.setupObjectDetector()
+            if (mlPipeline.isOdInitialized() && mlPipeline.objectDetectorHelper.isClosed()) {
+                mlPipeline.objectDetectorHelper.setupObjectDetector()
+            }
         }
 
-        objectDetectorHelper.clearDebounceState()
-        sceneAggregator.resetCooldown()
+        if (cameraSetup.cameraProvider != null) {
+            cameraSetup.rebindCamera(
+                requireContext(), this,
+                fragmentCameraBinding.viewFinder,
+                backgroundExecutor,
+                mlPipeline.createCompositeAnalyzer()
+            )
+        }
 
-        fragmentCameraBinding.overlay.clear()
-        fragmentCameraBinding.highContrastOverlay.clear()
+        isCameraActive = true
+        mainHandler.postDelayed(sceneSummaryRunnable, SCENE_SUMMARY_INTERVAL_MS)
+        mainHandler.postDelayed(batteryCheckRunnable, BATTERY_CHECK_INTERVAL_MS)
     }
 
-    // ── Camera Setup ─────────────────────────────────────────────────────
+    override fun onPause() {
+        super.onPause()
+        mainHandler.removeCallbacks(sceneSummaryRunnable)
+        mainHandler.removeCallbacks(batteryCheckRunnable)
+        isCameraActive = false
+
+        if (this::voiceCommandManager.isInitialized && voiceCommandManager.isCurrentlyListening()) {
+            voiceCommandManager.stopListening()
+        }
+        if (this::flashlightManager.isInitialized && flashlightManager.isTorchOn()) {
+            flashlightManager.toggleTorch(false)
+        }
+        if (this::onboardingManager.isInitialized) onboardingManager.cancelTutorial()
+
+        cameraSetup.releaseCamera()
+
+        if (mlPipeline.isOdInitialized()) {
+            viewModel.setModel(mlPipeline.objectDetectorHelper.currentModel)
+            viewModel.setDelegate(mlPipeline.objectDetectorHelper.currentDelegate)
+            viewModel.setThreshold(mlPipeline.objectDetectorHelper.threshold)
+            viewModel.setMaxResults(mlPipeline.objectDetectorHelper.maxResults)
+            backgroundExecutor.execute { mlPipeline.objectDetectorHelper.clearObjectDetector() }
+        }
+
+        clearOverlays()
+        mlPipeline.reset()
+    }
+
+    override fun onDestroyView() {
+        _fragmentCameraBinding = null
+        super.onDestroyView()
+
+        mainHandler.removeCallbacks(sceneSummaryRunnable)
+        mainHandler.removeCallbacks(batteryCheckRunnable)
+        if (this::onboardingManager.isInitialized) onboardingManager.cancelTutorial()
+        if (this::gestureRouter.isInitialized) gestureRouter.detach()
+
+        backgroundExecutor.shutdown()
+        backgroundExecutor.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS)
+
+        if (this::ttsManager.isInitialized) ttsManager.onDestroy()
+        if (this::hapticManager.isInitialized) hapticManager.cancel()
+        if (this::voiceCommandManager.isInitialized) voiceCommandManager.destroy()
+        if (this::mlPipeline.isInitialized) mlPipeline.shutdown()
+        if (this::readingModeHelper.isInitialized) readingModeHelper.exitReadingMode()
+        if (this::medicineReaderHelper.isInitialized) medicineReaderHelper.exitMedicineMode()
+
+        cameraSetup.destroy()
+
+        clearOverlays()
+        mlPipeline.reset()
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        cameraSetup.updateRotation(fragmentCameraBinding.viewFinder.display)
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Camera Setup
+    // ══════════════════════════════════════════════════════════════════
 
     private fun setUpCamera() {
-        val cameraProviderFuture =
-            ProcessCameraProvider.getInstance(requireContext())
-        cameraProviderFuture.addListener(
-            {
-                cameraProvider = cameraProviderFuture.get()
-                bindCameraUseCases()
-            },
-            ContextCompat.getMainExecutor(requireContext())
+        cameraSetup.setupCamera(
+            context = requireContext(),
+            lifecycleOwner = this,
+            previewView = fragmentCameraBinding.viewFinder,
+            backgroundExecutor = backgroundExecutor,
+            analyzer = mlPipeline.createCompositeAnalyzer(),
+            flashlightMgr = flashlightManager
         )
-    }
-
-    @SuppressLint("UnsafeOptInUsageError")
-    private fun bindCameraUseCases() {
-        val cameraProvider =
-            cameraProvider
-                ?: throw IllegalStateException("Camera initialization failed.")
-
-        val cameraSelector =
-            CameraSelector.Builder()
-                .requireLensFacing(CameraSelector.LENS_FACING_BACK).build()
-
-        preview =
-            Preview.Builder()
-                .setTargetAspectRatio(AspectRatio.RATIO_4_3)
-                .setTargetRotation(fragmentCameraBinding.viewFinder.display.rotation)
-                .build()
-
-        imageAnalyzer =
-            ImageAnalysis.Builder()
-                .setTargetAspectRatio(AspectRatio.RATIO_4_3)
-                .setTargetRotation(fragmentCameraBinding.viewFinder.display.rotation)
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .setOutputImageFormat(OUTPUT_IMAGE_FORMAT_RGBA_8888)
-                .build()
-                .also {
-                    it.setAnalyzer(
-                        backgroundExecutor,
-                        createCompositeAnalyzer()
-                    )
-                }
-
-        cameraProvider.unbindAll()
-
-        try {
-            camera = cameraProvider.bindToLifecycle(
-                this,
-                cameraSelector,
-                preview,
-                imageAnalyzer
-            )
-
-            flashlightManager.camera = camera
-            preview?.setSurfaceProvider(fragmentCameraBinding.viewFinder.surfaceProvider)
-
-            startVoiceListening()
-        } catch (exc: Exception) {
-            Log.e(TAG, "Use case binding failed", exc)
-        }
+        startVoiceListening()
     }
 
     private fun startVoiceListening() {
@@ -746,168 +345,255 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
         }, VOICE_LISTENING_DELAY_MS)
     }
 
-    // ── Composite Analyzer ───────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════
+    // Voice Commands
+    // ══════════════════════════════════════════════════════════════════
 
-    /**
-     * Creates a composite analyzer with frame throttling and battery optimization.
-     *
-     * **Battery optimization:** Processes 1 out of every 3 frames (~10 FPS instead
-     * of 30 FPS), reducing CPU/GPU load by ~66%. Luminance analysis still runs on
-     * every frame for accurate auto-torch response.
-     *
-     * **Frame throttling:** Prevents frame accumulation when the previous frame
-     * is still being analyzed.
-     *
-     * Frame processing pipeline:
-     *  1. LuminanceAnalyzer — reads Y plane (every frame, no close)
-     *  2. Frame skip check — skip OD/OCR/barcode/face on 2 of 3 frames
-     *  3. Create shared bitmap from imageProxy, close proxy
-     *  4. BarcodeAnalyzer — scans for UPC/EAN/QR on bitmap
-     *  5. FaceDetectorHelper — detects faces on bitmap
-     *  6. TextRecognitionHelper (if OCR requested) OR ObjectDetectorHelper
-     */
-    private fun createCompositeAnalyzer(): ImageAnalysis.Analyzer {
-        val luminanceAnalyzer = LuminanceAnalyzer { isDark, meanLuminance ->
-            latestIsDark = isDark
-            latestMeanLuminance = meanLuminance
-
+    private fun setupVoiceCommands() {
+        voiceCommandManager.onOcrRequested = {
+            activity?.runOnUiThread { if (isAdded) performOcrOnCurrentFrame() }
+        }
+        voiceCommandManager.onObjectDetectionRequested = {
+            activity?.runOnUiThread { if (isAdded) announceDetectedObject() }
+        }
+        voiceCommandManager.onLightCheckRequested = {
+            activity?.runOnUiThread { if (isAdded) announceLightConditions() }
+        }
+        voiceCommandManager.onListeningStateChanged = { listening ->
             activity?.runOnUiThread {
-                if (isAdded && this::flashlightManager.isInitialized) {
-                    flashlightManager.autoTorch(isDark)
+                if (isAdded) {
+                    if (listening) {
+                        ttsManager.stop()
+                        ttsManager.speakImmediate(context?.getString(R.string.voice_listening) ?: "Listening for commands...")
+                    } else {
+                        ttsManager.speakImmediate(context?.getString(R.string.voice_stopped) ?: "Listening stopped.")
+                    }
                 }
             }
         }
-
-        return ImageAnalysis.Analyzer { imageProxy ->
-            // Always run luminance on every frame for accurate auto-torch
-            luminanceAnalyzer.analyzeLuminance(imageProxy)
-
-            // Battery optimization: process 1 of every 3 frames
-            val count = frameCounter.incrementAndGet()
-            if (count % FRAME_SKIP_RATIO != 0) {
-                imageProxy.close()
-                return@Analyzer
-            }
-
-            // Frame throttling: skip if previous frame still processing
-            if (!isAnalyzing.compareAndSet(false, true)) {
-                imageProxy.close()
-                return@Analyzer
-            }
-
-            var sharedBitmap: android.graphics.Bitmap? = null
-            try {
-                // Create shared bitmap from the RGBA_8888 frame
-                val rotationDegrees = imageProxy.imageInfo.rotationDegrees
-                sharedBitmap = android.graphics.Bitmap.createBitmap(
-                    imageProxy.width, imageProxy.height,
-                    android.graphics.Bitmap.Config.ARGB_8888
-                )
-                imageProxy.use { sharedBitmap!!.copyPixelsFromBuffer(imageProxy.planes[0].buffer) }
-                imageProxy.close()
-
-                // Run barcode and face detection on the shared bitmap
-                val latch = CountDownLatch(2)
-
-                barcodeAnalyzer.processBitmap(
-                    sharedBitmap, rotationDegrees,
-                    onSuccess = { announcements ->
-                        if (announcements.isNotEmpty()) {
-                            activity?.runOnUiThread {
-                                if (isAdded) ttsManager.speak(announcements.first())
-                            }
-                        }
-                        latch.countDown()
-                    },
-                    onError = { latch.countDown() }
-                )
-
-                faceDetectorHelper.processBitmap(
-                    sharedBitmap, rotationDegrees,
-                    onSuccess = { announcements ->
-                        if (announcements.isNotEmpty()) {
-                            activity?.runOnUiThread {
-                                if (isAdded) ttsManager.speak(announcements.first())
-                            }
-                        }
-                        latch.countDown()
-                    },
-                    onError = { latch.countDown() }
-                )
-
-                latch.await(3, TimeUnit.SECONDS)
-
-                // Route to OCR or OD
-                if (ocrRequested.compareAndSet(true, false)) {
-                    textRecognitionHelper.processBitmap(
-                        sharedBitmap, rotationDegrees,
-                        onSuccess = { recognizedText ->
-                            activity?.runOnUiThread {
-                                if (isAdded) {
-                                    highContrastOverlay.setOcrText(recognizedText)
-                                    ttsManager.speakImmediate(recognizedText)
-                                }
-                            }
-                            isAnalyzing.set(false)
-                        },
-                        onError = { error ->
-                            Log.e(TAG, "OCR processing failed", error)
-                            activity?.runOnUiThread {
-                                if (isAdded) {
-                                    highContrastOverlay.clearOcrText()
-                                    ttsManager.speakImmediate("Text recognition failed. Please try again.")
-                                }
-                            }
-                            isAnalyzing.set(false)
-                        }
-                    )
-                } else {
-                    objectDetectorHelper.detectLivestreamBitmap(
-                        sharedBitmap, SystemClock.uptimeMillis()
-                    )
-                    isAnalyzing.set(false)
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Composite analyzer error", e)
-                imageProxy.close()
-                isAnalyzing.set(false)
+        voiceCommandManager.onError = { error -> Log.w(TAG, "Voice command error: $error") }
+        voiceCommandManager.onTextRecognized = { text ->
+            if (text.isNotEmpty()) {
+                activity?.runOnUiThread { if (isAdded) voiceCommandManager.parseAndTrigger(text) }
             }
         }
     }
 
-    // ── OD Results Callback ──────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════
+    // Actions (called by GestureRouter)
+    // ══════════════════════════════════════════════════════════════════
 
-    override fun onConfigurationChanged(newConfig: Configuration) {
-        super.onConfigurationChanged(newConfig)
-        imageAnalyzer?.targetRotation =
-            fragmentCameraBinding.viewFinder.display.rotation
+    private fun performOcrOnCurrentFrame() {
+        ttsManager.speakImmediate(context?.getString(R.string.ocr_reading) ?: "Reading text...")
+        mlPipeline.requestOcr()
     }
+
+    private fun announceDetectedObject() {
+        if (!mlPipeline.isOdInitialized()) {
+            ttsManager.speak(context?.getString(R.string.od_no_objects) ?: "No objects detected yet.")
+            return
+        }
+        val resultBundle = mlPipeline.objectDetectorHelper.lastResultBundle ?: run {
+            ttsManager.speak(context?.getString(R.string.od_no_objects) ?: "No objects detected yet.")
+            return
+        }
+
+        val detections = resultBundle.results[0].detections()
+        if (detections.isNullOrEmpty()) {
+            ttsManager.speak(context?.getString(R.string.od_no_visible) ?: "No objects currently visible.")
+            return
+        }
+
+        val announcements = mlPipeline.objectDetectorHelper.getAnnounceableDetections(
+            resultBundle = resultBundle,
+            frameWidth = resultBundle.inputImageWidth,
+            frameHeight = resultBundle.inputImageHeight
+        )
+
+        if (announcements.isNotEmpty()) {
+            ttsManager.speak(announcements.first())
+        } else {
+            val topDetection = detections.maxByOrNull { it.categories()[0].score() }
+            if (topDetection != null) {
+                val cat = topDetection.categories()[0]
+                ttsManager.speak(context?.getString(R.string.od_detected, cat.categoryName(), (cat.score() * 100).toInt())
+                    ?: "${cat.categoryName()}, confidence ${(cat.score() * 100).toInt()} percent.")
+            } else {
+                ttsManager.speak(context?.getString(R.string.od_no_detected) ?: "No objects detected.")
+            }
+        }
+    }
+
+    private fun triggerSceneSummary() {
+        if (!mlPipeline.isOdInitialized()) {
+            ttsManager.speak(context?.getString(R.string.scene_no_data) ?: "No scene data available.")
+            return
+        }
+        val resultBundle = mlPipeline.objectDetectorHelper.lastResultBundle ?: run {
+            ttsManager.speak(context?.getString(R.string.scene_no_data) ?: "No scene data available.")
+            return
+        }
+
+        val detections = resultBundle.results[0].detections()
+        if (detections.isNullOrEmpty()) {
+            ttsManager.speak(context?.getString(R.string.scene_no_visible) ?: "No objects currently visible.")
+            return
+        }
+
+        val spatialDetections = detections.mapNotNull { detection ->
+            val category = detection.categories().firstOrNull() ?: return@mapNotNull null
+            mlPipeline.objectDetectorHelper.computeSpatialInfo(
+                boundingBox = detection.boundingBox(),
+                frameWidth = resultBundle.inputImageWidth,
+                frameHeight = resultBundle.inputImageHeight,
+                categoryName = category.categoryName(),
+                score = category.score()
+            )
+        }
+
+        val summary = sceneAggregator.aggregate(spatialDetections)
+        if (summary != null) {
+            hapticManager.vibrateLongPress()
+            ttsManager.speak(summary)
+            viewModel.saveSceneScan(summary)
+        } else {
+            ttsManager.speak(context?.getString(R.string.scene_summary_not_available) ?: "Scene summary not available.")
+        }
+    }
+
+    private fun announceLightConditions() {
+        val meanLuminance = mlPipeline.latestMeanLuminance
+        val isDark = mlPipeline.latestIsDark
+
+        if (meanLuminance == 0.0 && !isDark) {
+            ttsManager.speak(context?.getString(R.string.light_not_measured) ?: "Light level not yet measured.")
+            return
+        }
+
+        val brightness = meanLuminance.toInt()
+        if (isDark) {
+            hapticManager.vibrateWarning()
+            flashlightManager.autoTorch(true)
+            ttsManager.speakImmediate(context?.getString(R.string.light_dark, brightness) ?: "Environment is dark.")
+        } else {
+            flashlightManager.autoTorch(false)
+            ttsManager.speakImmediate(context?.getString(R.string.light_sufficient, brightness) ?: "Lighting is sufficient.")
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Battery Monitoring
+    // ══════════════════════════════════════════════════════════════════
+
+    private fun checkBatteryLevel() {
+        val batteryManager = requireContext().getSystemService(android.content.Context.BATTERY_SERVICE) as? BatteryManager
+        val batteryLevel = batteryManager?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: return
+
+        viewModel.updateBatteryLevel(batteryLevel)
+
+        if (batteryLevel <= BATTERY_CRITICAL_THRESHOLD && lastBatteryWarningLevel > BATTERY_CRITICAL_THRESHOLD) {
+            lastBatteryWarningLevel = BATTERY_CRITICAL_THRESHOLD
+            viewModel.setLastBatteryWarningLevel(BATTERY_CRITICAL_THRESHOLD)
+            hapticManager.vibrateWarning()
+            ttsManager.speakImmediate(
+                context?.getString(R.string.battery_critical_warning, batteryLevel)
+                    ?: "Battery critical: $batteryLevel percent."
+            )
+        } else if (batteryLevel <= BATTERY_LOW_THRESHOLD && lastBatteryWarningLevel > BATTERY_LOW_THRESHOLD) {
+            lastBatteryWarningLevel = BATTERY_LOW_THRESHOLD
+            viewModel.setLastBatteryWarningLevel(BATTERY_LOW_THRESHOLD)
+            ttsManager.speakImmediate(
+                context?.getString(R.string.battery_low_warning, batteryLevel)
+                    ?: "Battery low: $batteryLevel percent."
+            )
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Bottom Sheet Controls
+    // ══════════════════════════════════════════════════════════════════
+
+    private fun initBottomSheetControls() {
+        fragmentCameraBinding.bottomSheetLayout.maxResultsValue.text = viewModel.currentMaxResults.toString()
+        fragmentCameraBinding.bottomSheetLayout.thresholdValue.text = String.format("%.2f", viewModel.currentThreshold)
+
+        fragmentCameraBinding.bottomSheetLayout.thresholdMinus.setOnClickListener {
+            if (mlPipeline.objectDetectorHelper.threshold >= 0.1) {
+                mlPipeline.objectDetectorHelper.threshold -= 0.1f; updateControlsUi()
+            }
+        }
+        fragmentCameraBinding.bottomSheetLayout.thresholdPlus.setOnClickListener {
+            if (mlPipeline.objectDetectorHelper.threshold <= 0.8) {
+                mlPipeline.objectDetectorHelper.threshold += 0.1f; updateControlsUi()
+            }
+        }
+        fragmentCameraBinding.bottomSheetLayout.maxResultsMinus.setOnClickListener {
+            if (mlPipeline.objectDetectorHelper.maxResults > 1) {
+                mlPipeline.objectDetectorHelper.maxResults--; updateControlsUi()
+            }
+        }
+        fragmentCameraBinding.bottomSheetLayout.maxResultsPlus.setOnClickListener {
+            if (mlPipeline.objectDetectorHelper.maxResults < 5) {
+                mlPipeline.objectDetectorHelper.maxResults++; updateControlsUi()
+            }
+        }
+
+        fragmentCameraBinding.bottomSheetLayout.spinnerDelegate.setSelection(viewModel.currentDelegate, false)
+        fragmentCameraBinding.bottomSheetLayout.spinnerDelegate.onItemSelectedListener =
+            object : AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(p0: AdapterView<*>?, p1: View?, p2: Int, p3: Long) {
+                    try {
+                        mlPipeline.objectDetectorHelper.currentDelegate = p2; updateControlsUi()
+                    } catch (e: UninitializedPropertyAccessException) {
+                        Log.e(TAG, "OD not initialized.")
+                    }
+                }
+                override fun onNothingSelected(p0: AdapterView<*>?) {}
+            }
+
+        fragmentCameraBinding.bottomSheetLayout.spinnerModel.setSelection(viewModel.currentModel, false)
+        fragmentCameraBinding.bottomSheetLayout.spinnerModel.onItemSelectedListener =
+            object : AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(p0: AdapterView<*>?, p1: View?, p2: Int, p3: Long) {
+                    try {
+                        mlPipeline.objectDetectorHelper.currentModel = p2; updateControlsUi()
+                    } catch (e: UninitializedPropertyAccessException) {
+                        Log.e(TAG, "OD not initialized.")
+                    }
+                }
+                override fun onNothingSelected(p0: AdapterView<*>?) {}
+            }
+    }
+
+    private fun updateControlsUi() {
+        fragmentCameraBinding.bottomSheetLayout.maxResultsValue.text = mlPipeline.objectDetectorHelper.maxResults.toString()
+        fragmentCameraBinding.bottomSheetLayout.thresholdValue.text = String.format("%.2f", mlPipeline.objectDetectorHelper.threshold)
+        backgroundExecutor.execute { mlPipeline.reinitializeOd() }
+        mlPipeline.resetCooldowns()
+        sceneAggregator.resetCooldown()
+        clearOverlays()
+    }
+
+    private fun clearOverlays() {
+        if (_fragmentCameraBinding != null) {
+            try { fragmentCameraBinding.overlay.clear() } catch (_: Exception) {}
+            try { fragmentCameraBinding.highContrastOverlay.clear() } catch (_: Exception) {}
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // OD Results Callback
+    // ══════════════════════════════════════════════════════════════════
 
     override fun onResults(resultBundle: ObjectDetectorHelper.ResultBundle) {
-        latestDetectionResult = resultBundle
-
         activity?.runOnUiThread {
             if (_fragmentCameraBinding != null) {
-                fragmentCameraBinding.bottomSheetLayout.inferenceTimeVal.text =
-                    String.format("%d ms", resultBundle.inferenceTime)
-
+                fragmentCameraBinding.bottomSheetLayout.inferenceTimeVal.text = String.format("%d ms", resultBundle.inferenceTime)
                 val detectionResult = resultBundle.results[0]
                 if (isAdded) {
-                    fragmentCameraBinding.overlay.setResults(
-                        detectionResult,
-                        resultBundle.inputImageHeight,
-                        resultBundle.inputImageWidth,
-                        resultBundle.inputImageRotation
-                    )
-
-                    fragmentCameraBinding.highContrastOverlay.setResults(
-                        detectionResult,
-                        resultBundle.inputImageHeight,
-                        resultBundle.inputImageWidth,
-                        resultBundle.inputImageRotation
-                    )
+                    fragmentCameraBinding.overlay.setResults(detectionResult, resultBundle.inputImageHeight, resultBundle.inputImageWidth, resultBundle.inputImageRotation)
+                    fragmentCameraBinding.highContrastOverlay.setResults(detectionResult, resultBundle.inputImageHeight, resultBundle.inputImageWidth, resultBundle.inputImageRotation)
                 }
-
                 fragmentCameraBinding.overlay.invalidate()
                 fragmentCameraBinding.highContrastOverlay.invalidate()
             }
@@ -918,26 +604,63 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
         activity?.runOnUiThread {
             Toast.makeText(requireContext(), error, Toast.LENGTH_SHORT).show()
             if (errorCode == ObjectDetectorHelper.GPU_ERROR) {
-                fragmentCameraBinding.bottomSheetLayout.spinnerDelegate.setSelection(
-                    ObjectDetectorHelper.DELEGATE_CPU, false
-                )
+                fragmentCameraBinding.bottomSheetLayout.spinnerDelegate.setSelection(ObjectDetectorHelper.DELEGATE_CPU, false)
             }
         }
     }
 
+    // ══════════════════════════════════════════════════════════════════
+    // P2: Specialized Modes
+    // ══════════════════════════════════════════════════════════════════
+
+    /**
+     * Toggles reading mode on/off.
+     * In reading mode, the camera pipeline uses ReadingModeHelper for
+     * continuous line tracking and page detection.
+     */
+    fun toggleReadingMode() {
+        if (isReadingMode) {
+            isReadingMode = false
+            readingModeHelper.exitReadingMode()
+            ttsManager.speakImmediate(context?.getString(R.string.reading_mode_deactivated) ?: "Reading mode off.")
+        } else {
+            // Disable medicine mode if active
+            if (isMedicineMode) toggleMedicineMode()
+            isReadingMode = true
+            readingModeHelper.enterReadingMode()
+            ttsManager.speakImmediate(context?.getString(R.string.reading_mode_activated) ?: "Reading mode on.")
+        }
+    }
+
+    /**
+     * Toggles medicine reader mode on/off.
+     * In medicine mode, the camera pipeline uses MedicineReaderHelper for
+     * prescription label parsing with dosage warnings.
+     */
+    fun toggleMedicineMode() {
+        if (isMedicineMode) {
+            isMedicineMode = false
+            medicineReaderHelper.exitMedicineMode()
+            ttsManager.speakImmediate(context?.getString(R.string.medicine_mode_deactivated) ?: "Medicine mode off.")
+        } else {
+            // Disable reading mode if active
+            if (isReadingMode) toggleReadingMode()
+            isMedicineMode = true
+            medicineReaderHelper.enterMedicineMode()
+            ttsManager.speakImmediate(context?.getString(R.string.medicine_mode_activated) ?: "Medicine mode on.")
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Companion Constants
+    // ══════════════════════════════════════════════════════════════════
+
     companion object {
         private const val VOICE_LISTENING_DELAY_MS = 2000L
-
-        /**
-         * Process 1 out of every 3 frames for battery optimization.
-         * At 30 FPS camera output, this yields ~10 FPS processing.
-         */
-        const val FRAME_SKIP_RATIO = 3
-
-        /**
-         * Interval for automatic scene summary announcements.
-         * Fires every 6 seconds while the camera is active.
-         */
         const val SCENE_SUMMARY_INTERVAL_MS = 6000L
+        const val ONBOARDING_DELAY_MS = 3000L
+        const val BATTERY_CHECK_INTERVAL_MS = 120_000L
+        const val BATTERY_LOW_THRESHOLD = 15
+        const val BATTERY_CRITICAL_THRESHOLD = 5
     }
 }

@@ -12,8 +12,12 @@ import android.widget.SeekBar
 import android.widget.Spinner
 import android.widget.TextView
 import androidx.fragment.app.Fragment
+import androidx.fragment.app.activityViewModels
 import com.vyze.app.R
 import com.vyze.app.TTSManager
+import com.vyze.app.TtsViewModel
+import kotlinx.coroutines.MainScope
+import kotlinx.coroutines.launch
 
 /**
  * Accessible TTS settings screen for visually impaired users.
@@ -37,6 +41,7 @@ import com.vyze.app.TTSManager
  */
 class TtsSettingsFragment : Fragment() {
 
+    private val ttsViewModel: TtsViewModel by activityViewModels()
     private lateinit var ttsManager: TTSManager
     private lateinit var prefs: android.content.SharedPreferences
 
@@ -50,6 +55,15 @@ class TtsSettingsFragment : Fragment() {
     private lateinit var valueVolume: TextView
     private lateinit var sliderVolume: SeekBar
     private lateinit var btnTestVoice: Button
+
+    // P2 views
+    private lateinit var valueNightMode: TextView
+    private lateinit var spinnerNightMode: Spinner
+    private lateinit var btnReadingMode: Button
+    private lateinit var btnMedicineMode: Button
+    private lateinit var btnGestureTutorial: Button
+    private lateinit var btnErrorLog: Button
+    private lateinit var nightModeHelper: com.vyze.app.NightModeHelper
 
     // Debounce for slider changes — speak sample only after 500ms of inactivity
     private val handler = android.os.Handler(android.os.Looper.getMainLooper())
@@ -66,10 +80,10 @@ class TtsSettingsFragment : Fragment() {
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
 
-        // Initialize TTS Manager and preferences
-        ttsManager = TTSManager(requireContext().applicationContext)
+        // Use singleton TTSManager from ViewModel
+        ttsManager = ttsViewModel.ttsManager
         prefs = requireContext().getSharedPreferences(
-            TTSManager.PREFS_NAME, Context.MODE_PRIVATE
+            TTSManager.PREFS_NAME, android.content.Context.MODE_PRIVATE
         )
 
         // Apply saved settings immediately
@@ -95,6 +109,17 @@ class TtsSettingsFragment : Fragment() {
         setupPitchSlider()
         setupVolumeSlider()
         setupTestButton()
+
+        // P2: Night mode + specialized modes
+        nightModeHelper = com.vyze.app.NightModeHelper(requireContext().applicationContext)
+        valueNightMode = view.findViewById(R.id.value_night_mode)
+        spinnerNightMode = view.findViewById(R.id.spinner_night_mode)
+        btnReadingMode = view.findViewById(R.id.btn_reading_mode)
+        btnMedicineMode = view.findViewById(R.id.btn_medicine_mode)
+        btnGestureTutorial = view.findViewById(R.id.btn_gesture_tutorial)
+        btnErrorLog = view.findViewById(R.id.btn_error_log)
+        setupNightModeSpinner()
+        setupModeButtons()
     }
 
     /**
@@ -303,9 +328,92 @@ class TtsSettingsFragment : Fragment() {
         pendingSpeakRunnable = null
     }
 
+    // ── Night Mode ─────────────────────────────────────────────────────
+
+    private fun setupNightModeSpinner() {
+        val modeLabels = listOf(
+            requireContext().getString(R.string.night_mode_light),
+            requireContext().getString(R.string.night_mode_dark),
+            requireContext().getString(R.string.night_mode_system)
+        )
+        val adapter = ArrayAdapter(
+            requireContext(),
+            android.R.layout.simple_spinner_item,
+            modeLabels
+        )
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        spinnerNightMode.adapter = adapter
+
+        // Set current selection
+        val currentMode = nightModeHelper.getNightMode()
+        val selectedIndex = when (currentMode) {
+            androidx.appcompat.app.AppCompatDelegate.MODE_NIGHT_NO -> 0
+            androidx.appcompat.app.AppCompatDelegate.MODE_NIGHT_YES -> 1
+            else -> 2
+        }
+        spinnerNightMode.setSelection(selectedIndex, false)
+        valueNightMode.text = nightModeHelper.getCurrentModeName()
+
+        spinnerNightMode.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                val mode = when (position) {
+                    0 -> androidx.appcompat.app.AppCompatDelegate.MODE_NIGHT_NO
+                    1 -> androidx.appcompat.app.AppCompatDelegate.MODE_NIGHT_YES
+                    else -> androidx.appcompat.app.AppCompatDelegate.MODE_NIGHT_FOLLOW_SYSTEM
+                }
+                if (mode != nightModeHelper.getNightMode()) {
+                    nightModeHelper.setNightMode(mode)
+                    valueNightMode.text = nightModeHelper.getCurrentModeName()
+                    ttsManager.speakImmediate(
+                        requireContext().getString(R.string.night_mode_toggled, nightModeHelper.getCurrentModeName())
+                    )
+                }
+            }
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
+        }
+    }
+
+    // ── Specialized Mode Buttons ──────────────────────────────────────
+
+    private fun setupModeButtons() {
+        btnReadingMode.setOnClickListener {
+            ttsManager.speakImmediate(requireContext().getString(R.string.reading_mode_activated))
+            // Return to camera with reading mode flag
+            val navController = androidx.navigation.Navigation.findNavController(requireActivity(), R.id.fragment_container)
+            navController.popBackStack()
+        }
+
+        btnMedicineMode.setOnClickListener {
+            ttsManager.speakImmediate(requireContext().getString(R.string.medicine_mode_activated))
+            val navController = androidx.navigation.Navigation.findNavController(requireActivity(), R.id.fragment_container)
+            navController.popBackStack()
+        }
+
+        btnGestureTutorial.setOnClickListener {
+            ttsManager.speakImmediate(requireContext().getString(R.string.tutorial_start))
+            val navController = androidx.navigation.Navigation.findNavController(requireActivity(), R.id.fragment_container)
+            navController.popBackStack()
+        }
+
+        btnErrorLog.setOnClickListener {
+            val app = requireContext().applicationContext as com.vyze.app.VyzeApplication
+            kotlinx.coroutines.MainScope().launch {
+                val errors = app.errorLogRepository.getRecentErrors(10)
+                if (errors.isEmpty()) {
+                    ttsManager.speakImmediate(requireContext().getString(R.string.error_log_empty))
+                } else {
+                    ttsManager.speakImmediate(
+                        requireContext().getString(R.string.error_log_count, errors.size) +
+                            ". Latest: ${errors.first().message.take(100)}"
+                    )
+                }
+            }
+        }
+    }
+
     override fun onDestroyView() {
         cancelPendingSpeak()
-        ttsManager.onDestroy()
+        // Do NOT call ttsManager.onDestroy() — it's owned by TtsViewModel
         super.onDestroyView()
     }
 

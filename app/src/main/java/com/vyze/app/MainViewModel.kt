@@ -1,51 +1,195 @@
-/*
- * Copyright 2022 The TensorFlow Authors. All Rights Reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *             http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
 package com.vyze.app
 
-import androidx.lifecycle.ViewModel
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.SavedStateHandle
+import androidx.lifecycle.viewModelScope
+import com.vyze.app.data.ScanRepository
+import com.vyze.app.data.ScanEntity
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 
 /**
- *  This ViewModel is used to store object detector helper settings
+ * Main ViewModel for Vyze, holding all shared application state.
+ *
+ * Uses [SavedStateHandle] to persist critical settings across process death.
+ * Replaces the original OD-only ViewModel with a comprehensive state holder.
+ *
+ * ## State Categories
+ * 1. **Object Detection** — delegate, threshold, max results, model
+ * 2. **Active Language** — TTS language key (en/ms/zh)
+ * 3. **Battery State** — current level, last warning level
+ * 4. **Scene Mode** — active scene mode / scene summary toggle
+ * 5. **Scan History** — reactive flow of recent scans
  */
-class MainViewModel : ViewModel() {
-    private var _delegate: Int = ObjectDetectorHelper.DELEGATE_CPU
-    private var _threshold: Float =
-        ObjectDetectorHelper.THRESHOLD_DEFAULT
-    private var _maxResults: Int =
-        ObjectDetectorHelper.MAX_RESULTS_DEFAULT
-    private var _model: Int = ObjectDetectorHelper.MODEL_EFFICIENTDETV0
+class MainViewModel(
+    application: Application,
+    private val savedStateHandle: SavedStateHandle
+) : AndroidViewModel(application) {
 
-    val currentDelegate: Int get() = _delegate
-    val currentThreshold: Float get() = _threshold
-    val currentMaxResults: Int get() = _maxResults
-    val currentModel: Int get() = _model
+    private val scanRepository = ScanRepository(application.applicationContext)
+
+    // ══════════════════════════════════════════════════════════════════
+    // Object Detection State (persisted via SavedStateHandle)
+    // ══════════════════════════════════════════════════════════════════
+
+    val currentDelegate: Int
+        get() = savedStateHandle[KEY_DELEGATE] ?: ObjectDetectorHelper.DELEGATE_CPU
+
+    val currentThreshold: Float
+        get() = savedStateHandle[KEY_THRESHOLD] ?: ObjectDetectorHelper.THRESHOLD_DEFAULT
+
+    val currentMaxResults: Int
+        get() = savedStateHandle[KEY_MAX_RESULTS] ?: ObjectDetectorHelper.MAX_RESULTS_DEFAULT
+
+    val currentModel: Int
+        get() = savedStateHandle[KEY_MODEL] ?: ObjectDetectorHelper.MODEL_EFFICIENTDETV0
 
     fun setDelegate(delegate: Int) {
-        _delegate = delegate
+        savedStateHandle[KEY_DELEGATE] = delegate
     }
 
     fun setThreshold(threshold: Float) {
-        _threshold = threshold
+        savedStateHandle[KEY_THRESHOLD] = threshold
     }
 
     fun setMaxResults(maxResults: Int) {
-        _maxResults = maxResults
+        savedStateHandle[KEY_MAX_RESULTS] = maxResults
     }
 
     fun setModel(model: Int) {
-        _model = model
+        savedStateHandle[KEY_MODEL] = model
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Active Language State
+    // ══════════════════════════════════════════════════════════════════
+
+    private val _activeLanguage = MutableStateFlow(
+        savedStateHandle[KEY_ACTIVE_LANGUAGE] ?: TTSManager.LANGUAGE_ENGLISH
+    )
+
+    /** Current TTS language key. Observed by UI for language selector binding. */
+    val activeLanguage: StateFlow<String> = _activeLanguage.asStateFlow()
+
+    fun setActiveLanguage(languageKey: String) {
+        savedStateHandle[KEY_ACTIVE_LANGUAGE] = languageKey
+        _activeLanguage.value = languageKey
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Battery State
+    // ══════════════════════════════════════════════════════════════════
+
+    private val _batteryLevel = MutableStateFlow(-1)
+
+    /** Current battery level (0–100), or -1 if unknown. */
+    val batteryLevel: StateFlow<Int> = _batteryLevel.asStateFlow()
+
+    private val _lastBatteryWarningLevel = MutableStateFlow(-1)
+
+    /** Last level at which a battery warning was spoken. */
+    val lastBatteryWarningLevel: StateFlow<Int> = _lastBatteryWarningLevel.asStateFlow()
+
+    fun updateBatteryLevel(level: Int) {
+        _batteryLevel.value = level
+    }
+
+    fun setLastBatteryWarningLevel(level: Int) {
+        _lastBatteryWarningLevel.value = level
+        savedStateHandle[KEY_LAST_BATTERY_WARNING] = level
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Scene Mode
+    // ══════════════════════════════════════════════════════════════════
+
+    private val _isSceneModeActive = MutableStateFlow(false)
+
+    /** Whether automatic scene summaries are enabled. */
+    val isSceneModeActive: StateFlow<Boolean> = _isSceneModeActive.asStateFlow()
+
+    fun setSceneModeActive(active: Boolean) {
+        _isSceneModeActive.value = active
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Scan History (reactive via Room)
+    // ══════════════════════════════════════════════════════════════════
+
+    private val _recentScans = MutableStateFlow<List<ScanEntity>>(emptyList())
+
+    /** Recent scan history. Updated whenever a new scan is saved. */
+    val recentScans: StateFlow<List<ScanEntity>> = _recentScans.asStateFlow()
+
+    /** Load the most recent scans from the database. */
+    fun loadRecentScans(limit: Int = 3) {
+        viewModelScope.launch {
+            _recentScans.value = scanRepository.getRecentScans(limit)
+        }
+    }
+
+    /** Save a scan and refresh the list. */
+    fun saveScan(type: String, content: String, metadata: String = "") {
+        viewModelScope.launch {
+            scanRepository.saveScan(type, content, metadata)
+            loadRecentScans()
+        }
+    }
+
+    /** Save an OCR scan. */
+    fun saveOcrScan(text: String) {
+        saveScan(ScanRepository.TYPE_OCR, text)
+    }
+
+    /** Save a barcode scan. */
+    fun saveBarcodeScan(content: String, format: String = "") {
+        saveScan(ScanRepository.TYPE_BARCODE, content, format)
+    }
+
+    /** Save a currency detection. */
+    fun saveCurrencyScan(denomination: String) {
+        saveScan(ScanRepository.TYPE_CURRENCY, denomination)
+    }
+
+    /** Save a color analysis. */
+    fun saveColorScan(colorName: String) {
+        saveScan(ScanRepository.TYPE_COLOR, colorName)
+    }
+
+    /** Save a scene summary. */
+    fun saveSceneScan(summary: String) {
+        saveScan(ScanRepository.TYPE_SCENE, summary)
+    }
+
+    /** Format recent scans for TTS readout. */
+    fun formatRecentScansForTts(limit: Int = 3, onResult: (String) -> Unit) {
+        viewModelScope.launch {
+            val text = scanRepository.formatRecentScansForTts(limit)
+            onResult(text)
+        }
+    }
+
+    /** Clear all scan history. */
+    fun clearScanHistory() {
+        viewModelScope.launch {
+            scanRepository.clearAllScans()
+            loadRecentScans()
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Companion — SavedStateHandle Keys
+    // ══════════════════════════════════════════════════════════════════
+
+    companion object {
+        private const val KEY_DELEGATE = "od_delegate"
+        private const val KEY_THRESHOLD = "od_threshold"
+        private const val KEY_MAX_RESULTS = "od_max_results"
+        private const val KEY_MODEL = "od_model"
+        private const val KEY_ACTIVE_LANGUAGE = "active_language"
+        private const val KEY_LAST_BATTERY_WARNING = "last_battery_warning"
     }
 }

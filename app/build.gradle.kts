@@ -134,6 +134,24 @@ dependencies {
     // MediaPipe
     implementation("com.google.mediapipe:tasks-vision:0.10.8")
 
+    // Room (local database for scan history)
+    val room_version = "2.7.0"
+    implementation("androidx.room:room-runtime:$room_version")
+    implementation("androidx.room:room-ktx:$room_version")
+    kapt("androidx.room:room-compiler:$room_version")
+
+    // SavedStateHandle
+    implementation("androidx.lifecycle:lifecycle-viewmodel-savedstate:2.7.0")
+
+    // Lifecycle Service (for AccessibilityService)
+    implementation("androidx.lifecycle:lifecycle-service:2.7.0")
+    implementation("androidx.activity:activity-ktx:1.8.2")
+
+    // Instrumented testing — Room
+    androidTestImplementation("androidx.room:room-testing:2.7.0")
+    androidTestImplementation("androidx.test.espresso:espresso-contrib:3.5.1")
+    androidTestImplementation("androidx.test.espresso:espresso-intents:3.5.1")
+
     // Unit testing
     testImplementation("androidx.test.ext:junit:1.1.5")
     testImplementation("androidx.test:rules:1.5.0")

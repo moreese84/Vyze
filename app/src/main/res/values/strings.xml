@@ -125,4 +125,75 @@
     <string name="scene_no_data">No scene data available yet.</string>
     <string name="scene_no_visible">No objects currently visible.</string>
     <string name="scene_summary_not_available">Scene summary not available. Please wait.</string>
+
+    <!-- ── Accessibility (TalkBack) ────────────────────────────────── -->
+    <string name="camera_container_desc">Vyze camera screen. Tap to detect objects. Double-tap to read text. Long-press for scene summary.</string>
+    <string name="view_finder_desc">Camera preview feed showing live detection results</string>
+    <string name="overlay_desc">Object detection bounding box overlay</string>
+    <string name="high_contrast_overlay_desc">High-contrast detection overlay for low-vision users</string>
+    <string name="bottom_sheet_desc">Object detection settings panel</string>
+
+    <!-- ── Emergency SOS ───────────────────────────────────────────── -->
+    <string name="sos_activated">Emergency mode activated. Opening dialer.</string>
+    <string name="sos_deactivated">Emergency mode deactivated.</string>
+
+    <!-- ── Battery ─────────────────────────────────────────────────── -->
+    <string name="battery_low_warning">Battery low: %1$d percent. Consider reducing ML frequency.</string>
+    <string name="battery_critical_warning">Battery critical: %1$d percent. Please charge your device.</string>
+
+    <!-- ── Color Analysis ──────────────────────────────────────────── -->
+    <string name="color_analyzing">Analyzing color&#8230;</string>
+    <string name="color_result">Color detected: %1$s</string>
+    <string name="color_unknown">Unknown</string>
+
+    <!-- ── Reading Mode ──────────────────────────────────────────── -->
+    <string name="reading_mode_activated">Reading mode activated. Point at text to read.</string>
+    <string name="reading_mode_deactivated">Reading mode deactivated.</string>
+    <string name="reading_next_lines">Reading next lines.</string>
+    <string name="reading_previous_lines">Reading previous lines.</string>
+    <string name="reading_bookmark">Bookmark saved at line %1$d.</string>
+    <string name="reading_resume">Resuming from bookmark at line %1$d.</string>
+    <string name="reading_page_summary">Page %1$d. %2$d lines. Currently at line %3$d.</string>
+    <string name="reading_no_text">No text detected. Point closer to the document.</string>
+    <string name="reading_end_of_page">Reached end of page.</string>
+
+    <!-- ── Medicine Mode ─────────────────────────────────────────── -->
+    <string name="medicine_mode_activated">Medicine reader activated. Point at a prescription label.</string>
+    <string name="medicine_mode_deactivated">Medicine reader deactivated.</string>
+    <string name="medicine_drug_name">Medicine: %1$s</string>
+    <string name="medicine_dosage">Dosage: %1$s</string>
+    <string name="medicine_frequency">How to take: %1$s</string>
+    <string name="medicine_warning">Warning! %1$s</string>
+    <string name="medicine_expired">This medicine may be expired. Expires: %1$s</string>
+    <string name="medicine_no_label">No medicine label detected. Point closer to the label.</string>
+
+    <!-- ── Night Mode ────────────────────────────────────────────── -->
+    <string name="night_mode_title">Theme</string>
+    <string name="night_mode_light">Light</string>
+    <string name="night_mode_dark">Dark</string>
+    <string name="night_mode_system">System</string>
+    <string name="night_mode_toggled">Theme changed to %1$s</string>
+
+    <!-- ── Gesture Tutorial ──────────────────────────────────────── -->
+    <string name="tutorial_title">Gesture Tutorial</string>
+    <string name="tutorial_start">Starting gesture tutorial. Follow the instructions.</string>
+    <string name="tutorial_step_single_tap">Tap once anywhere on the circle</string>
+    <string name="tutorial_step_double_tap">Tap twice quickly</string>
+    <string name="tutorial_step_long_press">Press and hold for 2 seconds</string>
+    <string name="tutorial_step_triple_tap">Tap three times quickly</string>
+    <string name="tutorial_step_triple_hold">Tap three times and hold on the last</string>
+    <string name="tutorial_success">Correct! Well done.</string>
+    <string name="tutorial_wrong">Not quite. Try again.</string>
+    <string name="tutorial_complete">Tutorial complete! You are ready to use Vyze.</string>
+
+    <!-- ── Error Log ─────────────────────────────────────────────── -->
+    <string name="error_log_title">Error Log</string>
+    <string name="error_log_empty">No errors logged.</string>
+    <string name="error_log_count">%1$d errors recorded</string>
+    <string name="error_log_cleared">Error log cleared.</string>
+
+    <!-- ── Accessibility Service ─────────────────────────────────── -->
+    <string name="accessibility_service_description">Vyze accessibility service provides TalkBack integration and gesture support for visually impaired users.</string>
+    <string name="accessibility_service_enabled">Vyze accessibility service enabled.</string>
+    <string name="accessibility_service_disabled">Vyze accessibility service disabled.</string>
 </resources>

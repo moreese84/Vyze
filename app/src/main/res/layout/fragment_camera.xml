@@ -18,25 +18,39 @@
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:id="@+id/camera_container"
     android:layout_width="match_parent"
-    android:layout_height="match_parent">
+    android:layout_height="match_parent"
+    android:contentDescription="@string/camera_container_desc"
+    android:importantForAccessibility="yes">
 
+    <!-- Camera preview feed -->
     <androidx.camera.view.PreviewView
         android:id="@+id/view_finder"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
+        android:contentDescription="@string/view_finder_desc"
+        android:importantForAccessibility="no"
         app:scaleType="fillStart"/>
 
+    <!-- Standard bounding box overlay for object detection -->
     <com.vyze.app.OverlayView
         android:id="@+id/overlay"
+        android:layout_width="match_parent"
         android:layout_height="match_parent"
-        android:layout_width="match_parent" />
+        android:contentDescription="@string/overlay_desc"
+        android:importantForAccessibility="no" />
 
+    <!-- High-contrast overlay for low-vision users -->
     <com.vyze.app.HighContrastOverlayView
         android:id="@+id/high_contrast_overlay"
+        android:layout_width="match_parent"
         android:layout_height="match_parent"
-        android:layout_width="match_parent" />
+        android:contentDescription="@string/high_contrast_overlay_desc"
+        android:importantForAccessibility="no" />
 
+    <!-- Bottom sheet with detection settings -->
     <include
         android:id="@+id/bottom_sheet_layout"
+        android:contentDescription="@string/bottom_sheet_desc"
         layout="@layout/info_bottom_sheet" />
+
 </androidx.coordinatorlayout.widget.CoordinatorLayout>

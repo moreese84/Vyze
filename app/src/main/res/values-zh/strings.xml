@@ -100,4 +100,91 @@
     <string name="scene_no_data">场景数据暂不可用。</string>
     <string name="scene_no_visible">当前没有可见的物体。</string>
     <string name="scene_summary_not_available">场景摘要暂不可用。请稍候。</string>
+
+    <!-- ── Accessibility (TalkBack) ────────────────────────────────── -->
+    <string name="camera_container_desc">Vyze相机屏幕。点击检测物体。双击读取文字。长按查看场景摘要。</string>
+    <string name="view_finder_desc">显示实时检测结果的相机预览</string>
+    <string name="overlay_desc">物体检测边界框覆盖层</string>
+    <string name="high_contrast_overlay_desc">为低视力用户设计的高对比度检测覆盖层</string>
+    <string name="bottom_sheet_desc">物体检测设置面板</string>
+
+    <!-- ── Emergency SOS ───────────────────────────────────────────── -->
+    <string name="sos_activated">紧急模式已激活。正在打开拨号器。</string>
+    <string name="sos_deactivated">紧急模式已停用。</string>
+
+    <!-- ── Battery ─────────────────────────────────────────────────── -->
+    <string name="battery_low_warning">电池电量低：百分之%1$d。请考虑降低ML频率。</string>
+    <string name="battery_critical_warning">电池电量危急：百分之%1$d。请为设备充电。</string>
+
+    <!-- ── Color Analysis ──────────────────────────────────────────── -->
+    <string name="color_analyzing">正在分析颜色&#8230;</string>
+    <string name="color_result">检测到颜色：%1$s</string>
+    <string name="color_unknown">未知</string>
+
+    <!-- ── Reading Mode ──────────────────────────────────────────── -->
+    <string name="reading_mode_activated">阅读模式已激活。指向文字即可朗读。</string>
+    <string name="reading_mode_deactivated">阅读模式已停用。</string>
+    <string name="reading_next_lines">正在朗读下几行。</string>
+    <string name="reading_previous_lines">正在朗读前几行。</string>
+    <string name="reading_bookmark">书签已保存在第%1$d行。</string>
+    <string name="reading_resume">从书签处继续，第%1$d行。</string>
+    <string name="reading_page_summary">第%1$d页，共%2$d行。当前在第%3$d行。</string>
+    <string name="reading_no_text">未检测到文字。请更靠近文档。</string>
+    <string name="reading_end_of_page">已到达页面末尾。</string>
+
+    <!-- ── Medicine Mode ─────────────────────────────────────────── -->
+    <string name="medicine_mode_activated">药品阅读器已激活。请指向处方标签。</string>
+    <string name="medicine_mode_deactivated">药品阅读器已停用。</string>
+    <string name="medicine_drug_name">药品：%1$s</string>
+    <string name="medicine_dosage">剂量：%1$s</string>
+    <string name="medicine_frequency">用法：%1$s</string>
+    <string name="medicine_warning">警告！%1$s</string>
+    <string name="medicine_expired">此药品可能已过期。有效期：%1$s</string>
+    <string name="medicine_no_label">未检测到药品标签。请更靠近标签。</string>
+
+    <!-- ── Night Mode ────────────────────────────────────────────── -->
+    <string name="night_mode_title">主题</string>
+    <string name="night_mode_light">浅色</string>
+    <string name="night_mode_dark">深色</string>
+    <string name="night_mode_system">跟随系统</string>
+    <string name="night_mode_toggled">主题已更改为%1$s</string>
+
+    <!-- ── Gesture Tutorial ──────────────────────────────────────── -->
+    <string name="tutorial_title">手势教程</string>
+    <string name="tutorial_start">开始手势教程。请按照指示操作。</string>
+    <string name="tutorial_step_single_tap">在圆圈内任意位置点击一次</string>
+    <string name="tutorial_step_double_tap">快速点击两次</string>
+    <string name="tutorial_step_long_press">按住2秒钟</string>
+    <string name="tutorial_step_triple_tap">快速点击三次</string>
+    <string name="tutorial_step_triple_hold">点击三次并在最后一次按住</string>
+    <string name="tutorial_success">正确！做得好。</string>
+    <string name="tutorial_wrong">不太对。请再试一次。</string>
+    <string name="tutorial_complete">教程完成！您已准备好使用Vyze。</string>
+
+    <!-- ── Error Log ─────────────────────────────────────────────── -->
+    <string name="error_log_title">错误日志</string>
+    <string name="error_log_empty">暂无错误记录。</string>
+    <string name="error_log_count">已记录%1$d个错误</string>
+    <string name="error_log_cleared">错误日志已清除。</string>
+
+    <!-- ── Accessibility Service ─────────────────────────────────── -->
+    <string name="accessibility_service_description">Vyze辅助功能服务为视障用户提供TalkBack集成和手势支持。</string>
+    <string name="accessibility_service_enabled">Vyze辅助功能服务已启用。</string>
+    <string name="accessibility_service_disabled">Vyze辅助功能服务已禁用。</string>
+
+    <!-- ── UI Labels ─────────────────────────────────────────────── -->
+    <string name="alt_bottom_sheet_chevron">可展开面板指示器</string>
+    <string name="alt_bottom_sheet_max_results_button_minus">减少最大检测结果数按钮</string>
+    <string name="alt_bottom_sheet_max_results_button_plus">增加最大检测结果数按钮</string>
+    <string name="alt_bottom_sheet_threshold_button_minus">降低检测结果置信度阈值按钮</string>
+    <string name="alt_bottom_sheet_threshold_button_plus">提高检测结果置信度阈值按钮</string>
+    <string name="label_inference_time">推理时间</string>
+    <string name="label_fps">每秒帧数</string>
+    <string name="label_confidence_threshold">置信度阈值</string>
+    <string name="label_max_results">最大结果数</string>
+    <string name="label_delegate">委托方式</string>
+    <string name="label_models">机器学习模型</string>
+    <string name="menu_camera">相机</string>
+    <string name="menu_gallery">图库</string>
+    <string name="tv_gallery_placeholder">点击+添加图片或视频以开始运行物体检测。</string>
 </resources>

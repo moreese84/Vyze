@@ -1,44 +1,107 @@
 package com.vyze.app
 
 import android.app.Application
-import android.os.Build
 import android.util.Log
-import kotlin.system.exitProcess
+import com.vyze.app.data.ErrorLogRepository
+import com.vyze.app.data.ScanRepository
+import com.vyze.app.data.VyzeDatabase
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 
 /**
- * Global [Application] subclass for Vyze.
+ * Application class for Vyze.
  *
- * - Installs a default [Thread.UncaughtExceptionHandler] that logs the error
- *   and gracefully finishes the process instead of showing a crash dialog.
- * - Provides a central place for future global initialisation (analytics, work manager, etc.).
+ * Acts as a lightweight service locator for dependency injection — provides
+ * singleton instances of shared managers and repositories. This avoids the
+ * overhead and complexity of Hilt/Koin while keeping dependencies testable.
+ *
+ * Also installs a global [Thread.UncaughtExceptionHandler] that logs fatal
+ * errors to the local error log database before crashing.
  */
 class VyzeApplication : Application() {
 
-    override fun onCreate() {
-        super.onCreate()
-        installGlobalExceptionHandler()
-        Log.i(TAG, "VyzeApplication onCreate – API ${Build.VERSION.SDK_INT}")
+    /** Application-scoped coroutine scope for background work. */
+    val applicationScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    // ── Lazy Singletons ──────────────────────────────────────────────
+
+    /** Singleton database instance shared across the app. */
+    val database: VyzeDatabase by lazy {
+        VyzeDatabase.getInstance(applicationContext)
     }
 
+    /** Repository for scan history. */
+    val scanRepository: ScanRepository by lazy {
+        ScanRepository(applicationContext)
+    }
+
+    /** Repository for error logging. */
+    val errorLogRepository: ErrorLogRepository by lazy {
+        ErrorLogRepository(applicationContext)
+    }
+
+    /** Singleton TTSManager. Managed externally via TtsViewModel. */
+    val ttsManager: TTSManager by lazy {
+        TTSManager(applicationContext).apply {
+            applySettings(applicationContext)
+        }
+    }
+
+    // ── Lifecycle ─────────────────────────────────────────────────────
+
+    override fun onCreate() {
+        super.onCreate()
+        installGlobalErrorHandler()
+        Log.d(TAG, "VyzeApplication created")
+    }
+
+    // ── Global Error Handler ──────────────────────────────────────────
+
     /**
-     * Catches uncaught exceptions on **any** thread so that camera / sensor edge-cases
-     * (e.g. a RuntimeException from a CameraX callback or an ML Kit timeout on a
-     * background thread) do not crash the app for the user.
+     * Installs a global [Thread.UncaughtExceptionHandler] that logs fatal
+     * errors to the Room error log before the app crashes.
      */
-    private fun installGlobalExceptionHandler() {
+    private fun installGlobalErrorHandler() {
         val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
 
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
-            Log.e(TAG, "Uncaught exception on thread '${thread.name}'", throwable)
+            val errorMessage = buildString {
+                append("FATAL: ${throwable.javaClass.simpleName}: ${throwable.message}")
+                append("\nThread: ${thread.name}")
+                throwable.stackTrace.take(5).forEach { element ->
+                    append("\n  at $element")
+                }
+            }
 
-            // Attempt to notify the user via logcat, then exit cleanly.
-            // We intentionally do *not* show an ANR / crash dialog.
-            android.os.Process.killProcess(android.os.Process.myPid())
-            exitProcess(2)
+            Log.e(TAG, errorMessage, throwable)
+
+            // Log to Room database (best-effort, non-blocking)
+            applicationScope.launch {
+                try {
+                    errorLogRepository.logError(
+                        level = "FATAL",
+                        tag = thread.name,
+                        message = errorMessage,
+                        throwable = throwable
+                    )
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to log fatal error to database", e)
+                }
+            }
+
+            // Call original handler (will crash the app)
+            defaultHandler?.uncaughtException(thread, throwable)
         }
     }
 
     companion object {
         private const val TAG = "VyzeApplication"
+
+        /** Convenience accessor for the Application instance. */
+        fun from(app: android.content.Context): VyzeApplication {
+            return app.applicationContext as VyzeApplication
+        }
     }
 }
