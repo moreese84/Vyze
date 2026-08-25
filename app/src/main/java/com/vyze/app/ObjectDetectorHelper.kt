@@ -475,6 +475,27 @@ class ObjectDetectorHelper(
         detectAsync(mpImage, frameTime)
     }
 
+    /**
+     * Runs live-stream object detection on a pre-extracted [Bitmap].
+     * Used by the composite analyzer when the bitmap has already been created
+     * from the imageProxy and shared across barcode/face/OCR analyzers.
+     *
+     * @param bitmap    The camera frame as a Bitmap (ARGB_8888).
+     * @param frameTime The frame timestamp (from [SystemClock.uptimeMillis]).
+     */
+    fun detectLivestreamBitmap(bitmap: Bitmap, frameTime: Long) {
+        if (runningMode != RunningMode.LIVE_STREAM) {
+            throw IllegalArgumentException(
+                "Attempting to call detectLivestreamBitmap while not using RunningMode.LIVE_STREAM"
+            )
+        }
+
+        // If the input image rotation changed, reset the detector
+        // Note: rotation is tracked externally by the composite analyzer
+        val mpImage = BitmapImageBuilder(bitmap).build()
+        detectAsync(mpImage, frameTime)
+    }
+
     // Run object detection using MediaPipe Object Detector API
     @VisibleForTesting
     fun detectAsync(mpImage: MPImage, frameTime: Long) {

@@ -248,6 +248,40 @@ class TextRecognitionHelper {
         return parts.joinToString(". ")
     }
 
+    /**
+     * Processes a [Bitmap] for text recognition without needing an ImageProxy.
+     * Used by the composite analyzer when the bitmap has already been extracted
+     * from the imageProxy and shared across multiple analyzers.
+     *
+     * @param bitmap          The camera frame as a Bitmap (ARGB_8888).
+     * @param rotationDegrees Rotation applied to the image (from ImageProxy.imageInfo).
+     * @param onSuccess       Callback with the structured, filtered text output.
+     * @param onError         Callback invoked when recognition fails.
+     */
+    fun processBitmap(
+        bitmap: Bitmap,
+        rotationDegrees: Int,
+        onSuccess: (String) -> Unit,
+        onError: (Exception) -> Unit
+    ) {
+        val inputImage = InputImage.fromBitmap(bitmap, rotationDegrees)
+
+        recognizer.process(inputImage)
+            .addOnSuccessListener { visionText ->
+                val structuredText = processVisionText(
+                    visionText = visionText,
+                    imageWidth = bitmap.width,
+                    imageHeight = bitmap.height
+                )
+                val resultText = if (structuredText.isBlank()) "No text detected" else structuredText
+                onSuccess(resultText)
+            }
+            .addOnFailureListener { e ->
+                Log.e(TAG, "Text recognition failed", e)
+                onError(e)
+            }
+    }
+
     // ── Bitmap Conversion ───────────────────────────────────────────────────
 
     /**

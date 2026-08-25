@@ -4,6 +4,7 @@ package com.vyze.app.fragments
 import android.annotation.SuppressLint
 import android.content.res.Configuration
 import android.os.Bundle
+import android.os.SystemClock
 import android.util.Log
 import android.view.GestureDetector
 import android.view.LayoutInflater
@@ -22,6 +23,8 @@ import androidx.core.content.ContextCompat
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.activityViewModels
 import androidx.navigation.Navigation
+import com.vyze.app.BarcodeAnalyzer
+import com.vyze.app.FaceDetectorHelper
 import com.vyze.app.FlashlightManager
 import com.vyze.app.GestureDetectorHelper
 import com.vyze.app.HapticManager
@@ -35,6 +38,7 @@ import com.vyze.app.TTSManager
 import com.vyze.app.VoiceCommandManager
 import com.vyze.app.databinding.FragmentCameraBinding
 import com.google.mediapipe.tasks.vision.core.RunningMode
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -75,6 +79,12 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
 
     // Voice Command
     private lateinit var voiceCommandManager: VoiceCommandManager
+
+    // Barcode scanning
+    private lateinit var barcodeAnalyzer: BarcodeAnalyzer
+
+    // Face detection
+    private lateinit var faceDetectorHelper: FaceDetectorHelper
 
     // High Contrast Overlay
     private lateinit var highContrastOverlay: HighContrastOverlayView
@@ -170,6 +180,16 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
             voiceCommandManager.destroy()
         }
 
+        // Cleanup Barcode Analyzer
+        if (this::barcodeAnalyzer.isInitialized) {
+            barcodeAnalyzer.close()
+        }
+
+        // Cleanup Face Detector
+        if (this::faceDetectorHelper.isInitialized) {
+            faceDetectorHelper.close()
+        }
+
         // Null out camera reference held by FlashlightManager
         if (this::flashlightManager.isInitialized) {
             flashlightManager.camera = null
@@ -224,6 +244,12 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
         // Initialize Voice Command Manager
         voiceCommandManager = VoiceCommandManager(requireContext().applicationContext)
         setupVoiceCommands()
+
+        // Initialize Barcode Analyzer
+        barcodeAnalyzer = BarcodeAnalyzer()
+
+        // Initialize Face Detector
+        faceDetectorHelper = FaceDetectorHelper()
 
         // Reference to High Contrast Overlay
         highContrastOverlay = fragmentCameraBinding.highContrastOverlay
@@ -640,11 +666,13 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
      * dropped immediately (closed without processing). This prevents
      * frame accumulation and ensures zero memory leaks.
      *
-     * Concerns handled:
-     * 1. LuminanceAnalyzer for light level detection
-     * 2. ObjectDetectorHelper for object detection
-     * 3. On-demand OCR via TextRecognitionHelper (when double-tap or voice command triggers a request)
-     * 4. HighContrastOverlayView updates for low-vision users
+     * Frame processing pipeline:
+     *  1. LuminanceAnalyzer — reads Y plane (no close)
+     *  2. Create shared bitmap from imageProxy, close proxy
+     *  3. BarcodeAnalyzer — scans for UPC/EAN/QR on bitmap
+     *  4. FaceDetectorHelper — detects faces on bitmap
+     *  5. TextRecognitionHelper (if OCR requested) OR ObjectDetectorHelper
+     *  6. Recycle shared bitmap
      */
     private fun createCompositeAnalyzer(): ImageAnalysis.Analyzer {
         val luminanceAnalyzer = LuminanceAnalyzer { isDark, meanLuminance ->
@@ -666,20 +694,67 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
                 return@Analyzer
             }
 
+            var sharedBitmap: android.graphics.Bitmap? = null
             try {
-                // Run luminance analysis first (reads Y plane, does not close imageProxy)
+                // Step 1: Run luminance analysis (reads Y plane, does not close imageProxy)
                 luminanceAnalyzer.analyzeLuminance(imageProxy)
 
-                // Check if OCR was requested via double-tap or voice command
-                if (ocrRequested.compareAndSet(true, false)) {
-                    // Route frame to TextRecognitionHelper (it closes imageProxy)
-                    textRecognitionHelper.processImageProxy(
-                        imageProxy = imageProxy,
-                        onSuccess = { recognizedText ->
-                            // Read the recognized text aloud on the main thread
+                // Step 2: Create shared bitmap from the RGBA_8888 frame
+                val rotationDegrees = imageProxy.imageInfo.rotationDegrees
+                sharedBitmap = android.graphics.Bitmap.createBitmap(
+                    imageProxy.width, imageProxy.height,
+                    android.graphics.Bitmap.Config.ARGB_8888
+                )
+                imageProxy.use { sharedBitmap!!.copyPixelsFromBuffer(imageProxy.planes[0].buffer) }
+                imageProxy.close()
+
+                // Step 3 & 4: Run barcode and face detection on the shared bitmap
+                // Both are async ML Kit tasks — use a CountDownLatch to wait
+                val latch = CountDownLatch(2)
+
+                // Barcode scan
+                barcodeAnalyzer.processBitmap(
+                    sharedBitmap, rotationDegrees,
+                    onSuccess = { announcements ->
+                        if (announcements.isNotEmpty()) {
                             activity?.runOnUiThread {
                                 if (isAdded) {
-                                    // Display OCR text on the high-contrast overlay
+                                    ttsManager.speak(announcements.first())
+                                }
+                            }
+                        }
+                        latch.countDown()
+                    },
+                    onError = { latch.countDown() }
+                )
+
+                // Face detection
+                faceDetectorHelper.processBitmap(
+                    sharedBitmap, rotationDegrees,
+                    onSuccess = { announcements ->
+                        if (announcements.isNotEmpty()) {
+                            activity?.runOnUiThread {
+                                if (isAdded) {
+                                    ttsManager.speak(announcements.first())
+                                }
+                            }
+                        }
+                        latch.countDown()
+                    },
+                    onError = { latch.countDown() }
+                )
+
+                // Wait for barcode + face to complete (max 3s timeout)
+                latch.await(3, TimeUnit.SECONDS)
+
+                // Step 5: Route to OCR or OD
+                if (ocrRequested.compareAndSet(true, false)) {
+                    // OCR path — processBitmap does not close the shared bitmap
+                    textRecognitionHelper.processBitmap(
+                        sharedBitmap, rotationDegrees,
+                        onSuccess = { recognizedText ->
+                            activity?.runOnUiThread {
+                                if (isAdded) {
                                     highContrastOverlay.setOcrText(recognizedText)
                                     ttsManager.speakImmediate(recognizedText)
                                 }
@@ -698,10 +773,10 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
                         }
                     )
                 } else {
-                    // Normal pipeline: object detection (handles its own imageProxy lifecycle)
-                    objectDetectorHelper.detectLivestreamFrame(imageProxy)
-                    // objectDetectorHelper handles imageProxy.close() internally,
-                    // so we release the throttle flag here
+                    // Object detection path — pass bitmap directly
+                    objectDetectorHelper.detectLivestreamBitmap(
+                        sharedBitmap, SystemClock.uptimeMillis()
+                    )
                     isAnalyzing.set(false)
                 }
             } catch (e: Exception) {

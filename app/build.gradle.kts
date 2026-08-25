@@ -101,8 +101,10 @@ dependencies {
     implementation("androidx.camera:camera-lifecycle:$camerax_version")
     implementation("androidx.camera:camera-view:$camerax_version")
 
-    // ML Kit Text Recognition (bundled — model is statically linked in the APK, fully offline)
+    // ML Kit (bundled — models are statically linked in the APK, fully offline)
     implementation("com.google.mlkit:text-recognition:16.0.0")
+    implementation("com.google.mlkit:barcode-scanning:17.2.0")
+    implementation("com.google.mlkit:face-detection:16.1.6")
 
     // MediaPipe
     implementation("com.google.mediapipe:tasks-vision:0.10.8")
