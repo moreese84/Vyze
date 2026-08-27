@@ -11,20 +11,27 @@ import android.util.Log
 /**
  * Manages voice-driven accessibility commands using Android [SpeechRecognizer].
  *
- * Parsed intent triggers:
- * - "read", "text", "sign"          → OCR scan
- * - "what", "object", "detect", "look" → Object detection readout
- * - "light", "flash", "torch", "dark"  → Luminance check + torch toggle
+ * ## Architecture (Post-Refactoring)
+ * All recognized speech is routed to the agent via [onFreeformQuery].
+ * The agent auto-detects the intent (navigation, search, document, medicine)
+ * from freeform text — no hardcoded keyword matching needed.
+ *
+ * Legacy fast-path shortcuts ("read", "what", "torch") are removed.
+ * The agent handles all intent detection with better accuracy and
+ * natural language understanding.
+ *
+ * ## Flow
+ * 1. SpeechRecognizer captures continuous audio
+ * 2. Final recognized text → [onFreeformQuery] callback
+ * 3. Caller (CameraFragment) routes to AgentEngine with appropriate mode
  */
 class VoiceCommandManager(private val context: Context) {
 
     private var speechRecognizer: SpeechRecognizer? = null
     private var isListening = false
 
-    /** Callbacks for recognized intent triggers */
-    var onOcrRequested: (() -> Unit)? = null
-    var onObjectDetectionRequested: (() -> Unit)? = null
-    var onLightCheckRequested: (() -> Unit)? = null
+    /** Callback for recognized speech text — routed to agent. */
+    var onFreeformQuery: ((text: String) -> Unit)? = null
 
     /** Callback for listening state changes */
     var onListeningStateChanged: ((listening: Boolean) -> Unit)? = null
@@ -75,14 +82,15 @@ class VoiceCommandManager(private val context: Context) {
             Log.d(TAG, "Recognized: $text")
             onTextRecognized?.invoke(text)
 
-            // Allow listening to continue for continuous mode
             isListening = false
             onListeningStateChanged?.invoke(false)
 
-            // Restart listening for continuous command detection
+            // Route all recognized speech to agent
             if (text.isNotEmpty()) {
-                restartListening()
+                onFreeformQuery?.invoke(text)
             }
+
+            restartListening()
         }
 
         override fun onPartialResults(partialResults: Bundle?) {
@@ -98,7 +106,6 @@ class VoiceCommandManager(private val context: Context) {
 
     /**
      * Start continuous voice listening.
-     * TTS should be paused before starting to prevent the app from hearing itself.
      */
     fun startListening() {
         if (!SpeechRecognizer.isRecognitionAvailable(context)) {
@@ -137,9 +144,6 @@ class VoiceCommandManager(private val context: Context) {
         }
     }
 
-    /**
-     * Stop voice listening.
-     */
     fun stopListening() {
         try {
             speechRecognizer?.stopListening()
@@ -152,11 +156,7 @@ class VoiceCommandManager(private val context: Context) {
         }
     }
 
-    /**
-     * Restart listening after a short delay.
-     */
     private fun restartListening() {
-        // Small delay before restarting to avoid rapid-fire restarts
         android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
             if (!isListening) {
                 startListening()
@@ -164,46 +164,11 @@ class VoiceCommandManager(private val context: Context) {
         }, RESTART_DELAY_MS)
     }
 
-    /**
-     * Parse recognized text and trigger the appropriate accessibility action.
-     */
-    fun parseAndTrigger(text: String) {
-        val lower = text.lowercase().trim()
-
-        // OCR intent triggers
-        if (OCR_KEYWORDS.any { lower.contains(it) }) {
-            Log.d(TAG, "OCR intent detected from: '$text'")
-            onOcrRequested?.invoke()
-            return
-        }
-
-        // Object detection intent triggers
-        if (OBJECT_KEYWORDS.any { lower.contains(it) }) {
-            Log.d(TAG, "Object detection intent detected from: '$text'")
-            onObjectDetectionRequested?.invoke()
-            return
-        }
-
-        // Light / torch intent triggers
-        if (LIGHT_KEYWORDS.any { lower.contains(it) }) {
-            Log.d(TAG, "Light check intent detected from: '$text'")
-            onLightCheckRequested?.invoke()
-            return
-        }
-
-        Log.d(TAG, "No matching intent found for: '$text'")
-    }
-
-    /**
-     * Release resources. Should be called during lifecycle teardown.
-     */
     fun destroy() {
         stopListening()
         speechRecognizer?.destroy()
         speechRecognizer = null
-        onOcrRequested = null
-        onObjectDetectionRequested = null
-        onLightCheckRequested = null
+        onFreeformQuery = null
         onListeningStateChanged = null
         onError = null
         onTextRecognized = null
@@ -227,9 +192,5 @@ class VoiceCommandManager(private val context: Context) {
     companion object {
         private const val TAG = "VoiceCommandManager"
         private const val RESTART_DELAY_MS = 500L
-
-        private val OCR_KEYWORDS = listOf("read", "text", "sign")
-        private val OBJECT_KEYWORDS = listOf("what", "object", "detect", "look")
-        private val LIGHT_KEYWORDS = listOf("light", "flash", "torch", "dark")
     }
 }

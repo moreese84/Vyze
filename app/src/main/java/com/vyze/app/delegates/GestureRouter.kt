@@ -88,6 +88,7 @@ class GestureRouter(
         containerView.setOnTouchListener { _, event ->
             gestureDetectorHelper.onTouchEvent(event)
             gestureDetector.onTouchEvent(event)
+            true // Consume the event so child overlays don't steal it
         }
     }
 

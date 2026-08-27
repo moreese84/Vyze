@@ -17,624 +17,588 @@ package com.vyze.app
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
 import android.graphics.RectF
-import android.media.MediaMetadataRetriever
-import android.net.Uri
 import android.os.SystemClock
 import android.util.Log
-import androidx.annotation.VisibleForTesting
-import androidx.camera.core.ImageProxy
-import com.google.mediapipe.framework.image.BitmapImageBuilder
-import com.google.mediapipe.framework.image.MPImage
-import com.google.mediapipe.tasks.core.BaseOptions
-import com.google.mediapipe.tasks.core.Delegate
-import com.google.mediapipe.tasks.vision.core.ImageProcessingOptions
-import com.google.mediapipe.tasks.vision.core.RunningMode
-import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetector
-import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetectorResult
-import java.util.concurrent.ConcurrentHashMap
-import kotlin.math.abs
+import org.tensorflow.lite.Interpreter
+import org.tensorflow.lite.Tensor
+import java.io.Closeable
+import java.io.FileInputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.MappedByteBuffer
+import java.nio.channels.FileChannel
+import kotlin.math.max
+import kotlin.math.min
 
+/**
+ * YOLOv8 object detection using the TensorFlow Lite Interpreter.
+ *
+ * Replaces MediaPipe's high-level ObjectDetector with a raw TFLite
+ * pipeline so we can load any model — including YOLOv8-nano trained on
+ * Open Images V7 (601 classes) or Objects365 (365 classes).
+ *
+ * ## Input Pipeline
+ *
+ * 1. Bitmap is pre-rotated to portrait and letterboxed to 640×640 by
+ *    [com.vyze.app.delegates.MlPipelineManager].
+ * 2. We normalize pixels to [0, 1] and write to a `[1, 640, 640, 3]`
+ *    float32 input tensor.
+ *
+ * ## Output Pipeline
+ *
+ * YOLOv8 outputs `[1, 4+numClasses, 8400]`:
+ * - Channels 0–3: `[cx, cy, w, h]` in 640×640 pixel coordinates.
+ * - Channels 4+: class confidence scores.
+ *
+ * We transpose to `[8400, 4+C]`, filter by confidence threshold, apply
+ * Non-Maximum Suppression, and return [VyzeDetection] results whose
+ * bounding boxes are in the **letterboxed** coordinate space (same as
+ * the input bitmap).
+ */
 class ObjectDetectorHelper(
     var threshold: Float = THRESHOLD_DEFAULT,
     var maxResults: Int = MAX_RESULTS_DEFAULT,
-    var currentDelegate: Int = DELEGATE_CPU,
-    var currentModel: Int = MODEL_EFFICIENTDETV0,
-    var runningMode: RunningMode = RunningMode.IMAGE,
     val context: Context,
-    // The listener is only used when running in RunningMode.LIVE_STREAM
     var objectDetectorListener: DetectorListener? = null
-) {
+) : Closeable {
 
-    // For this example this needs to be a var so it can be reset on changes. If the ObjectDetector
-    // will not change, a lazy val would be preferable.
-    private var objectDetector: ObjectDetector? = null
-    private var imageRotation = 0
-    private lateinit var imageProcessingOptions: ImageProcessingOptions
+    // Legacy stubs — kept for MainViewModel / settings spinner compatibility.
+    // TFLite YOLOv8 uses a single model; delegate/model selection is no-op.
+    var currentDelegate: Int = DELEGATE_CPU
+    var currentModel: Int = MODEL_EFFICIENTDETV0
 
-    /**
-     * Stores the most recent detection result bundle.
-     * Used by GestureRouter / CameraFragment to access the latest OD results
-     * on-demand (e.g., when the user taps to hear detected objects).
-     */
+    private var interpreter: Interpreter? = null
+    private var labels: List<String> = emptyList()
+
+    // Model input dimensions (read from model metadata or default to 640)
+    private var inputSize = INPUT_SIZE_DEFAULT
+
+    // Whether the model expects NCHW [1,3,640,640] or NHWC [1,640,640,3]
+    private var inputIsNCHW = false
+
+    // Actual model input shape logged at load time
+    private var inputShape = "unknown"
+
     @Volatile
     var lastResultBundle: ResultBundle? = null
         private set
-
-    // ── Spatial Mapping & Speech Debouncing ───────────────────────────────────
-
-    /**
-     * Timestamp of the last frame returned by the detector (for debouncing).
-     * Keyed by a composite key: "label|zone" where zone is the spatial zone string.
-     * Value is the [SystemClock.uptimeMillis] at which that label+zone was last spoken.
-     */
-    private val lastSpokenTimestamp = ConcurrentHashMap<String, Long>()
 
     init {
         setupObjectDetector()
     }
 
-    fun clearObjectDetector() {
-        objectDetector?.close()
-        objectDetector = null
-        lastSpokenTimestamp.clear()
+    override fun close() {
+        interpreter?.close()
+        interpreter = null
     }
 
-    // Initialize the object detector using current settings on the
-    // thread that is using it. CPU can be used with detectors
-    // that are created on the main thread and used on a background thread, but
-    // the GPU delegate needs to be used on the thread that initialized the detector
+    // Keep the same name as before so callers don't break
+    fun clearObjectDetector() = close()
+
+    // ── Detector Setup ────────────────────────────────────────────────────────
+
     fun setupObjectDetector() {
-        // Set general detection options, including number of used threads
-        val baseOptionsBuilder = BaseOptions.builder()
-
-        // Use the specified hardware for running the model. Default to CPU
-        when (currentDelegate) {
-            DELEGATE_CPU -> {
-                baseOptionsBuilder.setDelegate(Delegate.CPU)
-            }
-
-            DELEGATE_GPU -> {
-                // Is there a check for GPU being supported?
-                baseOptionsBuilder.setDelegate(Delegate.GPU)
-            }
-        }
-
-        val modelName = when (currentModel) {
-            MODEL_EFFICIENTDETV0 -> "efficientdet-lite0.tflite"
-            MODEL_EFFICIENTDETV2 -> "efficientdet-lite2.tflite"
-            else -> "efficientdet-lite0.tflite"
-        }
-
-        baseOptionsBuilder.setModelAssetPath(modelName)
-
-        // Check if runningMode is consistent with objectDetectorListener
-        when (runningMode) {
-            RunningMode.LIVE_STREAM -> {
-                if (objectDetectorListener == null) {
-                    throw IllegalStateException(
-                        "objectDetectorListener must be set when runningMode is LIVE_STREAM."
-                    )
-                }
-            }
-
-            RunningMode.IMAGE, RunningMode.VIDEO -> {
-                // no-op
-            }
-        }
-
         try {
-            val optionsBuilder = ObjectDetector.ObjectDetectorOptions.builder()
-                .setBaseOptions(baseOptionsBuilder.build())
-                .setScoreThreshold(threshold).setRunningMode(runningMode)
-                .setMaxResults(maxResults)
+            // ── Load model via FileChannel → MappedByteBuffer ─────────────
+            // Using context.assets.openFd() + FileInputStream ensures the
+            // .tflite binary is memory-mapped directly from the APK without
+            // decompression or copy.  This is the most reliable approach for
+            // TFLite model loading on Android.
+            Log.i(TAG, "Attempting to load model: $MODEL_FILE")
 
-            imageProcessingOptions = ImageProcessingOptions.builder()
-                .setRotationDegrees(imageRotation).build()
+            val assetFileDescriptor = context.assets.openFd(MODEL_FILE)
+            val fileInputStream = FileInputStream(assetFileDescriptor.fileDescriptor)
+            val fileChannel = fileInputStream.channel
+            val modelBuffer: MappedByteBuffer = fileChannel.map(
+                FileChannel.MapMode.READ_ONLY,
+                assetFileDescriptor.startOffset,
+                assetFileDescriptor.declaredLength
+            )
+            fileChannel.close()
+            fileInputStream.close()
+            assetFileDescriptor.close()
 
-            when (runningMode) {
-                RunningMode.IMAGE, RunningMode.VIDEO -> optionsBuilder.setRunningMode(
-                    runningMode
-                )
+            Log.i(TAG, "Model buffer loaded: ${modelBuffer.capacity()} bytes")
 
-                RunningMode.LIVE_STREAM -> optionsBuilder.setRunningMode(
-                    runningMode
-                ).setResultListener(this::returnLivestreamResult)
-                    .setErrorListener(this::returnLivestreamError)
+            // ── Create Interpreter ───────────────────────────────────────
+            val options = Interpreter.Options().apply {
+                setNumThreads(4)
+            }
+            interpreter = Interpreter(modelBuffer, options)
+
+            Log.i(TAG, "Interpreter created successfully")
+
+            // ── Load labels ──────────────────────────────────────────────
+            labels = context.assets.open(LABELS_FILE).bufferedReader().readLines()
+
+            Log.i(TAG, "Loaded ${labels.size} labels from $LABELS_FILE")
+
+            // ── Auto-detect input tensor layout ────────────────────────
+            val inputTensorInfo: Tensor = interpreter!!.getInputTensor(0)
+            val shape = inputTensorInfo.shape()  // e.g. [1, 640, 640, 3] or [1, 3, 640, 640]
+            inputShape = shape.contentToString()
+
+            inputIsNCHW = if (shape.size == 4) {
+                // [N, C, H, W] → shape[1] < shape[2] means channels-first
+                shape[1] <= 4 && shape[2] > shape[1]
+            } else {
+                false
             }
 
-            val options = optionsBuilder.build()
-            objectDetector = ObjectDetector.createFromOptions(context, options)
-        } catch (e: IllegalStateException) {
+            if (shape.size == 4) {
+                inputSize = if (inputIsNCHW) shape[2] else shape[1]
+            }
+
+            Log.i(TAG, "Input tensor shape: $inputShape, layout=${if (inputIsNCHW) "NCHW" else "NHWC"}, inputSize=$inputSize")
+
+            // ── Log output tensor shape ────────────────────────────────
+            val outputTensor = interpreter!!.getOutputTensor(0)
+            val outShape = outputTensor.shape()
+            Log.i(TAG, "Output tensor shape: ${outShape.contentToString()}")
+            Log.i(TAG, "Model ready: $MODEL_FILE, ${labels.size} labels")
+
+        } catch (e: java.io.FileNotFoundException) {
+            Log.e(TAG, "MODEL FILE NOT FOUND: $MODEL_FILE — place it in app/src/main/assets/", e)
             objectDetectorListener?.onError(
-                "Object detector failed to initialize. See error logs for details"
+                "Model file not found: $MODEL_FILE. Place the .tflite file in assets/ folder."
             )
-            Log.e(TAG, "TFLite failed to load model with error: " + e.message)
-        } catch (e: RuntimeException) {
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to initialize TFLite: ${e.message}", e)
+            e.printStackTrace()
             objectDetectorListener?.onError(
-                "Object detector failed to initialize. See error logs for " + "details",
-                GPU_ERROR
-            )
-            Log.e(
-                TAG,
-                "Object detector failed to load model with error: " + e.message
+                "Object detector failed to initialize: ${e.message}"
             )
         }
     }
 
-    // Return running status of recognizer helper
-    fun isClosed(): Boolean {
-        return objectDetector == null
-    }
+    fun isClosed(): Boolean = interpreter == null
 
-    // ── Spatial Mapping ──────────────────────────────────────────────────────
+    // ── Live-Stream Detection ─────────────────────────────────────────────────
 
     /**
-     * Spatial information for a single detected object.
+     * Run YOLOv8 detection on a pre-processed bitmap.
      *
-     * @property categoryName  The label assigned by the model (e.g. "person", "cup").
-     * @property score         Confidence score 0.0–1.0.
-     * @property boundingBox   Raw bounding box from the detector.
-     * @property direction     One of [DIR_LEFT], [DIR_AHEAD], [DIR_RIGHT].
-     * @property proximity     One of [PROX_CLOSE], [PROX_FAR], [PROX_MEDIUM] (empty string).
-     * @property zoneKey       Composite key "label|direction|proximity" used for debouncing.
+     * The caller MUST ensure the bitmap is:
+     * 1. Rotated to upright portrait.
+     * 2. Letterboxed to a square (640×640).
+     *
+     * @param bitmap            Portrait-oriented, letterboxed bitmap (ARGB_8888).
+     * @param frameTime         Timestamp from [SystemClock.uptimeMillis].
+     * @param originalWidth     Width of the frame before letterboxing.
+     * @param originalHeight    Height of the frame before letterboxing.
      */
-    data class SpatialInfo(
-        val categoryName: String,
-        val score: Float,
-        val boundingBox: RectF,
-        val direction: String,
-        val proximity: String,
-        val zoneKey: String
-    )
-
-    /**
-     * Compute spatial position of a bounding box relative to the frame dimensions.
-     *
-     * **Direction** (horizontal centre of the box normalised to 0.0–1.0):
-     *  - `< 0.35` → "on your left"
-     *  - `0.35..0.65` → "directly ahead"
-     *  - `> 0.65` → "on your right"
-     *
-     * **Proximity** (box area as fraction of total frame area):
-     *  - `> 0.15` → "close"
-     *  - `< 0.05` → "far"
-     *  - otherwise → "" (medium, not announced to reduce speech clutter)
-     */
-    fun computeSpatialInfo(
-        boundingBox: RectF,
-        frameWidth: Int,
-        frameHeight: Int,
-        categoryName: String,
-        score: Float
-    ): SpatialInfo {
-        // Centre X normalised to 0.0–1.0
-        val centerX = (boundingBox.centerX().toFloat() / frameWidth).coerceIn(0f, 1f)
-
-        val direction = when {
-            centerX < LEFT_THRESHOLD  -> DIR_LEFT
-            centerX <= RIGHT_THRESHOLD -> DIR_AHEAD
-            else                       -> DIR_RIGHT
-        }
-
-        // Box area as fraction of total frame area
-        val boxArea = boundingBox.width().toLong() * boundingBox.height().toLong()
-        val frameArea = frameWidth.toLong() * frameHeight.toLong()
-        val areaFraction = if (frameArea > 0) boxArea.toFloat() / frameArea.toFloat() else 0f
-
-        val proximity = when {
-            areaFraction > CLOSE_THRESHOLD  -> PROX_CLOSE
-            areaFraction < FAR_THRESHOLD    -> PROX_FAR
-            else                            -> PROX_MEDIUM  // empty string
-        }
-
-        val zoneKey = "$categoryName|$direction|$proximity"
-
-        return SpatialInfo(
-            categoryName = categoryName,
-            score = score,
-            boundingBox = boundingBox,
-            direction = direction,
-            proximity = proximity,
-            zoneKey = zoneKey
-        )
-    }
-
-    // ── Speech Debouncing ────────────────────────────────────────────────────
-
-    /**
-     * Determines whether a [SpatialInfo] entry is eligible to be spoken right now.
-     *
-     * Rules:
-     *  1. If the label+zone has never been spoken → eligible.
-     *  2. If the cooldown has elapsed (> [DEBOUNCE_MS]) → eligible.
-     *  3. If the object has transitioned to a *new* spatial zone since the last
-     *     time this label was spoken → eligible (override cooldown).
-     *
-     * After returning `true` the timestamp is updated so subsequent calls within
-     * the cooldown window will return `false` (unless the zone changes again).
-     *
-     * Thread-safe: uses [ConcurrentHashMap] + atomic compare-and-set via
-     * [ConcurrentHashMap.put] which is sufficient because the composite analyzer
-     * is single-threaded and worst-case is a benign duplicate announcement.
-     */
-    fun isEligibleToSpeak(spatial: SpatialInfo): Boolean {
-        val now = SystemClock.uptimeMillis()
-        val previousTimestamp = lastSpokenTimestamp[spatial.zoneKey]
-
-        if (previousTimestamp == null) {
-            // Never spoken in this zone → speak
-            lastSpokenTimestamp[spatial.zoneKey] = now
-            return true
-        }
-
-        // Check cooldown
-        if (now - previousTimestamp > DEBOUNCE_MS) {
-            lastSpokenTimestamp[spatial.zoneKey] = now
-            return true
-        }
-
-        // Also check whether the object has moved to a *different* zone for the
-        // same label. We scan all keys that share the same label prefix.
-        val labelPrefix = spatial.categoryName + "|"
-        val hasDifferentZoneSpoken = lastSpokenTimestamp.any { (key, ts) ->
-            key.startsWith(labelPrefix) && key != spatial.zoneKey &&
-                (now - ts <= DEBOUNCE_MS)
-        }
-
-        // If a *different* zone for this label was recently spoken, and we are now
-        // in a new zone, override the cooldown.
-        if (hasDifferentZoneSpoken) {
-            lastSpokenTimestamp[spatial.zoneKey] = now
-            return true
-        }
-
-        return false
-    }
-
-    /**
-     * Build an announceable detection string with spatial context, or `null` if the
-     * detection is not eligible (debounced or medium proximity).
-     *
-     * Example output: "Person on your left, close."
-     */
-    fun buildAnnouncement(spatial: SpatialInfo): String? {
-        // Skip medium proximity to reduce speech clutter
-        if (spatial.proximity.isEmpty()) return null
-
-        // Debounce check
-        if (!isEligibleToSpeak(spatial)) return null
-
-        val proximityText = if (spatial.proximity.isNotEmpty()) {
-            ", ${spatial.proximity}"
-        } else ""
-
-        return "${spatial.categoryName} ${spatial.direction}$proximityText"
-    }
-
-    /**
-     * Convenience: given raw detection results, compute spatial info for every
-     * detection, filter by debounce + proximity, and return the list of
-     * announcement-ready strings sorted by confidence (highest first).
-     *
-     * @param resultBundle  The result bundle from the detector.
-     * @param frameWidth    Width of the input frame (before rotation).
-     * @param frameHeight   Height of the input frame (before rotation).
-     * @return List of announcement strings, or empty if nothing eligible.
-     */
-    fun getAnnounceableDetections(
-        resultBundle: ResultBundle,
-        frameWidth: Int,
-        frameHeight: Int
-    ): List<String> {
-        val detections = resultBundle.results.firstOrNull()?.detections()
-            ?: return emptyList()
-
-        return detections.mapNotNull { detection ->
-            val category = detection.categories().firstOrNull() ?: return@mapNotNull null
-            val spatial = computeSpatialInfo(
-                boundingBox = detection.boundingBox(),
-                frameWidth = frameWidth,
-                frameHeight = frameHeight,
-                categoryName = category.categoryName(),
-                score = category.score()
-            )
-            buildAnnouncement(spatial)
-        }.sortedByDescending { ann ->
-            // Sort by the confidence of the original detection
-            detections.firstOrNull { d ->
-                val cat = d.categories().firstOrNull()
-                cat != null && buildAnnouncement(
-                    computeSpatialInfo(
-                        d.boundingBox(), frameWidth, frameHeight,
-                        cat.categoryName(), cat.score()
-                    )
-                ) == ann
-            }?.categories()?.firstOrNull()?.score() ?: 0f
-        }
-    }
-
-    /**
-     * Clear all debounce timestamps. Call when the detector is reset or
-     * the user changes detection settings.
-     */
-    fun clearDebounceState() {
-        lastSpokenTimestamp.clear()
-    }
-
-    // ── Video Detection ──────────────────────────────────────────────────────
-
-    // Accepts the URI for a video file loaded from the user's gallery and attempts to run
-    // object detection inference on the video. This process will evaluate every frame in
-    // the video and attach the results to a bundle that will be returned.
-    fun detectVideoFile(
-        videoUri: Uri, inferenceIntervalMs: Long
+    fun detectLivestreamBitmap(
+        bitmap: Bitmap,
+        frameTime: Long,
+        originalWidth: Int,
+        originalHeight: Int
     ): ResultBundle? {
-
-        if (runningMode != RunningMode.VIDEO) {
-            throw IllegalArgumentException(
-                "Attempting to call detectVideoFile" + " while not using RunningMode.VIDEO"
-            )
+        val interp = interpreter ?: run {
+            Log.e(TAG, "detectLivestreamBitmap: interpreter is NULL")
+            return null
         }
 
-        if (objectDetector == null) return null
+        return try {
+            val startTime = SystemClock.uptimeMillis()
 
-        // Inference time is the difference between the system time at the start and finish of the
-        // process
-        val startTime = SystemClock.uptimeMillis()
+            // 1. Preprocess: letterbox resize to model input size + normalize
+            val inputTensor = preprocessBitmap(bitmap)
 
-        var didErrorOccurred = false
+            // 2. Run inference
+            val outputShape = interp.getOutputTensor(0).shape() // [1, 4+C, 8400]
+            val numChannels = outputShape[1]
+            val numAnchors = outputShape[2]
+            val outputBuffer = Array(1) { Array(numChannels) { FloatArray(numAnchors) } }
+            interp.run(inputTensor, outputBuffer)
 
-        // Load frames from the video and run the object detection model.
-        val retriever = MediaMetadataRetriever()
-        retriever.setDataSource(context, videoUri)
-        val videoLengthMs =
-            retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
-                ?.toLong()
+            // 3. Parse output: transpose, filter, NMS
+            val detections = parseOutput(outputBuffer[0], bitmap.width, bitmap.height)
 
-        // Note: We need to read width/height from frame instead of getting the width/height
-        // of the video directly because MediaRetriever returns frames that are smaller than the
-        // actual dimension of the video file.
-        val firstFrame = retriever.getFrameAtTime(0)
-        val width = firstFrame?.width
-        val height = firstFrame?.height
-        // Security: recycle probe frame immediately after reading dimensions
-        if (firstFrame != null && !firstFrame.isRecycled) firstFrame.recycle()
+            val inferenceTime = SystemClock.uptimeMillis() - startTime
 
-        // If the video is invalid, returns a null detection result
-        if ((videoLengthMs == null) || (width == null) || (height == null)) return null
+            Log.d(TAG, "detect: ${detections.size} det, ${inferenceTime}ms")
 
-        // Next, we'll get one frame every frameInterval ms, then run detection on these frames.
-        val resultList = mutableListOf<ObjectDetectorResult>()
-        val numberOfFrameToRead = videoLengthMs.div(inferenceIntervalMs)
+            // Compute letterbox padding
+            val padX = (bitmap.width - originalWidth) / 2
+            val padY = (bitmap.height - originalHeight) / 2
 
-        for (i in 0..numberOfFrameToRead) {
-            val timestampMs = i * inferenceIntervalMs // ms
-
-            retriever.getFrameAtTime(
-                timestampMs * 1000, // convert from ms to micro-s
-                MediaMetadataRetriever.OPTION_CLOSEST
-            )?.let { frame ->
-                // Convert the video frame to ARGB_8888 which is required by the MediaPipe
-                val argb8888Frame =
-                    if (frame.config == Bitmap.Config.ARGB_8888) frame
-                    else frame.copy(Bitmap.Config.ARGB_8888, false)
-
-                try {
-                    // Convert the input Bitmap object to an MPImage object to run inference
-                    val mpImage = BitmapImageBuilder(argb8888Frame).build()
-
-                    // Run object detection using MediaPipe Object Detector API
-                    objectDetector?.detectForVideo(mpImage, timestampMs)
-                        ?.let { detectionResult ->
-                            resultList.add(detectionResult)
-                        } ?: {
-                        didErrorOccurred = true
-                        objectDetectorListener?.onError(
-                            "ResultBundle could not be returned" + " in detectVideoFile"
-                        )
-                    }
-                } finally {
-                    // Security: recycle frame bitmaps to prevent accumulation
-                    if (!argb8888Frame.isRecycled) argb8888Frame.recycle()
-                    if (argb8888Frame != frame && !frame.isRecycled) {
-                        frame.recycle()
-                    }
-                }
-            } ?: run {
-                didErrorOccurred = true
-                objectDetectorListener?.onError(
-                    "Frame at specified time could not be" + " retrieved when detecting in video."
-                )
-            }
-        }
-
-        retriever.release()
-
-        val inferenceTimePerFrameMs =
-            (SystemClock.uptimeMillis() - startTime).div(numberOfFrameToRead)
-
-        return if (didErrorOccurred) {
+            ResultBundle(
+                detections = detections,
+                inferenceTime = inferenceTime,
+                inputImageHeight = originalHeight,
+                inputImageWidth = originalWidth,
+                letterboxPadX = padX,
+                letterboxPadY = padY
+            ).also { lastResultBundle = it }
+        } catch (e: Exception) {
+            Log.e(TAG, "detectLivestreamBitmap: ${e.message}", e)
             null
-        } else {
-            ResultBundle(resultList, inferenceTimePerFrameMs, height, width)
         }
     }
 
-    // Runs object detection on live streaming cameras frame-by-frame and returns the results
-    // asynchronously to the caller.
-    fun detectLivestreamFrame(imageProxy: ImageProxy) {
+    // ── Video Detection (stub — not yet implemented for TFLite) ─────────────
 
-        if (runningMode != RunningMode.LIVE_STREAM) {
-            throw IllegalArgumentException(
-                "Attempting to call detectLivestreamFrame" + " while not using RunningMode.LIVE_STREAM"
-            )
-        }
-
-        val frameTime = SystemClock.uptimeMillis()
-
-        // Copy out RGB bits from the frame to a bitmap buffer
-        val bitmapBuffer = Bitmap.createBitmap(
-            imageProxy.width, imageProxy.height, Bitmap.Config.ARGB_8888
-        )
-        imageProxy.use { bitmapBuffer.copyPixelsFromBuffer(imageProxy.planes[0].buffer) }
-        imageProxy.close()
-
-        // If the input image rotation is change, stop all detector
-        if (imageProxy.imageInfo.rotationDegrees != imageRotation) {
-            imageRotation = imageProxy.imageInfo.rotationDegrees
-            if (!bitmapBuffer.isRecycled) bitmapBuffer.recycle()
-            clearObjectDetector()
-            setupObjectDetector()
-            return
-        }
-
-        // Convert the input Bitmap object to an MPImage object to run inference
-        val mpImage = BitmapImageBuilder(bitmapBuffer).build()
-
-        detectAsync(mpImage, frameTime)
-        // Security: recycle bitmap buffer after MPImage wraps it
-        if (!bitmapBuffer.isRecycled) bitmapBuffer.recycle()
-    }
-
-    /**
-     * Runs live-stream object detection on a pre-extracted [Bitmap].
-     * Used by the composite analyzer when the bitmap has already been created
-     * from the imageProxy and shared across barcode/face/OCR analyzers.
-     *
-     * @param bitmap    The camera frame as a Bitmap (ARGB_8888).
-     * @param frameTime The frame timestamp (from [SystemClock.uptimeMillis]).
-     */
-    fun detectLivestreamBitmap(bitmap: Bitmap, frameTime: Long) {
-        if (runningMode != RunningMode.LIVE_STREAM) {
-            throw IllegalArgumentException(
-                "Attempting to call detectLivestreamBitmap while not using RunningMode.LIVE_STREAM"
-            )
-        }
-
-        // If the input image rotation changed, reset the detector
-        // Note: rotation is tracked externally by the composite analyzer
-        val mpImage = BitmapImageBuilder(bitmap).build()
-        detectAsync(mpImage, frameTime)
-    }
-
-    // Run object detection using MediaPipe Object Detector API
-    @VisibleForTesting
-    fun detectAsync(mpImage: MPImage, frameTime: Long) {
-        // As we're using running mode LIVE_STREAM, the detection result will be returned in
-        // returnLivestreamResult function
-        objectDetector?.detectAsync(mpImage, imageProcessingOptions, frameTime)
-    }
-
-    // Return the detection result to this ObjectDetectorHelper's caller
-    private fun returnLivestreamResult(
-        result: ObjectDetectorResult, input: MPImage
-    ) {
-        val finishTimeMs = SystemClock.uptimeMillis()
-        val inferenceTime = finishTimeMs - result.timestampMs()
-
-        val bundle = ResultBundle(
-            listOf(result),
-            inferenceTime,
-            input.height,
-            input.width,
-            imageRotation
-        )
-
-        lastResultBundle = bundle
-        objectDetectorListener?.onResults(bundle)
-    }
-
-    // Return errors thrown during detection to this ObjectDetectorHelper's caller
-    private fun returnLivestreamError(error: RuntimeException) {
-        objectDetectorListener?.onError(
-            error.message ?: "An unknown error has occurred"
-        )
-    }
-
-    // Accepted a Bitmap and runs object detection inference on it to return results back
-    // to the caller
-    fun detectImage(image: Bitmap): ResultBundle? {
-
-        if (runningMode != RunningMode.IMAGE) {
-            throw IllegalArgumentException(
-                "Attempting to call detectImage" + " while not using RunningMode.IMAGE"
-            )
-        }
-
-        if (objectDetector == null) return null
-
-        // Inference time is the difference between the system time at the start and finish of the
-        // process
-        val startTime = SystemClock.uptimeMillis()
-
-        // Convert the input Bitmap object to an MPImage object to run inference
-        val mpImage = BitmapImageBuilder(image).build()
-
-        // Run object detection using MediaPipe Object Detector API
-        objectDetector?.detect(mpImage)?.also { detectionResult ->
-            val inferenceTimeMs = SystemClock.uptimeMillis() - startTime
-            return ResultBundle(
-                listOf(detectionResult),
-                inferenceTimeMs,
-                image.height,
-                image.width
-            )
-        }
-
-        // If objectDetector?.detect() returns null, this is likely an error. Returning null
-        // to indicate this.
+    fun detectVideoFile(videoUri: android.net.Uri, inferenceIntervalMs: Long): ResultBundle? {
+        Log.w(TAG, "detectVideoFile not yet implemented for TFLite YOLOv8")
         return null
     }
 
-    // Wraps results from inference, the time it takes for inference to be performed, and
-    // the input image and height for properly scaling UI to return back to callers
+    // ── Gallery Detection ─────────────────────────────────────────────────────
+
+    fun detectImage(image: Bitmap): ResultBundle? {
+        val interp = interpreter ?: return null
+
+        return try {
+            val startTime = SystemClock.uptimeMillis()
+
+            // For gallery images, we letterbox to the model's input size
+            val letterboxed = letterboxToModelSize(image)
+            val inputTensor = preprocessBitmap(letterboxed)
+
+            val outputShape = interp.getOutputTensor(0).shape()
+            val numChannels = outputShape[1]
+            val numAnchors = outputShape[2]
+            val outputBuffer = Array(1) { Array(numChannels) { FloatArray(numAnchors) } }
+            interp.run(inputTensor, outputBuffer)
+
+            val detections = parseOutput(outputBuffer[0], letterboxed.width, letterboxed.height)
+            val inferenceTime = SystemClock.uptimeMillis() - startTime
+
+            if (!letterboxed.isRecycled) letterboxed.recycle()
+
+            ResultBundle(
+                detections = detections,
+                inferenceTime = inferenceTime,
+                inputImageHeight = image.height,
+                inputImageWidth = image.width,
+                letterboxPadX = (letterboxed.width - image.width) / 2,
+                letterboxPadY = (letterboxed.height - image.height) / 2
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "detectImage: ${e.message}", e)
+            null
+        }
+    }
+
+    // ── Preprocessing ─────────────────────────────────────────────────────────
+
+    /**
+     * Convert a Bitmap into the TFLite input tensor, normalized to [0, 1].
+     *
+     * Auto-detects the model's expected layout:
+     * - NCHW `[1, 3, H, W]`: writes R-plane, G-plane, B-plane sequentially.
+     * - NHWC `[1, H, W, 3]`: writes RGB interleaved per pixel.
+     *
+     * The bitmap is expected to already be the correct size (640×640 after
+     * letterboxing by MlPipelineManager). If not, it is resized.
+     */
+    private fun preprocessBitmap(bitmap: Bitmap): ByteBuffer {
+        val resized = if (bitmap.width != inputSize || bitmap.height != inputSize) {
+            Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
+        } else {
+            bitmap
+        }
+
+        // Total floats: 1 × 3 × 640 × 640 = 1,228,800
+        val totalFloats = 1 * 3 * inputSize * inputSize
+        val buffer = ByteBuffer.allocateDirect(totalFloats * 4)
+        buffer.order(ByteOrder.nativeOrder())
+        buffer.rewind()
+
+        // Extract all pixel ARGB ints
+        val pixels = IntArray(inputSize * inputSize)
+        resized.getPixels(pixels, 0, inputSize, 0, 0, inputSize, inputSize)
+
+        if (inputIsNCHW) {
+            // ── NCHW layout: [1, 3, H, W] ───────────────────────────
+            // Channel-first: write all R values, then all G, then all B.
+            // This is what your YOLOv8 Open Images model expects.
+            val planeSize = inputSize * inputSize
+
+            // R plane
+            for (pixel in pixels) {
+                buffer.putFloat(((pixel shr 16) and 0xFF) / 255.0f)
+            }
+            // G plane
+            for (pixel in pixels) {
+                buffer.putFloat(((pixel shr 8) and 0xFF) / 255.0f)
+            }
+            // B plane
+            for (pixel in pixels) {
+                buffer.putFloat((pixel and 0xFF) / 255.0f)
+            }
+        } else {
+            // ── NHWC layout: [1, H, W, 3] ───────────────────────────
+            // Channel-last: RGB interleaved per pixel.
+            for (pixel in pixels) {
+                buffer.putFloat(((pixel shr 16) and 0xFF) / 255.0f) // R
+                buffer.putFloat(((pixel shr 8) and 0xFF) / 255.0f)  // G
+                buffer.putFloat((pixel and 0xFF) / 255.0f)          // B
+            }
+        }
+
+        if (resized !== bitmap && !resized.isRecycled) resized.recycle()
+
+        buffer.rewind()
+        return buffer
+    }
+
+    /**
+     * Letterbox a bitmap to the model's square input size, preserving
+     * aspect ratio with gray padding.
+     */
+    private fun letterboxToModelSize(source: Bitmap): Bitmap {
+        val srcW = source.width
+        val srcH = source.height
+        if (srcW == inputSize && srcH == inputSize) return source
+
+        val scale = min(inputSize.toFloat() / srcW, inputSize.toFloat() / srcH)
+        val scaledW = (srcW * scale).toInt()
+        val scaledH = (srcH * scale).toInt()
+
+        val letterboxed = Bitmap.createBitmap(inputSize, inputSize, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(letterboxed)
+        canvas.drawColor(Color.rgb(114, 114, 114)) // YOLOv8 default gray padding
+
+        val left = (inputSize - scaledW) / 2
+        val top = (inputSize - scaledH) / 2
+        val destRect = android.graphics.Rect(left, top, left + scaledW, top + scaledH)
+        canvas.drawBitmap(source, null, destRect, null)
+
+        return letterboxed
+    }
+
+    // ── Box type (shared by parseOutput and NMS) ──────────────────────────────
+
+    private data class Box(val left: Float, val top: Float, val right: Float, val bottom: Float)
+
+    // ── Output Parsing ────────────────────────────────────────────────────────
+
+    /**
+     * Parse YOLOv8 raw output tensor `[4+C, 8400]` into filtered detections.
+     *
+     * Steps:
+     * 1. For each of the 8400 anchors, extract box `(cx, cy, w, h)` from
+     *    channels 0–3 and find the top class confidence from channels 4+.
+     * 2. Filter by [threshold].
+     * 3. Convert center-format `(cx, cy, w, h)` → corner-format
+     *    `(left, top, right, bottom)` in model-input pixel coordinates.
+     * 4. Apply greedy Non-Maximum Suppression.
+     * 5. Scale coordinates from model input space (640×640) back to the
+     *    actual letterboxed bitmap dimensions.
+     *
+     * @param rawOutput  Shape `[4+C, 8400]` — first dimension is channels,
+     *                   second is anchor count.
+     * @param bitmapW    Width of the letterboxed bitmap the model received.
+     * @param bitmapH    Height of the letterboxed bitmap the model received.
+     */
+    private fun parseOutput(
+        rawOutput: Array<FloatArray>,  // shape [4+C, 8400]
+        bitmapW: Int,
+        bitmapH: Int
+    ): List<VyzeDetection> {
+        val numChannels = rawOutput.size     // 4 + numClasses  (e.g. 605)
+        val numAnchors = rawOutput[0].size   // 8400
+        val numClasses = numChannels - 4     // e.g. 601
+
+        // ── Auto-detect normalized [0,1] vs pixel-space [0..640] ──────
+        // Sample the first 100 anchors' cx values.  If the maximum is
+        // < 2.0 the model outputs normalized coordinates and we must
+        // scale by inputSize before any further processing.
+        var maxCx = 0f
+        for (i in 0 until min(100, numAnchors)) {
+            val v = rawOutput[0][i]
+            if (v > maxCx) maxCx = v
+        }
+        val outputIsNormalized = maxCx < 2.0f
+        val boxScale = if (outputIsNormalized) inputSize.toFloat() else 1f
+
+        if (outputIsNormalized) {
+            Log.d(TAG, "Model output is NORMALIZED [0,1] — auto-scaling by $inputSize")
+        }
+
+        // ── Step 1: Find best class per anchor, filter by threshold ─────
+        data class RawDetection(
+            val cx: Float, val cy: Float, val w: Float, val h: Float,
+            val classIdx: Int, val score: Float
+        )
+
+        val candidates = mutableListOf<RawDetection>()
+
+        for (i in 0 until numAnchors) {
+            val cx = rawOutput[0][i] * boxScale
+            val cy = rawOutput[1][i] * boxScale
+            val w  = rawOutput[2][i] * boxScale
+            val h  = rawOutput[3][i] * boxScale
+
+            // Skip degenerate boxes
+            if (w <= 0f || h <= 0f) continue
+
+            // Find best class score among channels 4..4+C
+            var bestClass = -1
+            var bestScore = 0f
+            for (c in 0 until numClasses) {
+                val score = rawOutput[4 + c][i]
+                if (score > bestScore) {
+                    bestScore = score
+                    bestClass = c
+                }
+            }
+
+            if (bestScore >= threshold && bestClass >= 0) {
+                candidates.add(RawDetection(cx, cy, w, h, bestClass, bestScore))
+            }
+        }
+
+        if (candidates.isEmpty()) return emptyList()
+
+        Log.d(TAG, "parseOutput: ${candidates.size} candidates after threshold=${threshold}, " +
+            "normalized=$outputIsNormalized, maxCx=$maxCx")
+
+        // ── Step 2: Center-format → corner-format ──────────────────────
+        val boxes = candidates.map {
+            Box(it.cx - it.w / 2, it.cy - it.h / 2, it.cx + it.w / 2, it.cy + it.h / 2)
+        }
+
+        // ── Step 3: Non-Maximum Suppression ────────────────────────────
+        val nmsIndices = nonMaxSuppression(boxes, candidates.map { it.score }, NMS_IOU_THRESHOLD)
+
+        // ── Step 4: Scale to bitmap coords and build result ────────────
+        // The box coords are now in model input pixel space (0..inputSize).
+        // The letterboxed bitmap may differ (e.g. 1280×1280 from MlPipelineManager).
+        // Scale factor = bitmapSize / modelInputSize.
+        val scaleX = bitmapW.toFloat() / inputSize
+        val scaleY = bitmapH.toFloat() / inputSize
+
+        return nmsIndices.take(maxResults).mapNotNull { idx ->
+            val det = candidates[idx]
+            val box = boxes[idx]
+            val label = if (det.classIdx < labels.size) labels[det.classIdx] else "class_${det.classIdx}"
+
+            VyzeDetection(
+                boundingBox = RectF(
+                    box.left * scaleX,
+                    box.top * scaleY,
+                    box.right * scaleX,
+                    box.bottom * scaleY
+                ),
+                categories = listOf(VyzeCategory(label = label, score = det.score))
+            )
+        }
+    }
+
+    /**
+     * Greedy Non-Maximum Suppression.
+     *
+     * @param boxes     List of bounding boxes in corner format.
+     * @param scores    Confidence scores (parallel to boxes).
+     * @param iouThreshold  IoU threshold for suppression.
+     * @return Indices of surviving boxes, sorted by score descending.
+     */
+    private fun nonMaxSuppression(
+        boxes: List<Box>,
+        scores: List<Float>,
+        iouThreshold: Float
+    ): List<Int> {
+        // Sort by score descending
+        val sortedIndices = scores.indices.sortedByDescending { scores[it] }
+        val suppressed = BooleanArray(sortedIndices.size)
+        val result = mutableListOf<Int>()
+
+        for (i in sortedIndices.indices) {
+            if (suppressed[i]) continue
+            val idx = sortedIndices[i]
+            result.add(idx)
+
+            for (j in i + 1 until sortedIndices.size) {
+                if (suppressed[j]) continue
+                val jdx = sortedIndices[j]
+                val iou = computeIoU(boxes[idx], boxes[jdx])
+                if (iou > iouThreshold) {
+                    suppressed[j] = true
+                }
+            }
+        }
+
+        return result
+    }
+
+    /** Compute Intersection-over-Union between two boxes. */
+    private fun computeIoU(a: Box, b: Box): Float {
+        val interLeft = max(a.left, b.left)
+        val interTop = max(a.top, b.top)
+        val interRight = min(a.right, b.right)
+        val interBottom = min(a.bottom, b.bottom)
+
+        val interArea = max(0f, interRight - interLeft) * max(0f, interBottom - interTop)
+        val aArea = (a.right - a.left) * (a.bottom - a.top)
+        val bArea = (b.right - b.left) * (b.bottom - b.top)
+        val unionArea = aArea + bArea - interArea
+
+        return if (unionArea > 0) interArea / unionArea else 0f
+    }
+
+    // ── Result Types ──────────────────────────────────────────────────────────
+
+    /**
+     * A single detection — our replacement for MediaPipe's [ObjectDetectorResult].
+     */
+    data class VyzeDetection(
+        val boundingBox: RectF,
+        val categories: List<VyzeCategory>
+    )
+
+    data class VyzeCategory(
+        val label: String,
+        val score: Float
+    )
+
+    /**
+     * Wraps inference results, timing, and coordinate-mapping information.
+     */
     data class ResultBundle(
-        val results: List<ObjectDetectorResult>,
+        val detections: List<VyzeDetection>,
         val inferenceTime: Long,
         val inputImageHeight: Int,
         val inputImageWidth: Int,
-        val inputImageRotation: Int = 0
-    )
+        val inputImageRotation: Int = 0,
+        val letterboxPadX: Int = 0,
+        val letterboxPadY: Int = 0
+    ) {
+        /**
+         * Convert a bounding box from letterboxed coordinates to the
+         * original (pre-letterbox) frame coordinates.
+         */
+        fun unpadBox(box: RectF): RectF {
+            return RectF(
+                box.left - letterboxPadX,
+                box.top - letterboxPadY,
+                box.right - letterboxPadX,
+                box.bottom - letterboxPadY
+            )
+        }
+    }
 
     companion object {
+        const val MODEL_FILE = "yolov8n.tflite"
+        const val LABELS_FILE = "labels.txt"
+        const val INPUT_SIZE_DEFAULT = 640
+        const val MAX_RESULTS_DEFAULT = 10
+        const val THRESHOLD_DEFAULT = 0.25F
+        const val NMS_IOU_THRESHOLD = 0.45f
+        const val OTHER_ERROR = 0
+        const val GPU_ERROR = 1
+        // Legacy constants kept for MainViewModel / settings compatibility
         const val DELEGATE_CPU = 0
         const val DELEGATE_GPU = 1
         const val MODEL_EFFICIENTDETV0 = 0
         const val MODEL_EFFICIENTDETV2 = 1
-        const val MAX_RESULTS_DEFAULT = 3
-        const val THRESHOLD_DEFAULT = 0.5F
-        const val OTHER_ERROR = 0
-        const val GPU_ERROR = 1
-
         const val TAG = "ObjectDetectorHelper"
-
-        // ── Spatial Mapping Constants ────────────────────────────────────────
-        /** Centre-X normalised threshold: below this → left */
-        const val LEFT_THRESHOLD = 0.35f
-        /** Centre-X normalised threshold: above this → right (0.35–0.65 = ahead) */
-        const val RIGHT_THRESHOLD = 0.65f
-
-        /** Box area fraction above this → "close" */
-        const val CLOSE_THRESHOLD = 0.15f
-        /** Box area fraction below this → "far" */
-        const val FAR_THRESHOLD = 0.05f
-
-        // ── Direction / Proximity Strings ────────────────────────────────────
-        const val DIR_LEFT   = "on your left"
-        const val DIR_AHEAD  = "directly ahead"
-        const val DIR_RIGHT  = "on your right"
-
-        const val PROX_CLOSE  = "close"
-        const val PROX_FAR    = "far"
-        const val PROX_MEDIUM = ""   // empty — medium proximity is not announced
-
-        // ── Debounce ─────────────────────────────────────────────────────────
-        /** Cooldown in milliseconds per label+zone before the same object is announced again. */
-        const val DEBOUNCE_MS = 3500L
     }
 
-    // Used to pass results or errors back to the calling class
     interface DetectorListener {
         fun onError(error: String, errorCode: Int = OTHER_ERROR)
         fun onResults(resultBundle: ResultBundle)

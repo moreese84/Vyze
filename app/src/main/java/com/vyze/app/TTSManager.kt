@@ -19,6 +19,18 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
     @Volatile
     private var currentLocale: Locale = Locale.US
 
+    // ── Debounce state ────────────────────────────────────────────────
+    // Prevents continuous frame callbacks from flooding the TTS queue.
+    // All timestamps are in [System.currentTimeMillis] (wall-clock).
+
+    /** Timestamp of the last [speak] or [speakImmediate] call. */
+    @Volatile
+    private var lastSpeechTime = 0L
+
+    /** The text of the last utterance that was actually sent to TTS. */
+    @Volatile
+    private var lastSpokenText = ""
+
     init {
         tts = TextToSpeech(context.applicationContext, this)
     }
@@ -47,27 +59,72 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
 
     /**
      * Speaks the given text with the specified queue mode.
-     * Uses QUEUE_FLUSH by default (interrupts current speech).
+     *
+     * Defaults to [TextToSpeech.QUEUE_ADD] so that new utterances are
+     * appended rather than interrupting whatever is currently playing.
+     * This eliminates mid-sentence cutoffs caused by rapid-fire frame
+     * callbacks each issuing a QUEUE_FLUSH.
+     *
+     * A 2-second debounce is enforced: if the *exact same* text was
+     * spoken less than [DEBOUNCE_MS] ago the call is silently dropped,
+     * preventing repetitive "no... no... no..." loops from continuous
+     * error callbacks.
+     *
+     * If the TTS engine is already speaking different text, the new
+     * utterance is queued normally (non-destructive).
      */
-    fun speak(text: String, queueMode: Int = TextToSpeech.QUEUE_FLUSH) {
+    fun speak(text: String, queueMode: Int = TextToSpeech.QUEUE_ADD) {
         if (!isInitialized) {
-            Log.w(TAG, "TTS not initialized yet, queuing: $text")
+            Log.w(TAG, "TTS not initialized yet, ignoring: $text")
             return
         }
-        tts?.speak(text, queueMode, null, "utterance_${System.currentTimeMillis()}")
+
+        // ── 2-second debounce ────────────────────────────────────────────
+        val now = System.currentTimeMillis()
+        if (text == lastSpokenText && (now - lastSpeechTime) < DEBOUNCE_MS) {
+            // Same text within cooldown → suppress to prevent loop
+            return
+        }
+
+        lastSpeechTime = now
+        lastSpokenText = text
+
+        tts?.speak(text, queueMode, null, "utterance_${now}")
     }
 
     /**
      * Immediate speech for urgent accessibility feedback.
-     * Flushes any pending speech and speaks immediately.
+     *
+     * Stops any current speech, then speaks the new text using QUEUE_FLUSH.
+     * Still subject to the same 2-second debounce as [speak] to prevent
+     * rapid-fire loops.
      */
     fun speakImmediate(text: String) {
         if (!isInitialized) {
             Log.w(TAG, "TTS not initialized for immediate speech: $text")
             return
         }
+
+        // ── 2-second debounce (same logic as speak) ─────────────────────
+        val now = System.currentTimeMillis()
+        if (text == lastSpokenText && (now - lastSpeechTime) < DEBOUNCE_MS) {
+            return
+        }
+
+        lastSpeechTime = now
+        lastSpokenText = text
+
         tts?.stop()
-        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "immediate_${System.currentTimeMillis()}")
+        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "immediate_${now}")
+    }
+
+    /**
+     * Returns `true` when the TTS engine is actively speaking or has
+     * utterances queued.  Useful for callers that want to avoid
+     * interrupting an in-progress announcement.
+     */
+    fun isSpeaking(): Boolean {
+        return tts?.isSpeaking == true
     }
 
     /**
@@ -83,7 +140,7 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
      * Switches the TTS engine to the specified language.
      *
      * @param languageKey One of [LANGUAGE_ENGLISH], [LANGUAGE_MALAY], [LANGUAGE_CHINESE].
-     * @param context     Used to persist the preference.
+     * @param context     To persist the preference.
      */
     fun setLanguage(languageKey: String, context: Context) {
         val locale = localeFromKey(languageKey)
@@ -221,5 +278,12 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
 
         /** All supported language keys for UI binding. */
         val SUPPORTED_LANGUAGES = listOf(LANGUAGE_ENGLISH, LANGUAGE_MALAY, LANGUAGE_CHINESE)
+
+        /**
+         * Minimum milliseconds between identical TTS utterances.
+         * Prevents continuous frame callbacks from flooding the queue
+         * with the same error message (the "no... no... no..." loop).
+         */
+        const val DEBOUNCE_MS = 2000L
     }
 }

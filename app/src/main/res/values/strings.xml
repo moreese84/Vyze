@@ -192,6 +192,10 @@
     <string name="error_log_count">%1$d errors recorded</string>
     <string name="error_log_cleared">Error log cleared.</string>
 
+    <!-- ── Onboarding Overlay ───────────────────────────────────── -->
+    <string name="onboarding_overlay_desc">Welcome screen. Tap anywhere to begin using Vyze.</string>
+    <string name="onboarding_tap_to_begin">Tap anywhere to begin</string>
+
     <!-- ── Accessibility Service ─────────────────────────────────── -->
     <string name="accessibility_service_description">Vyze accessibility service provides TalkBack integration and gesture support for visually impaired users.</string>
     <string name="accessibility_service_enabled">Vyze accessibility service enabled.</string>

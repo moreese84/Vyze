@@ -49,7 +49,7 @@ android {
 
     defaultConfig {
         applicationId = "com.vyze.app"
-        minSdk = 24
+        minSdk = 26
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"
@@ -90,6 +90,7 @@ android {
 
     androidResources {
         noCompress += "tflite"
+        noCompress += "txt"
     }
 }
 
@@ -131,8 +132,15 @@ dependencies {
     implementation("com.google.mlkit:barcode-scanning:17.2.0")
     implementation("com.google.mlkit:face-detection:16.1.6")
 
-    // MediaPipe
+    // MediaPipe (kept for RunningMode enum used by OverlayView)
     implementation("com.google.mediapipe:tasks-vision:0.10.8")
+
+    // TensorFlow Lite (YOLOv8 object detection)
+    implementation("org.tensorflow:tensorflow-lite:2.14.0")
+    implementation("org.tensorflow:tensorflow-lite-support:0.4.4")
+
+    // ML Kit GenAI Prompt API (Gemini Nano on-device agent)
+    implementation("com.google.mlkit:genai-prompt:1.0.0-beta1")
 
     // Room (local database for scan history)
     val room_version = "2.7.0"

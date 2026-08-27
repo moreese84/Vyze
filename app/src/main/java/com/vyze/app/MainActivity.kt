@@ -38,13 +38,21 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         // Install splash screen BEFORE super.onCreate() — reads Theme.App.Starting
         // from the manifest and renders the dark background with the Vyze mark.
-        installSplashScreen()
+        val splashScreen = installSplashScreen()
+
+        // Hold the splash screen visible until the ML pipeline has finished
+        // initializing on the background thread.  Without this, the splash
+        // dismisses instantly and the user sees a dead camera preview for
+        // 1-3 seconds while models bind — especially confusing for low-vision
+        // users who rely on haptic/TTS confirmation.
+        splashScreen.setKeepOnScreenCondition { !SplashViewModel.isMlReady }
 
         super.onCreate(savedInstanceState)
 
         // ── Immediate haptic confirmation ──────────────────────────────
         // Low-vision users need tactile proof that the process is alive
-        // before ML models finish binding. This fires instantly on launch.
+        // before ML models finish binding. This fires instantly on launch
+        // while the splash is still held by setKeepOnScreenCondition.
         hapticManager = HapticManager(applicationContext)
         hapticManager.vibrateTap()
 

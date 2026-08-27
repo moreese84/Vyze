@@ -24,7 +24,7 @@ import java.util.concurrent.ConcurrentHashMap
  * holds the camera steady.
  *
  * ## Input Format
- * Accepts a list of [ObjectDetectorHelper.SpatialInfo] objects or
+ * Accepts a list of [SpatialAnnouncer.SpatialInfo] objects or
  * pre-formatted strings in the format `"label|direction"`.
  */
 class SceneAggregator {
@@ -38,10 +38,10 @@ class SceneAggregator {
     /**
      * Aggregates a list of spatial detections into a natural sentence.
      *
-     * @param detections List of [ObjectDetectorHelper.SpatialInfo] from the detector.
+     * @param detections List of [SpatialAnnouncer.SpatialInfo] from the detector.
      * @return A natural-language scene summary, or null if nothing valid / cooldown active.
      */
-    fun aggregate(detections: List<ObjectDetectorHelper.SpatialInfo>): String? {
+    fun aggregate(detections: List<SpatialAnnouncer.SpatialInfo>): String? {
         if (detections.isEmpty()) return null
 
         // Check cooldown
@@ -59,9 +59,9 @@ class SceneAggregator {
 
         // Priority order: ahead first, then left, then right
         val directionOrder = listOf(
-            ObjectDetectorHelper.DIR_AHEAD,
-            ObjectDetectorHelper.DIR_LEFT,
-            ObjectDetectorHelper.DIR_RIGHT
+            SpatialAnnouncer.DIR_AHEAD,
+            SpatialAnnouncer.DIR_LEFT,
+            SpatialAnnouncer.DIR_RIGHT
         )
 
         for (direction in directionOrder) {
@@ -108,16 +108,16 @@ class SceneAggregator {
 
     /**
      * Parses a detection string like "chair on your left" or "person facing you, close, ahead"
-     * into a [ObjectDetectorHelper.SpatialInfo].
+     * into a [SpatialAnnouncer.SpatialInfo].
      */
-    private fun parseDetectionString(input: String): ObjectDetectorHelper.SpatialInfo? {
+    private fun parseDetectionString(input: String): SpatialAnnouncer.SpatialInfo? {
         val lower = input.lowercase()
 
         // Find the direction in the string
         val direction = when {
-            lower.contains("on your left")  -> ObjectDetectorHelper.DIR_LEFT
-            lower.contains("on your right") -> ObjectDetectorHelper.DIR_RIGHT
-            lower.contains("directly ahead") || lower.contains("ahead") -> ObjectDetectorHelper.DIR_AHEAD
+            lower.contains("on your left")  -> SpatialAnnouncer.DIR_LEFT
+            lower.contains("on your right") -> SpatialAnnouncer.DIR_RIGHT
+            lower.contains("directly ahead") || lower.contains("ahead") -> SpatialAnnouncer.DIR_AHEAD
             else -> return null
         }
 
@@ -138,12 +138,12 @@ class SceneAggregator {
 
         // Determine proximity from the string
         val proximity = when {
-            lower.contains("close") -> ObjectDetectorHelper.PROX_CLOSE
-            lower.contains("far")   -> ObjectDetectorHelper.PROX_FAR
-            else                    -> ObjectDetectorHelper.PROX_MEDIUM
+            lower.contains("close") -> SpatialAnnouncer.PROX_CLOSE
+            lower.contains("far")   -> SpatialAnnouncer.PROX_FAR
+            else                    -> SpatialAnnouncer.PROX_MEDIUM
         }
 
-        return ObjectDetectorHelper.SpatialInfo(
+        return SpatialAnnouncer.SpatialInfo(
             categoryName = label,
             score = 1.0f,
             boundingBox = android.graphics.RectF(),

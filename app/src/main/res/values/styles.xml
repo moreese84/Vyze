@@ -21,6 +21,11 @@
 
     </style>
 
+    <!-- Main app theme used after the splash screen dismisses. -->
+    <style name="Theme.Vyze" parent="Theme.AppCompat.Light.NoActionBar">
+
+    </style>
+
     <!-- Splash Screen theme — applied as the starting theme in the manifest.
          Off-white background matches the adaptive icon palette.
          Must be set BEFORE installSplashScreen() in the Activity. -->
@@ -28,7 +33,7 @@
         <item name="windowSplashScreenBackground">@color/vyze_foreground</item>
         <item name="windowSplashScreenAnimatedIcon">@drawable/ic_launcher_foreground_animated</item>
         <item name="windowSplashScreenIconBackgroundColor">@color/vyze_foreground</item>
-        <item name="postSplashScreenTheme">@style/AppTheme</item>
+        <item name="postSplashScreenTheme">@style/Theme.Vyze</item>
     </style>
 
     <style name="BottomSheetSpinnerItemStyle" parent="Widget.AppCompat.Light.DropDownItem.Spinner">

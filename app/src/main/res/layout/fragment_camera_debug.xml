@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <!-- Camera preview feed -->
+    <androidx.camera.view.PreviewView
+        android:id="@+id/view_finder"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:contentDescription="@string/view_finder_desc"
+        android:importantForAccessibility="no"
+        app:scaleType="fillStart"
+        xmlns:app="http://schemas.android.com/apk/res-auto"/>
+
+    <!-- Diagnostic overlay — shows pipeline state on screen -->
+    <TextView
+        android:id="@+id/diagnostic_overlay"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|start"
+        android:layout_margin="8dp"
+        android:background="#CC000000"
+        android:textColor="#FF00FF00"
+        android:textSize="10sp"
+        android:fontFamily="monospace"
+        android:padding="6dp"
+        android:text="INIT..."
+        android:importantForAccessibility="no" />
+
+</FrameLayout>

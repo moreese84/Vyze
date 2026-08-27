@@ -205,7 +205,7 @@ class GalleryFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
 
     // Load and display the image.
     private fun runDetectionOnImage(uri: Uri) {
-        fragmentGalleryBinding.overlay.setRunningMode(RunningMode.IMAGE)
+        fragmentGalleryBinding.overlay.runningMode = RunningMode.IMAGE
         setUiEnabled(false)
         backgroundExecutor = Executors.newSingleThreadScheduledExecutor()
         updateDisplayView(MediaType.IMAGE)
@@ -232,10 +232,7 @@ class GalleryFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
                         ObjectDetectorHelper(
                             context = requireContext(),
                             threshold = viewModel.currentThreshold,
-                            currentDelegate = viewModel.currentDelegate,
-                            currentModel = viewModel.currentModel,
                             maxResults = viewModel.currentMaxResults,
-                            runningMode = RunningMode.IMAGE,
                             objectDetectorListener = this
                         )
 
@@ -243,10 +240,11 @@ class GalleryFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
                         ?.let { resultBundle ->
                             activity?.runOnUiThread {
                                 fragmentGalleryBinding.overlay.setResults(
-                                    resultBundle.results[0],
+                                    resultBundle.detections,
                                     bitmap.height,
                                     bitmap.width,
-                                    resultBundle.inputImageRotation
+                                    resultBundle.letterboxPadX,
+                                    resultBundle.letterboxPadY
                                 )
 
                                 setUiEnabled(true)
@@ -266,7 +264,7 @@ class GalleryFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
     }
 
     private fun runDetectionOnVideo(uri: Uri) {
-        fragmentGalleryBinding.overlay.setRunningMode(RunningMode.VIDEO)
+        fragmentGalleryBinding.overlay.runningMode = RunningMode.VIDEO
         setUiEnabled(false)
         updateDisplayView(MediaType.VIDEO)
 
@@ -284,10 +282,7 @@ class GalleryFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
                 ObjectDetectorHelper(
                     context = requireContext(),
                     threshold = viewModel.currentThreshold,
-                    currentDelegate = viewModel.currentDelegate,
-                    currentModel = viewModel.currentModel,
                     maxResults = viewModel.currentMaxResults,
-                    runningMode = RunningMode.VIDEO,
                     objectDetectorListener = this
                 )
 
@@ -328,15 +323,16 @@ class GalleryFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
                     val resultIndex =
                         videoElapsedTimeMs.div(VIDEO_INTERVAL_MS).toInt()
 
-                    if (resultIndex >= result.results.size || fragmentGalleryBinding.videoView.visibility == View.GONE) {
+                    if (resultIndex >= 1 || fragmentGalleryBinding.videoView.visibility == View.GONE) {
                         // The video playback has finished so we stop drawing bounding boxes
                         backgroundExecutor.shutdown()
                     } else {
                         fragmentGalleryBinding.overlay.setResults(
-                            result.results[resultIndex],
+                            result.detections,
                             result.inputImageHeight,
                             result.inputImageWidth,
-                            result.inputImageRotation
+                            result.letterboxPadX,
+                            result.letterboxPadY
                         )
 
                         setUiEnabled(true)

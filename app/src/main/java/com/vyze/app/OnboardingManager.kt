@@ -8,12 +8,18 @@ import android.util.Log
 /**
  * Manages the first-run onboarding experience for Vyze.
  *
- * On first launch, delivers a sequential audio tutorial via [TTSManager]
+ * On first launch, delivers a spoken tutorial via [TTSManager]
  * with synchronized haptic pulses via [HapticManager] so visually impaired
  * users learn the gesture vocabulary through both sound and touch.
  *
- * The first-run flag is persisted in [SharedPreferences] under [PREF_FIRST_RUN]
+ * The first-run flag is persisted in [SharedPreferences] under [PREF_IS_FIRST_LAUNCH]
  * so the tutorial plays only once across app restarts.
+ *
+ * ## Flow
+ * 1. Splash screen holds while ML models initialize.
+ * 2. Splash dismisses → [playWelcomeMessage] speaks the consolidated welcome.
+ * 3. Camera feed is active behind the onboarding overlay.
+ * 4. User taps screen → [dismissOnboarding] marks complete and hides overlay.
  */
 class OnboardingManager(
     private val context: Context,
@@ -26,71 +32,86 @@ class OnboardingManager(
 
     /**
      * Returns `true` if this is the first time the app has been launched.
+     * Checks the [PREF_IS_FIRST_LAUNCH] key (default `true`).
      */
-    fun isFirstRun(): Boolean {
-        return prefs.getBoolean(PREF_FIRST_RUN, true)
+    fun isFirstLaunch(): Boolean {
+        return prefs.getBoolean(PREF_IS_FIRST_LAUNCH, true)
     }
 
     /**
-     * Marks the first-run flag as completed so the tutorial will not
+     * Marks the first-launch flag as completed so the onboarding will not
      * play again on subsequent launches.
      */
     fun markOnboardingComplete() {
-        prefs.edit().putBoolean(PREF_FIRST_RUN, false).apply()
+        prefs.edit().putBoolean(PREF_IS_FIRST_LAUNCH, false).apply()
     }
 
     /**
-     * Plays the onboarding tutorial if this is the first run.
+     * Speaks the consolidated welcome message on first launch.
      *
-     * The tutorial speaks each gesture description sequentially, with a
-     * haptic pulse synchronized to each segment so the user receives
-     * tactile confirmation of each instruction.
+     * The message covers all gestures in a single utterance:
+     * "Welcome to Vyze. Single tap anywhere to hear objects ahead."
+     * "Double tap to read text. Long press for scene summaries."
+     * "Tap screen to begin."
      *
-     * Call this from [CameraFragment.onViewCreated] or equivalent.
-     * The tutorial is non-blocking — it uses delayed callbacks so it
-     * does not hold the main thread.
+     * @param onWelcomeFinished Optional callback invoked after the TTS
+     *                          utterance is queued (not after it finishes
+     *                          speaking — TTS is async).
+     */
+    fun playWelcomeMessage(onWelcomeFinished: (() -> Unit)? = null) {
+        if (!isFirstLaunch()) {
+            onWelcomeFinished?.invoke()
+            return
+        }
+
+        Log.d(TAG, "First launch detected — playing welcome onboarding")
+
+        handler.postDelayed({
+            hapticManager.vibrateLongPress()
+            ttsManager.speakImmediate(WELCOME_MESSAGE)
+            onWelcomeFinished?.invoke()
+        }, DELAY_WELCOME_MS)
+    }
+
+    /**
+     * Plays the full sequential tutorial (welcome + individual instructions).
+     * Kept for backward compatibility — new code should use [playWelcomeMessage].
      *
      * @param onComplete Optional callback invoked when the full tutorial finishes.
      */
     fun playTutorialIfFirstRun(onComplete: (() -> Unit)? = null) {
-        if (!isFirstRun()) {
+        if (!isFirstLaunch()) {
             onComplete?.invoke()
             return
         }
 
-        Log.d(TAG, "First run detected — playing onboarding tutorial")
+        Log.d(TAG, "First launch detected — playing onboarding tutorial")
 
-        // Step 0: Welcome message + greeting haptic
         handler.postDelayed({
             hapticManager.vibrateLongPress()
             ttsManager.speakImmediate(WELCOME_MESSAGE)
         }, DELAY_WELCOME_MS)
 
-        // Step 1: Single-tap instruction
         handler.postDelayed({
             hapticManager.vibrateTap()
             ttsManager.speak(SINGLE_TAP_INSTRUCTION)
         }, DELAY_SINGLE_TAP_MS)
 
-        // Step 2: Double-tap instruction
         handler.postDelayed({
             hapticManager.vibrateDoubleTap()
             ttsManager.speak(DOUBLE_TAP_INSTRUCTION)
         }, DELAY_DOUBLE_TAP_MS)
 
-        // Step 3: Long-press instruction
         handler.postDelayed({
             hapticManager.vibrateLongPress()
             ttsManager.speak(LONG_PRESS_INSTRUCTION)
         }, DELAY_LONG_PRESS_MS)
 
-        // Step 4: Swipe instruction
         handler.postDelayed({
             hapticManager.vibrateWarning()
             ttsManager.speak(SWIPE_INSTRUCTION)
         }, DELAY_SWIPE_MS)
 
-        // Step 5: Completion
         handler.postDelayed({
             hapticManager.vibrateDoubleTap()
             ttsManager.speak(COMPLETION_MESSAGE)
@@ -111,13 +132,26 @@ class OnboardingManager(
     companion object {
         private const val TAG = "OnboardingManager"
         private const val PREFS_NAME = "vyze_onboarding"
+
+        /** SharedPreferences key for first-launch flag (default true). */
+        const val PREF_IS_FIRST_LAUNCH = "is_first_launch"
+
+        // Legacy key — kept for migration compatibility
         const val PREF_FIRST_RUN = "first_run"
 
         // ── Tutorial Messages ───────────────────────────────────────────────
 
+        /**
+         * Consolidated welcome message for first launch.
+         * Covers all gestures in a single utterance so the user can
+         * tap to begin immediately without waiting through a long sequence.
+         */
         const val WELCOME_MESSAGE =
-            "Welcome to Vyze. I am your eyes. " +
-            "Let me teach you how to use me."
+            "Welcome to Vyze. " +
+            "Single tap anywhere to hear objects ahead. " +
+            "Double tap to read text. " +
+            "Long press for scene summaries. " +
+            "Tap screen to begin."
 
         const val SINGLE_TAP_INSTRUCTION =
             "Tap once anywhere on the screen to detect objects around you. " +
@@ -139,8 +173,6 @@ class OnboardingManager(
             "I am always here to help."
 
         // ── Timing (milliseconds) ───────────────────────────────────────────
-        // Delays are chosen to allow TTS to finish each segment before
-        // the next one starts. Adjust if TTS speed settings change.
 
         /** Delay before the welcome message plays. */
         const val DELAY_WELCOME_MS = 500L
