@@ -35,21 +35,11 @@ class MainViewModel(
     // Object Detection State (persisted via SavedStateHandle)
     // ══════════════════════════════════════════════════════════════════
 
-    val currentDelegate: Int
-        get() = savedStateHandle[KEY_DELEGATE] ?: ObjectDetectorHelper.DELEGATE_CPU
-
     val currentThreshold: Float
         get() = savedStateHandle[KEY_THRESHOLD] ?: ObjectDetectorHelper.THRESHOLD_DEFAULT
 
     val currentMaxResults: Int
         get() = savedStateHandle[KEY_MAX_RESULTS] ?: ObjectDetectorHelper.MAX_RESULTS_DEFAULT
-
-    val currentModel: Int
-        get() = savedStateHandle[KEY_MODEL] ?: ObjectDetectorHelper.MODEL_EFFICIENTDETV0
-
-    fun setDelegate(delegate: Int) {
-        savedStateHandle[KEY_DELEGATE] = delegate
-    }
 
     fun setThreshold(threshold: Float) {
         savedStateHandle[KEY_THRESHOLD] = threshold
@@ -57,10 +47,6 @@ class MainViewModel(
 
     fun setMaxResults(maxResults: Int) {
         savedStateHandle[KEY_MAX_RESULTS] = maxResults
-    }
-
-    fun setModel(model: Int) {
-        savedStateHandle[KEY_MODEL] = model
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -185,10 +171,8 @@ class MainViewModel(
     // ══════════════════════════════════════════════════════════════════
 
     companion object {
-        private const val KEY_DELEGATE = "od_delegate"
         private const val KEY_THRESHOLD = "od_threshold"
         private const val KEY_MAX_RESULTS = "od_max_results"
-        private const val KEY_MODEL = "od_model"
         private const val KEY_ACTIVE_LANGUAGE = "active_language"
         private const val KEY_LAST_BATTERY_WARNING = "last_battery_warning"
     }

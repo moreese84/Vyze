@@ -260,7 +260,7 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
             scanRepository = scanRepository,
             mainHandler = mainHandler
         )
-        gestureRouter.onSingleTapAction = {
+        gestureRouter.onSingleTapAction = { x, y ->
             // Cancel any pending scene summary to prevent interleaving
             mainHandler.removeCallbacks(sceneSummaryRunnable)
             // Suppress voice-command TTS so it doesn't override OD announcements
@@ -268,7 +268,7 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
             if (this::voiceCommandManager.isInitialized && voiceCommandManager.isCurrentlyListening()) {
                 voiceCommandManager.stopListening()
             }
-            announceDetectedObject()
+            announceDetectedObjectAtTouch(x, y)
         }
         gestureRouter.onDoubleTapAction = {
             mainHandler.removeCallbacks(sceneSummaryRunnable)
@@ -295,8 +295,6 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
             mlPipeline.initialize(
                 context = requireContext(),
                 threshold = viewModel.currentThreshold,
-                delegate = viewModel.currentDelegate,
-                model = viewModel.currentModel,
                 maxResults = viewModel.currentMaxResults,
                 detectorListener = this
             )
@@ -397,8 +395,7 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
         cameraSetup.releaseCamera()
 
         if (mlPipeline.isOdInitialized()) {
-            viewModel.setModel(mlPipeline.objectDetectorHelper.currentModel)
-            viewModel.setDelegate(mlPipeline.objectDetectorHelper.currentDelegate)
+
             viewModel.setThreshold(mlPipeline.objectDetectorHelper.threshold)
             viewModel.setMaxResults(mlPipeline.objectDetectorHelper.maxResults)
             backgroundExecutor.execute { mlPipeline.objectDetectorHelper.clearObjectDetector() }
@@ -539,10 +536,29 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
             return
         }
 
-        // Try spatial announcements first (includes debounce + proximity)
+        // Use scene grouping: groups multiple instances of same class
+        // (e.g. "3 chairs" instead of "chair, chair, chair")
+        // and applies per-class debounce cooldown
+        val sceneDescription = try {
+            spatialAnnouncer.buildSceneDescription(
+                detections = detections,
+                frameWidth = resultBundle.inputImageWidth,
+                frameHeight = resultBundle.inputImageHeight
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "buildSceneDescription failed", e)
+            null
+        }
+
+        if (sceneDescription != null) {
+            ttsManager.speakImmediate(sceneDescription)
+            return
+        }
+
+        // Fallback: try individual spatial announcements
         val announcements = try {
             spatialAnnouncer.getAnnounceableDetections(
-                detections = resultBundle.detections,
+                detections = detections,
                 frameWidth = resultBundle.inputImageWidth,
                 frameHeight = resultBundle.inputImageHeight
             )
@@ -581,6 +597,49 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
                 context?.getString(R.string.od_no_detected) ?: "No objects detected."
             )
         }
+    }
+
+    /**
+     * Announce the object at the exact touch point.
+     * Maps the screen touch to frame coordinates, then hit-tests
+     * against all current detections. If a hit is found, announces
+     * that specific object. Falls back to the general announceDetectedObject().
+     */
+    private fun announceDetectedObjectAtTouch(touchX: Float, touchY: Float) {
+        if (!mlPipeline.isOdInitialized()) {
+            ttsManager.speakImmediate(
+                context?.getString(R.string.od_no_objects) ?: "No objects detected yet."
+            )
+            return
+        }
+
+        val resultBundle = mlPipeline.objectDetectorHelper.lastResultBundle
+        if (resultBundle == null || resultBundle.detections.isEmpty()) {
+            ttsManager.speakImmediate(
+                context?.getString(R.string.od_no_visible)
+                    ?: "No objects currently visible. Try pointing the camera at an object."
+            )
+            return
+        }
+
+        // Hit-test: map touch to frame coords via the overlay
+        val hitDetection = fragmentCameraBinding.overlay.hitTestDetection(touchX, touchY)
+
+        if (hitDetection != null) {
+            val cat = hitDetection.categories.firstOrNull()
+            if (cat != null) {
+                ttsManager.speakImmediate(
+                    context?.getString(
+                        R.string.od_detected, cat.label,
+                        (cat.score * 100).toInt()
+                    ) ?: "${cat.label}, confidence ${(cat.score * 100)} percent."
+                )
+                return
+            }
+        }
+
+        // No hit at this touch point — fall back to spatial announcement
+        announceDetectedObject()
     }
 
     private fun triggerSceneSummary() {
@@ -765,31 +824,6 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
             }
         }
 
-        fragmentCameraBinding.bottomSheetLayout.spinnerDelegate.setSelection(viewModel.currentDelegate, false)
-        fragmentCameraBinding.bottomSheetLayout.spinnerDelegate.onItemSelectedListener =
-            object : AdapterView.OnItemSelectedListener {
-                override fun onItemSelected(p0: AdapterView<*>?, p1: View?, p2: Int, p3: Long) {
-                    try {
-                        mlPipeline.objectDetectorHelper.currentDelegate = p2; updateControlsUi()
-                    } catch (e: UninitializedPropertyAccessException) {
-                        Log.e(TAG, "OD not initialized.")
-                    }
-                }
-                override fun onNothingSelected(p0: AdapterView<*>?) {}
-            }
-
-        fragmentCameraBinding.bottomSheetLayout.spinnerModel.setSelection(viewModel.currentModel, false)
-        fragmentCameraBinding.bottomSheetLayout.spinnerModel.onItemSelectedListener =
-            object : AdapterView.OnItemSelectedListener {
-                override fun onItemSelected(p0: AdapterView<*>?, p1: View?, p2: Int, p3: Long) {
-                    try {
-                        mlPipeline.objectDetectorHelper.currentModel = p2; updateControlsUi()
-                    } catch (e: UninitializedPropertyAccessException) {
-                        Log.e(TAG, "OD not initialized.")
-                    }
-                }
-                override fun onNothingSelected(p0: AdapterView<*>?) {}
-            }
     }
 
     private fun updateControlsUi() {
@@ -846,9 +880,6 @@ class CameraFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
         activity?.runOnUiThread {
             diagnosticManager.update("OD ERROR: $error")
             Toast.makeText(requireContext(), error, Toast.LENGTH_SHORT).show()
-            if (errorCode == ObjectDetectorHelper.GPU_ERROR) {
-                fragmentCameraBinding.bottomSheetLayout.spinnerDelegate.setSelection(ObjectDetectorHelper.DELEGATE_CPU, false)
-            }
         }
     }
 

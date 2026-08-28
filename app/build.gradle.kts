@@ -54,6 +54,10 @@ android {
         versionCode = 1
         versionName = "1.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        ndk {
+            abiFilters += listOf("arm64-v8a")
+        }
     }
 
     dataBinding {
@@ -138,6 +142,7 @@ dependencies {
     // TensorFlow Lite (YOLOv8 object detection)
     implementation("org.tensorflow:tensorflow-lite:2.14.0")
     implementation("org.tensorflow:tensorflow-lite-support:0.4.4")
+    implementation("org.tensorflow:tensorflow-lite-gpu:2.14.0")
 
     // ML Kit GenAI Prompt API (Gemini Nano on-device agent)
     implementation("com.google.mlkit:genai-prompt:1.0.0-beta1")

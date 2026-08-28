@@ -23,7 +23,7 @@ import kotlinx.coroutines.launch
  * Handles all gesture-to-action routing for the camera screen.
  *
  * Gesture Vocabulary:
- * - Single tap → Object Detection readout
+ * - Single tap → Object Detection readout (with touch coordinate for hit-test)
  * - Double tap → OCR text recognition
  * - Long press → Scene Summary
  * - Triple tap → Color Analysis (center ROI)
@@ -40,8 +40,8 @@ class GestureRouter(
 
     private val TAG = "GestureRouter"
 
-    /** Callback for single-tap (Object Detection readout). */
-    var onSingleTapAction: () -> Unit = {}
+    /** Callback for single-tap with (x, y) in view coordinates. */
+    var onSingleTapAction: (x: Float, y: Float) -> Unit = { _, _ -> }
 
     /** Callback for double-tap (OCR readout). */
     var onDoubleTapAction: () -> Unit = {}
@@ -61,9 +61,9 @@ class GestureRouter(
         isAttached = true
 
         gestureDetectorHelper = GestureDetectorHelper(
-            onSingleTap = {
+            onSingleTap = { e ->
                 hapticManager.vibrateTap()
-                onSingleTapAction()
+                onSingleTapAction(e.x, e.y)
             },
             onDoubleTap = {
                 hapticManager.vibrateDoubleTap()

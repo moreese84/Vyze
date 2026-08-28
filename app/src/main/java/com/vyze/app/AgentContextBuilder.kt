@@ -141,36 +141,6 @@ class AgentContextBuilder {
         )
     }
 
-    /**
-     * Build a compact text summary (non-JSON) for quick rule-based fallback.
-     *
-     * Example output: `"chair 0.87 left close, table 0.72 center medium"`
-     */
-    fun buildCompactSummary(
-        detections: List<ObjectDetectorHelper.VyzeDetection>,
-        frameWidth: Int,
-        frameHeight: Int,
-        ocrText: String = ""
-    ): String {
-        val frameArea = frameWidth.toLong() * frameHeight.toLong()
-        val parts = mutableListOf<String>()
-
-        for (detection in detections) {
-            val category = detection.categories.firstOrNull() ?: continue
-            val zone = computeZone(detection.boundingBox, frameWidth)
-            val proximity = computeProximity(detection.boundingBox, frameArea)
-            val proxStr = if (proximity.isNotEmpty()) " $proximity" else ""
-            parts.add("${category.label} ${(category.score * 100).toInt()}% $zone$proxStr")
-        }
-
-        val objectSummary = parts.joinToString("; ")
-        return if (ocrText.isNotBlank()) {
-            "Objects: $objectSummary. Text visible: $ocrText"
-        } else {
-            "Objects: $objectSummary"
-        }
-    }
-
     // ── Spatial Mapping ───────────────────────────────────────────────
 
     private fun computeZone(box: RectF, frameWidth: Int): String {

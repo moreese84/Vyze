@@ -18,14 +18,7 @@
     <string name="menu_gallery">Gallery</string>
     <string name="tv_gallery_placeholder">Click + to add an image or a video to begin running the object detection.</string>
 
-    <string-array name="delegate_spinner_titles">
-        <item>CPU</item>
-        <item>GPU</item>
-    </string-array>
-    <string-array name="models_spinner_titles">
-        <item>EfficientDet Lite0</item>
-        <item>EfficientDet Lite2</item>
-    </string-array>
+
 
     <!-- ── Spatial Announcements ─────────────────────────────────────── -->
     <string name="spatial_ahead">directly ahead</string>

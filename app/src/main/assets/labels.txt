@@ -164,7 +164,7 @@ Doll
 Dolphin
 Door
 Door handle
-Doughnut
+Donut
 Dragonfly
 Drawer
 Dress
@@ -232,6 +232,7 @@ Guitar
 Hair dryer
 Hair spray
 Hamburger
+Hammer
 Hamster
 Hand dryer
 Handbag

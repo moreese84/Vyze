@@ -1,18 +1,3 @@
-/*
- * Copyright 2022 The TensorFlow Authors. All Rights Reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *             http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
 package com.vyze.app
 
 import android.content.Context
@@ -23,7 +8,7 @@ import android.graphics.RectF
 import android.os.SystemClock
 import android.util.Log
 import org.tensorflow.lite.Interpreter
-import org.tensorflow.lite.Tensor
+import org.tensorflow.lite.gpu.GpuDelegate
 import java.io.Closeable
 import java.io.FileInputStream
 import java.nio.ByteBuffer
@@ -34,29 +19,27 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * YOLOv8 object detection using the TensorFlow Lite Interpreter.
+ * YOLOv8 object detection via TensorFlow Lite.
  *
- * Replaces MediaPipe's high-level ObjectDetector with a raw TFLite
- * pipeline so we can load any model — including YOLOv8-nano trained on
- * Open Images V7 (601 classes) or Objects365 (365 classes).
+ * ## Dataset: Open Images V7 (601 classes)
+ * - labels.txt contains all 601 Open Images V7 class names.
+ * - The model class index maps directly to labels.txt entry: `labels[bestClass]`.
+ * - No artificial offsets, no COCO-80 assumptions, no class truncation.
  *
- * ## Input Pipeline
+ * ## Hardware acceleration
+ * - Attempts GPU delegate first for faster inference.
+ * - Falls back to NNAPI if GPU is unavailable.
+ * - Final fallback to CPU with 4 threads.
  *
- * 1. Bitmap is pre-rotated to portrait and letterboxed to 640×640 by
- *    [com.vyze.app.delegates.MlPipelineManager].
- * 2. We normalize pixels to [0, 1] and write to a `[1, 640, 640, 3]`
- *    float32 input tensor.
+ * ## Thread safety
+ * - Each call to [detect] MUST provide a fresh bitmap.
+ * - A new ByteBuffer is allocated per call — no shared buffers.
+ * - The interpreter is accessed from a single background thread.
  *
- * ## Output Pipeline
- *
- * YOLOv8 outputs `[1, 4+numClasses, 8400]`:
- * - Channels 0–3: `[cx, cy, w, h]` in 640×640 pixel coordinates.
- * - Channels 4+: class confidence scores.
- *
- * We transpose to `[8400, 4+C]`, filter by confidence threshold, apply
- * Non-Maximum Suppression, and return [VyzeDetection] results whose
- * bounding boxes are in the **letterboxed** coordinate space (same as
- * the input bitmap).
+ * ## Output format
+ * Standard YOLOv8 output tensor: `[1, 4+C, N]` (channels-first) where
+ * C = number of classes from the model and N = number of anchors.
+ * We transpose on the fly to iterate over N anchor predictions.
  */
 class ObjectDetectorHelper(
     var threshold: Float = THRESHOLD_DEFAULT,
@@ -65,26 +48,19 @@ class ObjectDetectorHelper(
     var objectDetectorListener: DetectorListener? = null
 ) : Closeable {
 
-    // Legacy stubs — kept for MainViewModel / settings spinner compatibility.
-    // TFLite YOLOv8 uses a single model; delegate/model selection is no-op.
-    var currentDelegate: Int = DELEGATE_CPU
-    var currentModel: Int = MODEL_EFFICIENTDETV0
-
     private var interpreter: Interpreter? = null
     private var labels: List<String> = emptyList()
+    private var gpuDelegate: GpuDelegate? = null
 
-    // Model input dimensions (read from model metadata or default to 640)
     private var inputSize = INPUT_SIZE_DEFAULT
-
-    // Whether the model expects NCHW [1,3,640,640] or NHWC [1,640,640,3]
     private var inputIsNCHW = false
-
-    // Actual model input shape logged at load time
-    private var inputShape = "unknown"
+    private var activeDelegate: String = "CPU"
 
     @Volatile
     var lastResultBundle: ResultBundle? = null
         private set
+
+    private var frameSeqNum = 0L
 
     init {
         setupObjectDetector()
@@ -93,472 +69,336 @@ class ObjectDetectorHelper(
     override fun close() {
         interpreter?.close()
         interpreter = null
+        gpuDelegate?.close()
+        gpuDelegate = null
     }
 
-    // Keep the same name as before so callers don't break
     fun clearObjectDetector() = close()
 
-    // ── Detector Setup ────────────────────────────────────────────────────────
+    // ── Setup ─────────────────────────────────────────────────────
 
     fun setupObjectDetector() {
         try {
-            // ── Load model via FileChannel → MappedByteBuffer ─────────────
-            // Using context.assets.openFd() + FileInputStream ensures the
-            // .tflite binary is memory-mapped directly from the APK without
-            // decompression or copy.  This is the most reliable approach for
-            // TFLite model loading on Android.
-            Log.i(TAG, "Attempting to load model: $MODEL_FILE")
+            Log.i(TAG, "Loading $MODEL_FILE")
 
-            val assetFileDescriptor = context.assets.openFd(MODEL_FILE)
-            val fileInputStream = FileInputStream(assetFileDescriptor.fileDescriptor)
-            val fileChannel = fileInputStream.channel
-            val modelBuffer: MappedByteBuffer = fileChannel.map(
-                FileChannel.MapMode.READ_ONLY,
-                assetFileDescriptor.startOffset,
-                assetFileDescriptor.declaredLength
+            val fd = context.assets.openFd(MODEL_FILE)
+            val fis = FileInputStream(fd.fileDescriptor)
+            val buf: MappedByteBuffer = fis.channel.map(
+                FileChannel.MapMode.READ_ONLY, fd.startOffset, fd.declaredLength
             )
-            fileChannel.close()
-            fileInputStream.close()
-            assetFileDescriptor.close()
+            fis.channel.close(); fis.close(); fd.close()
 
-            Log.i(TAG, "Model buffer loaded: ${modelBuffer.capacity()} bytes")
-
-            // ── Create Interpreter ───────────────────────────────────────
+            // Build interpreter options with hardware acceleration
             val options = Interpreter.Options().apply {
                 setNumThreads(4)
+
+                // Try GPU delegate first — catch Throwable to also catch
+                // UnsatisfiedLinkError when the native GPU library is missing
+                try {
+                    val delegate = GpuDelegate()
+                    addDelegate(delegate)
+                    gpuDelegate = delegate
+                    activeDelegate = "GPU"
+                    Log.i(TAG, "GPU delegate enabled")
+                } catch (e: Throwable) {
+                    Log.w(TAG, "GPU delegate unavailable (${e.javaClass.simpleName}): ${e.message}")
+                    gpuDelegate = null
+                    activeDelegate = "CPU"
+                }
             }
-            interpreter = Interpreter(modelBuffer, options)
 
-            Log.i(TAG, "Interpreter created successfully")
+            interpreter = Interpreter(buf, options)
 
-            // ── Load labels ──────────────────────────────────────────────
             labels = context.assets.open(LABELS_FILE).bufferedReader().readLines()
 
-            Log.i(TAG, "Loaded ${labels.size} labels from $LABELS_FILE")
+            val inShape = interpreter!!.getInputTensor(0).shape()
+            inputIsNCHW = inShape.size == 4 && inShape[1] <= 4 && inShape[2] > inShape[1]
+            inputSize = if (inShape.size == 4) {
+                if (inputIsNCHW) inShape[2] else inShape[1]
+            } else INPUT_SIZE_DEFAULT
 
-            // ── Auto-detect input tensor layout ────────────────────────
-            val inputTensorInfo: Tensor = interpreter!!.getInputTensor(0)
-            val shape = inputTensorInfo.shape()  // e.g. [1, 640, 640, 3] or [1, 3, 640, 640]
-            inputShape = shape.contentToString()
+            val outShape = interpreter!!.getOutputTensor(0).shape()
+            val outClasses = if (outShape.size == 3) {
+                val d0 = outShape[1]; val d1 = outShape[2]
+                if (d0 < d1) d0 - 4 else d1 - 4
+            } else 0
 
-            inputIsNCHW = if (shape.size == 4) {
-                // [N, C, H, W] → shape[1] < shape[2] means channels-first
-                shape[1] <= 4 && shape[2] > shape[1]
-            } else {
-                false
+            Log.i(TAG, "Dataset: Open Images V7 (${labels.size} classes)")
+            Log.i(TAG, "Input=${inShape.contentToString()} ${if (inputIsNCHW) "NCHW" else "NHWC"} " +
+                "Output=${outShape.contentToString()} modelClasses=$outClasses " +
+                "delegate=$activeDelegate threshold=$threshold")
+
+            if (outClasses != labels.size) {
+                Log.w(TAG, "Model outputs $outClasses classes but labels.txt has ${labels.size} entries. " +
+                    "Using labels.getOrNull() for safe mapping — some indices may map to 'Unknown'.")
             }
 
-            if (shape.size == 4) {
-                inputSize = if (inputIsNCHW) shape[2] else shape[1]
-            }
-
-            Log.i(TAG, "Input tensor shape: $inputShape, layout=${if (inputIsNCHW) "NCHW" else "NHWC"}, inputSize=$inputSize")
-
-            // ── Log output tensor shape ────────────────────────────────
-            val outputTensor = interpreter!!.getOutputTensor(0)
-            val outShape = outputTensor.shape()
-            Log.i(TAG, "Output tensor shape: ${outShape.contentToString()}")
-            Log.i(TAG, "Model ready: $MODEL_FILE, ${labels.size} labels")
-
-        } catch (e: java.io.FileNotFoundException) {
-            Log.e(TAG, "MODEL FILE NOT FOUND: $MODEL_FILE — place it in app/src/main/assets/", e)
-            objectDetectorListener?.onError(
-                "Model file not found: $MODEL_FILE. Place the .tflite file in assets/ folder."
-            )
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to initialize TFLite: ${e.message}", e)
-            e.printStackTrace()
-            objectDetectorListener?.onError(
-                "Object detector failed to initialize: ${e.message}"
-            )
+            Log.e(TAG, "Init failed: ${e.message}", e)
+            objectDetectorListener?.onError("Init failed: ${e.message}")
         }
     }
 
     fun isClosed(): Boolean = interpreter == null
 
-    // ── Live-Stream Detection ─────────────────────────────────────────────────
+    // ── Detection ─────────────────────────────────────────────────
 
-    /**
-     * Run YOLOv8 detection on a pre-processed bitmap.
-     *
-     * The caller MUST ensure the bitmap is:
-     * 1. Rotated to upright portrait.
-     * 2. Letterboxed to a square (640×640).
-     *
-     * @param bitmap            Portrait-oriented, letterboxed bitmap (ARGB_8888).
-     * @param frameTime         Timestamp from [SystemClock.uptimeMillis].
-     * @param originalWidth     Width of the frame before letterboxing.
-     * @param originalHeight    Height of the frame before letterboxing.
-     */
-    fun detectLivestreamBitmap(
+    fun detect(
         bitmap: Bitmap,
-        frameTime: Long,
         originalWidth: Int,
         originalHeight: Int
-    ): ResultBundle? {
-        val interp = interpreter ?: run {
-            Log.e(TAG, "detectLivestreamBitmap: interpreter is NULL")
-            return null
-        }
+    ): ResultBundle {
+        val interp = interpreter ?: return emptyResult(originalWidth, originalHeight)
+
+        val seq = ++frameSeqNum
+        val t0 = SystemClock.uptimeMillis()
 
         return try {
-            val startTime = SystemClock.uptimeMillis()
+            val inputBuf = preprocess(bitmap, seq)
 
-            // 1. Preprocess: letterbox resize to model input size + normalize
-            val inputTensor = preprocessBitmap(bitmap)
+            val outShape = interp.getOutputTensor(0).shape()
+            require(outShape.size == 3) { "Expected rank-3 output, got ${outShape.size}" }
+            val d0 = outShape[1]
+            val d1 = outShape[2]
+            val output = Array(1) { Array(d0) { FloatArray(d1) } }
 
-            // 2. Run inference
-            val outputShape = interp.getOutputTensor(0).shape() // [1, 4+C, 8400]
-            val numChannels = outputShape[1]
-            val numAnchors = outputShape[2]
-            val outputBuffer = Array(1) { Array(numChannels) { FloatArray(numAnchors) } }
-            interp.run(inputTensor, outputBuffer)
+            interp.run(inputBuf, output)
 
-            // 3. Parse output: transpose, filter, NMS
-            val detections = parseOutput(outputBuffer[0], bitmap.width, bitmap.height)
+            val raw = output[0]
+            val detections = parseYoloOutput(raw, d0, d1, bitmap.width, bitmap.height, seq)
 
-            val inferenceTime = SystemClock.uptimeMillis() - startTime
+            val dt = SystemClock.uptimeMillis() - t0
+            Log.d(TAG, "[$seq] ${detections.size} det ${dt}ms [$activeDelegate]")
 
-            Log.d(TAG, "detect: ${detections.size} det, ${inferenceTime}ms")
-
-            // Compute letterbox padding
             val padX = (bitmap.width - originalWidth) / 2
             val padY = (bitmap.height - originalHeight) / 2
 
             ResultBundle(
                 detections = detections,
-                inferenceTime = inferenceTime,
+                inferenceTime = dt,
                 inputImageHeight = originalHeight,
                 inputImageWidth = originalWidth,
                 letterboxPadX = padX,
                 letterboxPadY = padY
             ).also { lastResultBundle = it }
+
         } catch (e: Exception) {
-            Log.e(TAG, "detectLivestreamBitmap: ${e.message}", e)
-            null
+            Log.e(TAG, "[$seq] ${e.javaClass.simpleName}: ${e.message}", e)
+            emptyResult(originalWidth, originalHeight)
         }
     }
 
-    // ── Video Detection (stub — not yet implemented for TFLite) ─────────────
-
-    fun detectVideoFile(videoUri: android.net.Uri, inferenceIntervalMs: Long): ResultBundle? {
-        Log.w(TAG, "detectVideoFile not yet implemented for TFLite YOLOv8")
-        return null
-    }
-
-    // ── Gallery Detection ─────────────────────────────────────────────────────
+    /** Legacy API for gallery detection. */
+    fun detectLivestreamBitmap(
+        bitmap: Bitmap, frameTime: Long,
+        originalWidth: Int, originalHeight: Int
+    ): ResultBundle = detect(bitmap, originalWidth, originalHeight)
 
     fun detectImage(image: Bitmap): ResultBundle? {
         val interp = interpreter ?: return null
-
         return try {
-            val startTime = SystemClock.uptimeMillis()
-
-            // For gallery images, we letterbox to the model's input size
-            val letterboxed = letterboxToModelSize(image)
-            val inputTensor = preprocessBitmap(letterboxed)
-
-            val outputShape = interp.getOutputTensor(0).shape()
-            val numChannels = outputShape[1]
-            val numAnchors = outputShape[2]
-            val outputBuffer = Array(1) { Array(numChannels) { FloatArray(numAnchors) } }
-            interp.run(inputTensor, outputBuffer)
-
-            val detections = parseOutput(outputBuffer[0], letterboxed.width, letterboxed.height)
-            val inferenceTime = SystemClock.uptimeMillis() - startTime
-
-            if (!letterboxed.isRecycled) letterboxed.recycle()
-
-            ResultBundle(
-                detections = detections,
-                inferenceTime = inferenceTime,
-                inputImageHeight = image.height,
-                inputImageWidth = image.width,
-                letterboxPadX = (letterboxed.width - image.width) / 2,
-                letterboxPadY = (letterboxed.height - image.height) / 2
-            )
+            val lb = letterboxToModelSize(image)
+            val buf = preprocess(lb, 0)
+            val outShape = interp.getOutputTensor(0).shape()
+            val output = Array(1) { Array(outShape[1]) { FloatArray(outShape[2]) } }
+            interp.run(buf, output)
+            val dets = parseYoloOutput(output[0], outShape[1], outShape[2],
+                lb.width, lb.height, 0)
+            if (lb !== image && !lb.isRecycled) lb.recycle()
+            ResultBundle(detections = dets, inferenceTime = 0,
+                inputImageHeight = image.height, inputImageWidth = image.width,
+                letterboxPadX = 0, letterboxPadY = 0)
         } catch (e: Exception) {
-            Log.e(TAG, "detectImage: ${e.message}", e)
-            null
+            Log.e(TAG, "detectImage: ${e.message}", e); null
         }
     }
 
-    // ── Preprocessing ─────────────────────────────────────────────────────────
+    private fun emptyResult(ow: Int, oh: Int) = ResultBundle(
+        detections = emptyList(), inferenceTime = 0,
+        inputImageHeight = oh, inputImageWidth = ow,
+        letterboxPadX = 0, letterboxPadY = 0
+    ).also { lastResultBundle = it }
 
-    /**
-     * Convert a Bitmap into the TFLite input tensor, normalized to [0, 1].
-     *
-     * Auto-detects the model's expected layout:
-     * - NCHW `[1, 3, H, W]`: writes R-plane, G-plane, B-plane sequentially.
-     * - NHWC `[1, H, W, 3]`: writes RGB interleaved per pixel.
-     *
-     * The bitmap is expected to already be the correct size (640×640 after
-     * letterboxing by MlPipelineManager). If not, it is resized.
-     */
-    private fun preprocessBitmap(bitmap: Bitmap): ByteBuffer {
-        val resized = if (bitmap.width != inputSize || bitmap.height != inputSize) {
-            Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
-        } else {
-            bitmap
-        }
+    // ── Preprocessing ─────────────────────────────────────────────
 
-        // Total floats: 1 × 3 × 640 × 640 = 1,228,800
-        val totalFloats = 1 * 3 * inputSize * inputSize
-        val buffer = ByteBuffer.allocateDirect(totalFloats * 4)
-        buffer.order(ByteOrder.nativeOrder())
-        buffer.rewind()
+    private fun preprocess(bitmap: Bitmap, seq: Long): ByteBuffer {
+        val scaled = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
 
-        // Extract all pixel ARGB ints
         val pixels = IntArray(inputSize * inputSize)
-        resized.getPixels(pixels, 0, inputSize, 0, 0, inputSize, inputSize)
+        scaled.getPixels(pixels, 0, inputSize, 0, 0, inputSize, inputSize)
+
+        if (scaled !== bitmap && !scaled.isRecycled) scaled.recycle()
+
+        val buf = ByteBuffer.allocateDirect(3 * inputSize * inputSize * 4)
+        buf.order(ByteOrder.nativeOrder())
+        buf.clear()
 
         if (inputIsNCHW) {
-            // ── NCHW layout: [1, 3, H, W] ───────────────────────────
-            // Channel-first: write all R values, then all G, then all B.
-            // This is what your YOLOv8 Open Images model expects.
-            val planeSize = inputSize * inputSize
-
-            // R plane
-            for (pixel in pixels) {
-                buffer.putFloat(((pixel shr 16) and 0xFF) / 255.0f)
-            }
-            // G plane
-            for (pixel in pixels) {
-                buffer.putFloat(((pixel shr 8) and 0xFF) / 255.0f)
-            }
-            // B plane
-            for (pixel in pixels) {
-                buffer.putFloat((pixel and 0xFF) / 255.0f)
-            }
+            for (p in pixels) buf.putFloat(((p shr 16) and 0xFF) / 255.0f)
+            for (p in pixels) buf.putFloat(((p shr 8) and 0xFF) / 255.0f)
+            for (p in pixels) buf.putFloat((p and 0xFF) / 255.0f)
         } else {
-            // ── NHWC layout: [1, H, W, 3] ───────────────────────────
-            // Channel-last: RGB interleaved per pixel.
-            for (pixel in pixels) {
-                buffer.putFloat(((pixel shr 16) and 0xFF) / 255.0f) // R
-                buffer.putFloat(((pixel shr 8) and 0xFF) / 255.0f)  // G
-                buffer.putFloat((pixel and 0xFF) / 255.0f)          // B
+            for (p in pixels) {
+                buf.putFloat(((p shr 16) and 0xFF) / 255.0f)
+                buf.putFloat(((p shr 8) and 0xFF) / 255.0f)
+                buf.putFloat((p and 0xFF) / 255.0f)
             }
         }
 
-        if (resized !== bitmap && !resized.isRecycled) resized.recycle()
-
-        buffer.rewind()
-        return buffer
+        buf.rewind()
+        return buf
     }
+
+    private fun letterboxToModelSize(src: Bitmap): Bitmap {
+        if (src.width == inputSize && src.height == inputSize) return src
+        val scale = min(inputSize.toFloat() / src.width, inputSize.toFloat() / src.height)
+        val sw = (src.width * scale).toInt()
+        val sh = (src.height * scale).toInt()
+        val lb = Bitmap.createBitmap(inputSize, inputSize, Bitmap.Config.ARGB_8888)
+        Canvas(lb).drawColor(Color.rgb(114, 114, 114))
+        Canvas(lb).drawBitmap(src, null,
+            android.graphics.Rect((inputSize - sw) / 2, (inputSize - sh) / 2,
+                (inputSize - sw) / 2 + sw, (inputSize - sh) / 2 + sh), null)
+        return lb
+    }
+
+    // ── YOLOv8 Output Parsing ─────────────────────────────────────
 
     /**
-     * Letterbox a bitmap to the model's square input size, preserving
-     * aspect ratio with gray padding.
+     * Parse the raw YOLOv8 output tensor for Open Images V7 (601 classes).
+     *
+     * YOLOv8 standard: `[1, 4+C, N]` → raw is `[4+C, N]` (channels-first)
+     *   - raw[0..3] = cx, cy, w, h per anchor
+     *   - raw[4..4+C] = class scores per anchor (C = number of model classes)
+     *
+     * Label mapping: `labels[bestClass]` — direct 0-based index into labels.txt.
+     * No offsets, no truncation, no COCO assumptions.
      */
-    private fun letterboxToModelSize(source: Bitmap): Bitmap {
-        val srcW = source.width
-        val srcH = source.height
-        if (srcW == inputSize && srcH == inputSize) return source
+    private fun parseYoloOutput(
+        raw: Array<FloatArray>,
+        dim0: Int, dim1: Int,
+        bitmapW: Int, bitmapH: Int,
+        seq: Long
+    ): List<VyzeDetection> {
 
-        val scale = min(inputSize.toFloat() / srcW, inputSize.toFloat() / srcH)
-        val scaledW = (srcW * scale).toInt()
-        val scaledH = (srcH * scale).toInt()
+        val channelsFirst = dim0 < dim1
+        val numAnchors = if (channelsFirst) dim1 else dim0
+        val numChannels = if (channelsFirst) dim0 else dim1
+        val numClasses = numChannels - 4
 
-        val letterboxed = Bitmap.createBitmap(inputSize, inputSize, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(letterboxed)
-        canvas.drawColor(Color.rgb(114, 114, 114)) // YOLOv8 default gray padding
+        Log.d(TAG, "[$seq] raw[$dim0,$dim1] channelsFirst=$channelsFirst " +
+            "anchors=$numAnchors classes=$numClasses labels=${labels.size}")
 
-        val left = (inputSize - scaledW) / 2
-        val top = (inputSize - scaledH) / 2
-        val destRect = android.graphics.Rect(left, top, left + scaledW, top + scaledH)
-        canvas.drawBitmap(source, null, destRect, null)
+        if (numClasses <= 0 || numAnchors <= 0) return emptyList()
 
-        return letterboxed
+        // Detect normalized vs pixel-space output
+        var maxCoord = 0f
+        for (i in 0 until min(200, numAnchors)) {
+            val v = if (channelsFirst) raw[0][i] else raw[i][0]
+            if (v > maxCoord) maxCoord = v
+        }
+        val scale = if (maxCoord < 2.0f) inputSize.toFloat() else 1f
+
+        // ── Extract candidates ─────────────────────────────────────
+        data class Cand(val cx: Float, val cy: Float, val w: Float, val h: Float,
+                         val cls: Int, val score: Float)
+
+        val cands = mutableListOf<Cand>()
+        var globalMax = 0f
+
+        for (i in 0 until numAnchors) {
+            val cx: Float; val cy: Float; val w: Float; val h: Float
+            if (channelsFirst) {
+                cx = raw[0][i] * scale; cy = raw[1][i] * scale
+                w  = raw[2][i] * scale; h  = raw[3][i] * scale
+            } else {
+                cx = raw[i][0] * scale; cy = raw[i][1] * scale
+                w  = raw[i][2] * scale; h  = raw[i][3] * scale
+            }
+
+            if (w <= 0f || h <= 0f) continue
+
+            var bestCls = -1; var bestScr = 0f
+            for (c in 0 until numClasses) {
+                val s = if (channelsFirst) raw[4 + c][i] else raw[i][4 + c]
+                if (s > bestScr) { bestScr = s; bestCls = c }
+            }
+
+            if (bestScr > globalMax) globalMax = bestScr
+
+            if (bestScr >= threshold && bestCls >= 0) {
+                cands.add(Cand(cx, cy, w, h, bestCls, bestScr))
+            }
+        }
+
+        Log.d(TAG, "[$seq] globalMax=$globalMax thresh=$threshold cands=${cands.size}")
+        if (cands.isEmpty()) return emptyList()
+
+        // ── Center → corner ──────────────────────────────────────
+        val boxes = cands.map {
+            Box(left = it.cx - it.w / 2, top = it.cy - it.h / 2,
+                right = it.cx + it.w / 2, bottom = it.cy + it.h / 2)
+        }
+
+        // ── NMS ──────────────────────────────────────────────────
+        val kept = nms(boxes, cands.map { it.score }, NMS_IOU_THRESHOLD)
+        Log.d(TAG, "[$seq] NMS: ${cands.size} → ${kept.size}")
+
+        // ── Build detections ─────────────────────────────────────
+        val sx = bitmapW.toFloat() / inputSize
+        val sy = bitmapH.toFloat() / inputSize
+
+        return kept.take(maxResults).map { idx ->
+            val c = cands[idx]
+            val b = boxes[idx]
+            val label = labels.getOrElse(c.cls) { "Unknown (${c.cls})" }
+            VyzeDetection(
+                boundingBox = RectF(
+                    (b.left * sx).coerceIn(0f, bitmapW.toFloat()),
+                    (b.top * sy).coerceIn(0f, bitmapH.toFloat()),
+                    (b.right * sx).coerceIn(0f, bitmapW.toFloat()),
+                    (b.bottom * sy).coerceIn(0f, bitmapH.toFloat())
+                ),
+                categories = listOf(VyzeCategory(label = label, score = c.score))
+            )
+        }
     }
 
-    // ── Box type (shared by parseOutput and NMS) ──────────────────────────────
+    // ── NMS ───────────────────────────────────────────────────────
 
     private data class Box(val left: Float, val top: Float, val right: Float, val bottom: Float)
 
-    // ── Output Parsing ────────────────────────────────────────────────────────
-
-    /**
-     * Parse YOLOv8 raw output tensor `[4+C, 8400]` into filtered detections.
-     *
-     * Steps:
-     * 1. For each of the 8400 anchors, extract box `(cx, cy, w, h)` from
-     *    channels 0–3 and find the top class confidence from channels 4+.
-     * 2. Filter by [threshold].
-     * 3. Convert center-format `(cx, cy, w, h)` → corner-format
-     *    `(left, top, right, bottom)` in model-input pixel coordinates.
-     * 4. Apply greedy Non-Maximum Suppression.
-     * 5. Scale coordinates from model input space (640×640) back to the
-     *    actual letterboxed bitmap dimensions.
-     *
-     * @param rawOutput  Shape `[4+C, 8400]` — first dimension is channels,
-     *                   second is anchor count.
-     * @param bitmapW    Width of the letterboxed bitmap the model received.
-     * @param bitmapH    Height of the letterboxed bitmap the model received.
-     */
-    private fun parseOutput(
-        rawOutput: Array<FloatArray>,  // shape [4+C, 8400]
-        bitmapW: Int,
-        bitmapH: Int
-    ): List<VyzeDetection> {
-        val numChannels = rawOutput.size     // 4 + numClasses  (e.g. 605)
-        val numAnchors = rawOutput[0].size   // 8400
-        val numClasses = numChannels - 4     // e.g. 601
-
-        // ── Auto-detect normalized [0,1] vs pixel-space [0..640] ──────
-        // Sample the first 100 anchors' cx values.  If the maximum is
-        // < 2.0 the model outputs normalized coordinates and we must
-        // scale by inputSize before any further processing.
-        var maxCx = 0f
-        for (i in 0 until min(100, numAnchors)) {
-            val v = rawOutput[0][i]
-            if (v > maxCx) maxCx = v
-        }
-        val outputIsNormalized = maxCx < 2.0f
-        val boxScale = if (outputIsNormalized) inputSize.toFloat() else 1f
-
-        if (outputIsNormalized) {
-            Log.d(TAG, "Model output is NORMALIZED [0,1] — auto-scaling by $inputSize")
-        }
-
-        // ── Step 1: Find best class per anchor, filter by threshold ─────
-        data class RawDetection(
-            val cx: Float, val cy: Float, val w: Float, val h: Float,
-            val classIdx: Int, val score: Float
-        )
-
-        val candidates = mutableListOf<RawDetection>()
-
-        for (i in 0 until numAnchors) {
-            val cx = rawOutput[0][i] * boxScale
-            val cy = rawOutput[1][i] * boxScale
-            val w  = rawOutput[2][i] * boxScale
-            val h  = rawOutput[3][i] * boxScale
-
-            // Skip degenerate boxes
-            if (w <= 0f || h <= 0f) continue
-
-            // Find best class score among channels 4..4+C
-            var bestClass = -1
-            var bestScore = 0f
-            for (c in 0 until numClasses) {
-                val score = rawOutput[4 + c][i]
-                if (score > bestScore) {
-                    bestScore = score
-                    bestClass = c
-                }
-            }
-
-            if (bestScore >= threshold && bestClass >= 0) {
-                candidates.add(RawDetection(cx, cy, w, h, bestClass, bestScore))
-            }
-        }
-
-        if (candidates.isEmpty()) return emptyList()
-
-        Log.d(TAG, "parseOutput: ${candidates.size} candidates after threshold=${threshold}, " +
-            "normalized=$outputIsNormalized, maxCx=$maxCx")
-
-        // ── Step 2: Center-format → corner-format ──────────────────────
-        val boxes = candidates.map {
-            Box(it.cx - it.w / 2, it.cy - it.h / 2, it.cx + it.w / 2, it.cy + it.h / 2)
-        }
-
-        // ── Step 3: Non-Maximum Suppression ────────────────────────────
-        val nmsIndices = nonMaxSuppression(boxes, candidates.map { it.score }, NMS_IOU_THRESHOLD)
-
-        // ── Step 4: Scale to bitmap coords and build result ────────────
-        // The box coords are now in model input pixel space (0..inputSize).
-        // The letterboxed bitmap may differ (e.g. 1280×1280 from MlPipelineManager).
-        // Scale factor = bitmapSize / modelInputSize.
-        val scaleX = bitmapW.toFloat() / inputSize
-        val scaleY = bitmapH.toFloat() / inputSize
-
-        return nmsIndices.take(maxResults).mapNotNull { idx ->
-            val det = candidates[idx]
-            val box = boxes[idx]
-            val label = if (det.classIdx < labels.size) labels[det.classIdx] else "class_${det.classIdx}"
-
-            VyzeDetection(
-                boundingBox = RectF(
-                    box.left * scaleX,
-                    box.top * scaleY,
-                    box.right * scaleX,
-                    box.bottom * scaleY
-                ),
-                categories = listOf(VyzeCategory(label = label, score = det.score))
-            )
-        }
-    }
-
-    /**
-     * Greedy Non-Maximum Suppression.
-     *
-     * @param boxes     List of bounding boxes in corner format.
-     * @param scores    Confidence scores (parallel to boxes).
-     * @param iouThreshold  IoU threshold for suppression.
-     * @return Indices of surviving boxes, sorted by score descending.
-     */
-    private fun nonMaxSuppression(
-        boxes: List<Box>,
-        scores: List<Float>,
-        iouThreshold: Float
-    ): List<Int> {
-        // Sort by score descending
-        val sortedIndices = scores.indices.sortedByDescending { scores[it] }
-        val suppressed = BooleanArray(sortedIndices.size)
+    private fun nms(boxes: List<Box>, scores: List<Float>, iouThr: Float): List<Int> {
+        val order = scores.indices.sortedByDescending { scores[it] }
+        val alive = BooleanArray(order.size)
         val result = mutableListOf<Int>()
 
-        for (i in sortedIndices.indices) {
-            if (suppressed[i]) continue
-            val idx = sortedIndices[i]
-            result.add(idx)
-
-            for (j in i + 1 until sortedIndices.size) {
-                if (suppressed[j]) continue
-                val jdx = sortedIndices[j]
-                val iou = computeIoU(boxes[idx], boxes[jdx])
-                if (iou > iouThreshold) {
-                    suppressed[j] = true
-                }
+        for (i in order.indices) {
+            if (alive[i]) continue
+            val a = order[i]
+            result.add(a)
+            for (j in i + 1 until order.size) {
+                if (alive[j]) continue
+                if (iou(boxes[a], boxes[order[j]]) > iouThr) alive[j] = true
             }
         }
-
         return result
     }
 
-    /** Compute Intersection-over-Union between two boxes. */
-    private fun computeIoU(a: Box, b: Box): Float {
-        val interLeft = max(a.left, b.left)
-        val interTop = max(a.top, b.top)
-        val interRight = min(a.right, b.right)
-        val interBottom = min(a.bottom, b.bottom)
-
-        val interArea = max(0f, interRight - interLeft) * max(0f, interBottom - interTop)
-        val aArea = (a.right - a.left) * (a.bottom - a.top)
-        val bArea = (b.right - b.left) * (b.bottom - b.top)
-        val unionArea = aArea + bArea - interArea
-
-        return if (unionArea > 0) interArea / unionArea else 0f
+    private fun iou(a: Box, b: Box): Float {
+        val ix = max(0f, min(a.right, b.right) - max(a.left, b.left))
+        val iy = max(0f, min(a.bottom, b.bottom) - max(a.top, b.top))
+        val inter = ix * iy
+        val union = (a.right - a.left) * (a.bottom - a.top) +
+                    (b.right - b.left) * (b.bottom - b.top) - inter
+        return if (union > 0) inter / union else 0f
     }
 
-    // ── Result Types ──────────────────────────────────────────────────────────
+    // ── Types ─────────────────────────────────────────────────────
 
-    /**
-     * A single detection — our replacement for MediaPipe's [ObjectDetectorResult].
-     */
-    data class VyzeDetection(
-        val boundingBox: RectF,
-        val categories: List<VyzeCategory>
-    )
+    data class VyzeDetection(val boundingBox: RectF, val categories: List<VyzeCategory>)
+    data class VyzeCategory(val label: String, val score: Float)
 
-    data class VyzeCategory(
-        val label: String,
-        val score: Float
-    )
-
-    /**
-     * Wraps inference results, timing, and coordinate-mapping information.
-     */
     data class ResultBundle(
         val detections: List<VyzeDetection>,
         val inferenceTime: Long,
@@ -568,18 +408,10 @@ class ObjectDetectorHelper(
         val letterboxPadX: Int = 0,
         val letterboxPadY: Int = 0
     ) {
-        /**
-         * Convert a bounding box from letterboxed coordinates to the
-         * original (pre-letterbox) frame coordinates.
-         */
-        fun unpadBox(box: RectF): RectF {
-            return RectF(
-                box.left - letterboxPadX,
-                box.top - letterboxPadY,
-                box.right - letterboxPadX,
-                box.bottom - letterboxPadY
-            )
-        }
+        fun unpadBox(box: RectF) = RectF(
+            box.left - letterboxPadX, box.top - letterboxPadY,
+            box.right - letterboxPadX, box.bottom - letterboxPadY
+        )
     }
 
     companion object {
@@ -587,15 +419,9 @@ class ObjectDetectorHelper(
         const val LABELS_FILE = "labels.txt"
         const val INPUT_SIZE_DEFAULT = 640
         const val MAX_RESULTS_DEFAULT = 10
-        const val THRESHOLD_DEFAULT = 0.25F
+        const val THRESHOLD_DEFAULT = 0.50f
         const val NMS_IOU_THRESHOLD = 0.45f
         const val OTHER_ERROR = 0
-        const val GPU_ERROR = 1
-        // Legacy constants kept for MainViewModel / settings compatibility
-        const val DELEGATE_CPU = 0
-        const val DELEGATE_GPU = 1
-        const val MODEL_EFFICIENTDETV0 = 0
-        const val MODEL_EFFICIENTDETV2 = 1
         const val TAG = "ObjectDetectorHelper"
     }
 

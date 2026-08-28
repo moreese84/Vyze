@@ -78,21 +78,6 @@ class BarcodeAnalyzer {
     }
 
     /**
-     * Convenience method that processes a bitmap and returns the first
-     * eligible barcode announcement, or null.
-     */
-    fun processBitmapSingle(
-        bitmap: Bitmap,
-        rotationDegrees: Int,
-        onSuccess: (String?) -> Unit,
-        onError: (Exception) -> Unit
-    ) {
-        processBitmap(bitmap, rotationDegrees, { announcements ->
-            onSuccess(announcements.firstOrNull())
-        }, onError)
-    }
-
-    /**
      * Formats a [Barcode] into a human-readable TTS announcement and
      * its raw content string for debouncing.
      *

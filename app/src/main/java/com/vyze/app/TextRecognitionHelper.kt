@@ -1,12 +1,7 @@
 package com.vyze.app
 
 import android.graphics.Bitmap
-import android.graphics.Rect
-import android.media.Image
 import android.util.Log
-import androidx.annotation.OptIn
-import androidx.camera.core.ExperimentalGetImage
-import androidx.camera.core.ImageProxy
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognition
@@ -45,74 +40,6 @@ class TextRecognitionHelper {
      *                   Returns "No text detected" when no valid blocks remain.
      * @param onError    Callback invoked when recognition fails.
      */
-    @OptIn(ExperimentalGetImage::class)
-    fun processImageProxy(
-        imageProxy: ImageProxy,
-        onSuccess: (String) -> Unit,
-        onError: (Exception) -> Unit
-    ) {
-        val mediaImage: Image? = imageProxy.image
-        if (mediaImage == null) {
-            imageProxy.close()
-            onError(IllegalStateException("ImageProxy contains no image"))
-            return
-        }
-
-        var bitmap: Bitmap? = null
-        try {
-            // Convert the RGBA_8888 ImageProxy to an InputImage via Bitmap
-            bitmap = imageProxyToBitmap(imageProxy)
-
-            val rotationDegrees = imageProxy.imageInfo.rotationDegrees
-            val inputImage = InputImage.fromBitmap(bitmap, rotationDegrees)
-
-            // Capture dimensions for noise filtering before ML Kit closes the image
-            val imageWidth = imageProxy.width
-            val imageHeight = imageProxy.height
-
-            recognizer.process(inputImage)
-                .addOnSuccessListener { visionText ->
-                    val structuredText = processVisionText(
-                        visionText = visionText,
-                        imageWidth = imageWidth,
-                        imageHeight = imageHeight
-                    )
-
-                    val resultText = if (structuredText.isBlank()) {
-                        "No text detected"
-                    } else {
-                        structuredText
-                    }
-
-                    onSuccess(resultText)
-                }
-                .addOnFailureListener { e ->
-                    Log.e(TAG, "Text recognition failed", e)
-                    onError(e)
-                }
-                .addOnCompleteListener {
-                    // Explicitly recycle bitmap to prevent frame-to-frame memory accumulation
-                    bitmap?.let {
-                        if (!it.isRecycled) {
-                            it.recycle()
-                        }
-                    }
-                    // Always close imageProxy to prevent memory leaks
-                    imageProxy.close()
-                }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error processing image for text recognition", e)
-            // Explicitly recycle bitmap on error path too
-            bitmap?.let {
-                if (!it.isRecycled) {
-                    it.recycle()
-                }
-            }
-            imageProxy.close()
-            onError(e)
-        }
-    }
-
     // ── Noise Filtering & Structural Sorting ────────────────────────────────
 
     /**
@@ -280,27 +207,6 @@ class TextRecognitionHelper {
                 Log.e(TAG, "Text recognition failed", e)
                 onError(e)
             }
-    }
-
-    // ── Bitmap Conversion ───────────────────────────────────────────────────
-
-    /**
-     * Converts a CameraX [ImageProxy] (RGBA_8888 format) to an Android [Bitmap].
-     *
-     * Since the pipeline uses [ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888],
-     * the plane buffer contains raw RGBA pixel data. We create an ARGB_8888
-     * Bitmap and copy the pixels directly.
-     */
-    private fun imageProxyToBitmap(imageProxy: ImageProxy): Bitmap {
-        val buffer = imageProxy.planes[0].buffer
-        val bitmap = Bitmap.createBitmap(
-            imageProxy.width,
-            imageProxy.height,
-            Bitmap.Config.ARGB_8888
-        )
-        buffer.rewind()
-        bitmap.copyPixelsFromBuffer(buffer)
-        return bitmap
     }
 
     /**

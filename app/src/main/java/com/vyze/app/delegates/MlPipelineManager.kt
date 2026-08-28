@@ -11,9 +11,11 @@ import java.util.concurrent.atomic.AtomicInteger
 /**
  * Orchestrates all ML inference pipelines on shared camera frames.
  *
- * Thin lifecycle/state manager that delegates:
- * - Frame extraction -> [FrameExtractor]
- * - Frame dispatch to ML engines -> [FrameDispatcher]
+ * Uses [FrameAnalyzer] for the core OD pipeline:
+ * - AtomicBoolean frame locking (no queuing, no stalls)
+ * - Guaranteed imageProxy.close() in finally block
+ * - Fresh bitmap extraction per frame
+ * - Deterministic ResultBundle callback on every frame
  */
 class MlPipelineManager(
     private val context: Context,
@@ -28,10 +30,6 @@ class MlPipelineManager(
     lateinit var currencyAnalyzer: CurrencyAnalyzer
     lateinit var objectDetectorHelper: ObjectDetectorHelper
 
-    private lateinit var frameExtractor: FrameExtractor
-    private lateinit var frameDispatcher: FrameDispatcher
-
-    private val isAnalyzing = AtomicBoolean(false)
     private val frameCounter = AtomicInteger(0)
     private val ocrRequested = AtomicBoolean(false)
 
@@ -45,15 +43,12 @@ class MlPipelineManager(
     var onFaceDetected: (announcements: List<String>) -> Unit = { _ -> }
     var onOcrComplete: (recognizedText: String, finalText: String) -> Unit = { _, _ -> }
     var onOcrFailed: (error: Exception) -> Unit = { _ -> }
-    var onOdComplete: (resultBundle: ObjectDetectorHelper.ResultBundle) -> Unit = { _ -> }
     var onModelsReady: () -> Unit = {}
     var onDiagnosticUpdate: ((String) -> Unit)? = null
 
     fun initialize(
         context: Context,
         threshold: Float,
-        delegate: Int,
-        model: Int,
         maxResults: Int,
         detectorListener: ObjectDetectorHelper.DetectorListener
     ) {
@@ -69,28 +64,15 @@ class MlPipelineManager(
             objectDetectorListener = detectorListener
         )
 
-        frameExtractor = FrameExtractor()
-        frameDispatcher = FrameDispatcher(
-            barcodeAnalyzer = barcodeAnalyzer,
-            faceDetectorHelper = faceDetectorHelper,
-            objectDetectorHelper = objectDetectorHelper,
-            textRecognitionHelper = textRecognitionHelper,
-            backgroundExecutor = backgroundExecutor
-        )
-
-        frameDispatcher.onBarcodeDetected = onBarcodeDetected
-        frameDispatcher.onFaceDetected = onFaceDetected
-        frameDispatcher.onOcrComplete = { recognizedText, finalText ->
-            val currencyAnnouncement = currencyAnalyzer.analyzeSingle(recognizedText)
-            val finalTextWithCurrency = currencyAnnouncement ?: finalText
-            onOcrComplete(recognizedText, finalTextWithCurrency)
-        }
-        frameDispatcher.onOcrFailed = onOcrFailed
-        frameDispatcher.onDiagnosticUpdate = onDiagnosticUpdate
-
         onModelsReady()
     }
 
+    /**
+     * Create the ImageAnalysis.Analyzer for CameraX.
+     *
+     * Delegates to [FrameAnalyzer] for the core OD pipeline.
+     * Luminance analysis runs on every frame (including skipped ones).
+     */
     fun createCompositeAnalyzer(): ImageAnalysis.Analyzer {
         val luminanceAnalyzer = LuminanceAnalyzer { isDark, meanLuminance ->
             latestIsDark = isDark
@@ -98,47 +80,33 @@ class MlPipelineManager(
             onLuminanceChanged(isDark, meanLuminance)
         }
 
+        val frameAnalyzer = FrameAnalyzer(
+            objectDetectorHelper = objectDetectorHelper
+        )
+
+        frameAnalyzer.onResult = { resultBundle ->
+            android.os.Handler(android.os.Looper.getMainLooper()).post {
+                objectDetectorHelper.objectDetectorListener?.onResults(resultBundle)
+            }
+        }
+
+        frameAnalyzer.onDiagnostic = { msg ->
+            onDiagnosticUpdate?.invoke(msg)
+        }
+
+        frameAnalyzer.onFrameDropped = { frameNum ->
+            Log.d(TAG, "Frame #$frameNum dropped (processing)")
+        }
+
         return ImageAnalysis.Analyzer { imageProxy ->
             luminanceAnalyzer.analyzeLuminance(imageProxy)
-
-            val count = frameCounter.incrementAndGet()
-            if (count % FRAME_SKIP_RATIO != 0) {
-                imageProxy.close()
-                return@Analyzer
-            }
-
-            if (!isAnalyzing.compareAndSet(false, true)) {
-                Log.d(TAG, "Frame dropped: isAnalyzing=true")
-                imageProxy.close()
-                return@Analyzer
-            }
-
-            val rotationDegrees = frameExtractor.getRotationDegrees(imageProxy)
-            val frameBitmap = frameExtractor.extract(imageProxy)
-
-            if (frameBitmap == null) {
-                isAnalyzing.set(false)
-                return@Analyzer
-            }
-
-            try {
-                frameDispatcher.dispatch(
-                    frameBitmap = frameBitmap,
-                    rotationDegrees = rotationDegrees,
-                    ocrRequested = ocrRequested.compareAndSet(true, false),
-                    onComplete = { isAnalyzing.set(false) }
-                )
-            } catch (e: Exception) {
-                Log.e(TAG, "Composite analyzer error", e)
-                isAnalyzing.set(false)
-            } finally {
-                if (!frameBitmap.isRecycled) frameBitmap.recycle()
-            }
+            frameCounter.incrementAndGet()
+            frameAnalyzer.analyze(imageProxy)
         }
     }
 
     fun isOdInitialized(): Boolean = ::objectDetectorHelper.isInitialized
-    fun isCurrentlyAnalyzing(): Boolean = isAnalyzing.get()
+    fun isCurrentlyAnalyzing(): Boolean = frameCounter.get() > 0
     fun requestOcr() { ocrRequested.set(true) }
     fun isOcrRequested(): Boolean = ocrRequested.get()
 
@@ -147,7 +115,6 @@ class MlPipelineManager(
     }
 
     fun reset() {
-        isAnalyzing.set(false)
         ocrRequested.set(false)
         frameCounter.set(0)
     }
@@ -169,6 +136,5 @@ class MlPipelineManager(
 
     companion object {
         const val FRAME_SKIP_RATIO = 3
-        const val WATCHDOG_TIMEOUT_MS = 5000L
     }
 }

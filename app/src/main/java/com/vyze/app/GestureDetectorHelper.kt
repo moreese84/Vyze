@@ -19,7 +19,7 @@ import android.view.MotionEvent
  *  - Triple Tap + Hold: Triggers Emergency SOS
  */
 class GestureDetectorHelper(
-    private val onSingleTap: () -> Unit = {},
+    private val onSingleTap: (MotionEvent) -> Unit = { _ -> },
     private val onDoubleTap: () -> Unit = {},
     private val onLongPress: () -> Unit = {},
     private val onTripleTap: () -> Unit = {},
@@ -76,7 +76,7 @@ class GestureDetectorHelper(
             }
             else -> {
                 // Single tap
-                onSingleTap()
+                onSingleTap(e)
                 return true
             }
         }

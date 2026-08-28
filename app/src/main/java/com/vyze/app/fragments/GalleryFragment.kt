@@ -21,7 +21,6 @@ import android.graphics.ImageDecoder
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.Log
 import android.view.LayoutInflater
@@ -34,17 +33,15 @@ import androidx.fragment.app.Fragment
 import androidx.fragment.app.activityViewModels
 import com.vyze.app.MainViewModel
 import com.vyze.app.ObjectDetectorHelper
-import com.vyze.app.databinding.FragmentGalleryBinding
 import com.google.mediapipe.tasks.vision.core.RunningMode
+import com.vyze.app.databinding.FragmentGalleryBinding
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
-import java.util.concurrent.TimeUnit
 
 class GalleryFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
 
     enum class MediaType {
         IMAGE,
-        VIDEO,
         UNKNOWN
     }
 
@@ -63,7 +60,6 @@ class GalleryFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
             uri?.let { mediaUri ->
                 when (val mediaType = loadMediaType(mediaUri)) {
                     MediaType.IMAGE -> runDetectionOnImage(mediaUri)
-                    MediaType.VIDEO -> runDetectionOnVideo(mediaUri)
                     MediaType.UNKNOWN -> {
                         updateDisplayView(mediaType)
                         Toast.makeText(
@@ -139,51 +135,6 @@ class GalleryFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
             }
         }
 
-        // When clicked, change the underlying hardware used for inference. Current options are CPU
-        // GPU, and NNAPI
-        fragmentGalleryBinding.bottomSheetLayout.spinnerDelegate.setSelection(
-            viewModel.currentDelegate,
-            false
-        )
-        fragmentGalleryBinding.bottomSheetLayout.spinnerDelegate.onItemSelectedListener =
-            object : AdapterView.OnItemSelectedListener {
-                override fun onItemSelected(
-                    p0: AdapterView<*>?,
-                    p1: View?,
-                    p2: Int,
-                    p3: Long
-                ) {
-
-                    viewModel.setDelegate(p2)
-                    updateControlsUi()
-                }
-
-                override fun onNothingSelected(p0: AdapterView<*>?) {
-                    /* no op */
-                }
-            }
-
-        // When clicked, change the underlying model used for object detection
-        fragmentGalleryBinding.bottomSheetLayout.spinnerModel.setSelection(
-            viewModel.currentModel,
-            false
-        )
-        fragmentGalleryBinding.bottomSheetLayout.spinnerModel.onItemSelectedListener =
-            object : AdapterView.OnItemSelectedListener {
-                override fun onItemSelected(
-                    p0: AdapterView<*>?,
-                    p1: View?,
-                    p2: Int,
-                    p3: Long
-                ) {
-                    viewModel.setModel(p2)
-                    updateControlsUi()
-                }
-
-                override fun onNothingSelected(p0: AdapterView<*>?) {
-                    /* no op */
-                }
-            }
     }
 
     // Update the values displayed in the bottom sheet. Reset detector.
@@ -263,97 +214,11 @@ class GalleryFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
             }
     }
 
-    private fun runDetectionOnVideo(uri: Uri) {
-        fragmentGalleryBinding.overlay.runningMode = RunningMode.VIDEO
-        setUiEnabled(false)
-        updateDisplayView(MediaType.VIDEO)
-
-        with(fragmentGalleryBinding.videoView) {
-            setVideoURI(uri)
-            // mute the audio
-            setOnPreparedListener { it.setVolume(0f, 0f) }
-            requestFocus()
-        }
-
-        backgroundExecutor = Executors.newSingleThreadScheduledExecutor()
-        backgroundExecutor.execute {
-
-            objectDetectorHelper =
-                ObjectDetectorHelper(
-                    context = requireContext(),
-                    threshold = viewModel.currentThreshold,
-                    maxResults = viewModel.currentMaxResults,
-                    objectDetectorListener = this
-                )
-
-            activity?.runOnUiThread {
-                fragmentGalleryBinding.videoView.visibility = View.GONE
-                fragmentGalleryBinding.progress.visibility = View.VISIBLE
-            }
-
-            objectDetectorHelper.detectVideoFile(uri, VIDEO_INTERVAL_MS)
-                ?.let { resultBundle ->
-                    activity?.runOnUiThread { displayVideoResult(resultBundle) }
-                }
-                ?: run {
-                    activity?.runOnUiThread {
-                        fragmentGalleryBinding.progress.visibility = View.GONE
-                    }
-                    Log.e(TAG, "Error running object detection.")
-                }
-
-            objectDetectorHelper.clearObjectDetector()
-        }
-    }
-
-    // Setup and display the video.
-    private fun displayVideoResult(result: ObjectDetectorHelper.ResultBundle) {
-
-        fragmentGalleryBinding.videoView.visibility = View.VISIBLE
-        fragmentGalleryBinding.progress.visibility = View.GONE
-
-        fragmentGalleryBinding.videoView.start()
-        val videoStartTimeMs = SystemClock.uptimeMillis()
-
-        backgroundExecutor.scheduleAtFixedRate(
-            {
-                activity?.runOnUiThread {
-                    val videoElapsedTimeMs =
-                        SystemClock.uptimeMillis() - videoStartTimeMs
-                    val resultIndex =
-                        videoElapsedTimeMs.div(VIDEO_INTERVAL_MS).toInt()
-
-                    if (resultIndex >= 1 || fragmentGalleryBinding.videoView.visibility == View.GONE) {
-                        // The video playback has finished so we stop drawing bounding boxes
-                        backgroundExecutor.shutdown()
-                    } else {
-                        fragmentGalleryBinding.overlay.setResults(
-                            result.detections,
-                            result.inputImageHeight,
-                            result.inputImageWidth,
-                            result.letterboxPadX,
-                            result.letterboxPadY
-                        )
-
-                        setUiEnabled(true)
-
-                        fragmentGalleryBinding.bottomSheetLayout.inferenceTimeVal.text =
-                            String.format("%d ms", result.inferenceTime)
-                    }
-                }
-            },
-            0,
-            VIDEO_INTERVAL_MS,
-            TimeUnit.MILLISECONDS
-        )
-    }
-
     private fun updateDisplayView(mediaType: MediaType) {
         fragmentGalleryBinding.overlay.clear()
         fragmentGalleryBinding.imageResult.visibility =
             if (mediaType == MediaType.IMAGE) View.VISIBLE else View.GONE
-        fragmentGalleryBinding.videoView.visibility =
-            if (mediaType == MediaType.VIDEO) View.VISIBLE else View.GONE
+        fragmentGalleryBinding.videoView.visibility = View.GONE
         fragmentGalleryBinding.tvPlaceholder.visibility =
             if (mediaType == MediaType.UNKNOWN) View.VISIBLE else View.GONE
     }
@@ -363,7 +228,6 @@ class GalleryFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
         val mimeType = context?.contentResolver?.getType(uri)
         mimeType?.let {
             if (mimeType.startsWith("image")) return MediaType.IMAGE
-            if (mimeType.startsWith("video")) return MediaType.VIDEO
         }
 
         return MediaType.UNKNOWN
@@ -371,8 +235,6 @@ class GalleryFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
 
     private fun setUiEnabled(enabled: Boolean) {
         fragmentGalleryBinding.fabGetContent.isEnabled = enabled
-        fragmentGalleryBinding.bottomSheetLayout.spinnerModel.isEnabled =
-            enabled
         fragmentGalleryBinding.bottomSheetLayout.thresholdMinus.isEnabled =
             enabled
         fragmentGalleryBinding.bottomSheetLayout.thresholdPlus.isEnabled =
@@ -380,8 +242,6 @@ class GalleryFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
         fragmentGalleryBinding.bottomSheetLayout.maxResultsMinus.isEnabled =
             enabled
         fragmentGalleryBinding.bottomSheetLayout.maxResultsPlus.isEnabled =
-            enabled
-        fragmentGalleryBinding.bottomSheetLayout.spinnerDelegate.isEnabled =
             enabled
     }
 
@@ -397,11 +257,6 @@ class GalleryFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
         detectError()
         activity?.runOnUiThread {
             Toast.makeText(requireContext(), error, Toast.LENGTH_SHORT).show()
-            if (errorCode == ObjectDetectorHelper.GPU_ERROR) {
-                fragmentGalleryBinding.bottomSheetLayout.spinnerDelegate.setSelection(
-                    ObjectDetectorHelper.DELEGATE_CPU, false
-                )
-            }
         }
     }
 
@@ -411,8 +266,5 @@ class GalleryFragment : Fragment(), ObjectDetectorHelper.DetectorListener {
 
     companion object {
         private const val TAG = "GalleryFragment"
-
-        // Value used to get frames at specific intervals for inference (e.g. every 300ms)
-        private const val VIDEO_INTERVAL_MS = 300L
     }
 }

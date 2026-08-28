@@ -12,32 +12,24 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
     private var cachedVolume: Float = TTSManager.DEFAULT_VOLUME
     private var appContext: Context = context.applicationContext
 
-    /**
-     * The currently active TTS locale. Updated via [setLocale] and
-     * persisted to SharedPreferences under [KEY_LANGUAGE].
-     */
     @Volatile
     private var currentLocale: Locale = Locale.US
 
     // ── Debounce state ────────────────────────────────────────────────
-    // Prevents continuous frame callbacks from flooding the TTS queue.
-    // All timestamps are in [System.currentTimeMillis] (wall-clock).
 
-    /** Timestamp of the last [speak] or [speakImmediate] call. */
     @Volatile
     private var lastSpeechTime = 0L
 
-    /** The text of the last utterance that was actually sent to TTS. */
     @Volatile
     private var lastSpokenText = ""
 
     init {
         tts = TextToSpeech(context.applicationContext, this)
+        Log.d(TAG, "TTS constructor called, waiting for onInit callback")
     }
 
     override fun onInit(status: Int) {
         if (status == TextToSpeech.SUCCESS) {
-            // Restore saved language preference
             val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             val savedLang = prefs.getString(KEY_LANGUAGE, LANGUAGE_ENGLISH) ?: LANGUAGE_ENGLISH
             currentLocale = localeFromKey(savedLang)
@@ -49,65 +41,73 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
                 currentLocale = Locale.US
             }
             isInitialized = true
-            Log.d(TAG, "TTS initialized with locale: $currentLocale")
+            Log.i(TAG, "TTS INITIALIZED OK — locale=$currentLocale, engine=${tts?.defaultEngine}")
+
+            // Flush any pending queued utterances that arrived before init
+            synchronized(pendingUtterances) {
+                for (text in pendingUtterances) {
+                    Log.d(TAG, "Flushing pending utterance: $text")
+                    tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "pending_${System.currentTimeMillis()}")
+                }
+                pendingUtterances.clear()
+            }
         } else {
-            Log.e(TAG, "TTS initialization failed with status: $status")
+            Log.e(TAG, "TTS INIT FAILED — status=$status (SUCCESS=${TextToSpeech.SUCCESS})")
         }
     }
+
+    /** Texts queued before TTS finished initializing. */
+    private val pendingUtterances = mutableListOf<String>()
 
     // ── Speech ──────────────────────────────────────────────────────────
 
     /**
      * Speaks the given text with the specified queue mode.
-     *
-     * Defaults to [TextToSpeech.QUEUE_ADD] so that new utterances are
-     * appended rather than interrupting whatever is currently playing.
-     * This eliminates mid-sentence cutoffs caused by rapid-fire frame
-     * callbacks each issuing a QUEUE_FLUSH.
-     *
-     * A 2-second debounce is enforced: if the *exact same* text was
-     * spoken less than [DEBOUNCE_MS] ago the call is silently dropped,
-     * preventing repetitive "no... no... no..." loops from continuous
-     * error callbacks.
-     *
-     * If the TTS engine is already speaking different text, the new
-     * utterance is queued normally (non-destructive).
      */
     fun speak(text: String, queueMode: Int = TextToSpeech.QUEUE_ADD) {
         if (!isInitialized) {
-            Log.w(TAG, "TTS not initialized yet, ignoring: $text")
+            Log.w(TAG, "speak() called before TTS init — queuing: \"$text\"")
+            synchronized(pendingUtterances) {
+                pendingUtterances.add(text)
+            }
             return
         }
 
-        // ── 2-second debounce ────────────────────────────────────────────
         val now = System.currentTimeMillis()
         if (text == lastSpokenText && (now - lastSpeechTime) < DEBOUNCE_MS) {
-            // Same text within cooldown → suppress to prevent loop
+            Log.d(TAG, "speak() DEBOUNCE — dropping duplicate: \"$text\"")
             return
         }
 
         lastSpeechTime = now
         lastSpokenText = text
 
-        tts?.speak(text, queueMode, null, "utterance_${now}")
+        val result = tts?.speak(text, queueMode, null, "utterance_${now}")
+        Log.d(TAG, "speak() OK queueMode=$queueMode result=$result text=\"$text\"")
     }
 
     /**
      * Immediate speech for urgent accessibility feedback.
-     *
      * Stops any current speech, then speaks the new text using QUEUE_FLUSH.
-     * Still subject to the same 2-second debounce as [speak] to prevent
-     * rapid-fire loops.
      */
     fun speakImmediate(text: String) {
-        if (!isInitialized) {
-            Log.w(TAG, "TTS not initialized for immediate speech: $text")
+        if (text.isBlank()) {
+            Log.w(TAG, "speakImmediate() called with blank text — skipping")
             return
         }
 
-        // ── 2-second debounce (same logic as speak) ─────────────────────
+        if (!isInitialized) {
+            Log.w(TAG, "speakImmediate() called before TTS init — queuing: \"$text\"")
+            synchronized(pendingUtterances) {
+                pendingUtterances.clear() // drop old, keep only latest
+                pendingUtterances.add(text)
+            }
+            return
+        }
+
         val now = System.currentTimeMillis()
         if (text == lastSpokenText && (now - lastSpeechTime) < DEBOUNCE_MS) {
+            Log.d(TAG, "speakImmediate() DEBOUNCE — dropping duplicate: \"$text\"")
             return
         }
 
@@ -115,33 +115,20 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
         lastSpokenText = text
 
         tts?.stop()
-        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "immediate_${now}")
+        val result = tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "immediate_${now}")
+        Log.d(TAG, "speakImmediate() OK result=$result text=\"$text\"")
     }
 
-    /**
-     * Returns `true` when the TTS engine is actively speaking or has
-     * utterances queued.  Useful for callers that want to avoid
-     * interrupting an in-progress announcement.
-     */
     fun isSpeaking(): Boolean {
         return tts?.isSpeaking == true
     }
 
-    /**
-     * Stops any current speech output.
-     */
     fun stop() {
         tts?.stop()
     }
 
     // ── Locale Switching ────────────────────────────────────────────────
 
-    /**
-     * Switches the TTS engine to the specified language.
-     *
-     * @param languageKey One of [LANGUAGE_ENGLISH], [LANGUAGE_MALAY], [LANGUAGE_CHINESE].
-     * @param context     To persist the preference.
-     */
     fun setLanguage(languageKey: String, context: Context) {
         val locale = localeFromKey(languageKey)
         currentLocale = locale
@@ -153,7 +140,6 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
             currentLocale = Locale.US
         }
 
-        // Persist the choice
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
             .putString(KEY_LANGUAGE, languageKey)
@@ -162,16 +148,10 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
         Log.d(TAG, "TTS language switched to: $currentLocale")
     }
 
-    /**
-     * Returns the current language key.
-     */
     fun getCurrentLanguageKey(): String {
         return keyFromLocale(currentLocale)
     }
 
-    /**
-     * Returns the current locale display name for UI binding.
-     */
     fun getCurrentLanguageDisplayName(context: Context): String {
         return when (keyFromLocale(currentLocale)) {
             LANGUAGE_MALAY  -> context.getString(R.string.tts_lang_malay)
@@ -182,42 +162,26 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
 
     // ── Settings ────────────────────────────────────────────────────────
 
-    /**
-     * Sets the speech rate. 1.0 is normal speed.
-     */
     fun setSpeechRate(rate: Float) {
         tts?.setSpeechRate(rate.coerceIn(0.5f, 2.0f))
     }
 
-    /**
-     * Sets the pitch. 1.0 is normal pitch.
-     */
     fun setPitch(pitch: Float) {
         tts?.setPitch(pitch.coerceIn(0.5f, 1.5f))
     }
 
-    /**
-     * Sets the audio stream volume.
-     */
     fun setVolume(volume: Float) {
         cachedVolume = volume.coerceIn(0f, 1f)
     }
 
-    /**
-     * Returns the last-set volume level (0.0–1.0).
-     */
     fun getVolume(): Float = cachedVolume
 
-    /**
-     * Applies saved TTS settings from SharedPreferences.
-     */
     fun applySettings(context: Context) {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         setSpeechRate(prefs.getFloat(KEY_SPEECH_RATE, DEFAULT_SPEECH_RATE))
         setPitch(prefs.getFloat(KEY_PITCH, DEFAULT_PITCH))
         setVolume(prefs.getFloat(KEY_VOLUME, DEFAULT_VOLUME))
 
-        // Restore language
         val savedLang = prefs.getString(KEY_LANGUAGE, LANGUAGE_ENGLISH) ?: LANGUAGE_ENGLISH
         setLanguage(savedLang, context)
     }
@@ -234,9 +198,6 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
 
     // ── Helpers ─────────────────────────────────────────────────────────
 
-    /**
-     * Converts a language key string to a [Locale].
-     */
     private fun localeFromKey(key: String): Locale {
         return when (key) {
             LANGUAGE_MALAY  -> Locale("ms", "MY")
@@ -245,9 +206,6 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
         }
     }
 
-    /**
-     * Converts a [Locale] to a language key string.
-     */
     private fun keyFromLocale(locale: Locale): String {
         return when (locale.language) {
             "ms"  -> LANGUAGE_MALAY
@@ -259,31 +217,23 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
     companion object {
         private const val TAG = "TTSManager"
 
-        // ── SharedPreferences Keys ─────────────────────────────────────
         const val PREFS_NAME = "vyze_tts_settings"
         const val KEY_SPEECH_RATE = "speech_rate"
         const val KEY_PITCH = "pitch"
         const val KEY_VOLUME = "volume"
         const val KEY_LANGUAGE = "tts_language"
 
-        // ── Defaults ───────────────────────────────────────────────────
         const val DEFAULT_SPEECH_RATE = 1.0f
         const val DEFAULT_PITCH = 1.0f
         const val DEFAULT_VOLUME = 0.8f
 
-        // ── Language Keys ──────────────────────────────────────────────
         const val LANGUAGE_ENGLISH = "en"
         const val LANGUAGE_MALAY = "ms"
         const val LANGUAGE_CHINESE = "zh"
 
-        /** All supported language keys for UI binding. */
         val SUPPORTED_LANGUAGES = listOf(LANGUAGE_ENGLISH, LANGUAGE_MALAY, LANGUAGE_CHINESE)
 
-        /**
-         * Minimum milliseconds between identical TTS utterances.
-         * Prevents continuous frame callbacks from flooding the queue
-         * with the same error message (the "no... no... no..." loop).
-         */
-        const val DEBOUNCE_MS = 2000L
+        /** Minimum milliseconds between identical TTS utterances. */
+        const val DEBOUNCE_MS = 1500L
     }
 }

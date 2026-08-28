@@ -51,7 +51,6 @@ class FrameDispatcher(
     var onFaceDetected: (announcements: List<String>) -> Unit = { _ -> }
     var onOcrComplete: (recognizedText: String, finalText: String) -> Unit = { _, _ -> }
     var onOcrFailed: (error: Exception) -> Unit = { _ -> }
-    var onOdComplete: (resultBundle: ObjectDetectorHelper.ResultBundle) -> Unit = { _ -> }
     var onDiagnosticUpdate: ((String) -> Unit)? = null
 
     // ── Core Dispatch ─────────────────────────────────────────────
@@ -140,11 +139,14 @@ class FrameDispatcher(
         var portrait: Bitmap? = null
         var letterboxed: Bitmap? = null
         try {
-            // Rotate to portrait THEN letterbox
+            // Rotate to portrait THEN letterbox — fresh bitmaps each time
             portrait = rotateToPortrait(bitmap, rotationDegrees)
             val portraitW = portrait.width
             val portraitH = portrait.height
             letterboxed = letterboxBitmap(portrait)
+
+            Log.d(TAG, "OD input: portrait=${portrait.width}x${portrait.height}, " +
+                "letterboxed=${letterboxed.width}x${letterboxed.height}")
 
             val frameTime = SystemClock.uptimeMillis()
             val resultBundle = objectDetectorHelper.detectLivestreamBitmap(
@@ -153,19 +155,20 @@ class FrameDispatcher(
                 originalHeight = portraitH
             )
 
-            if (resultBundle != null) {
-                val detCount = resultBundle.detections.size
-                Log.d(TAG, "OD: $detCount detections in ${resultBundle.inferenceTime}ms")
-                onDiagnosticUpdate?.invoke("OD: $detCount det, ${resultBundle.inferenceTime}ms")
+            val detCount = resultBundle.detections.size
+            Log.d(TAG, "OD: $detCount detections in ${resultBundle.inferenceTime}ms")
+            onDiagnosticUpdate?.invoke("OD: $detCount det, ${resultBundle.inferenceTime}ms")
+
+            // Post to main thread so the overlay and UI update correctly
+            android.os.Handler(android.os.Looper.getMainLooper()).post {
                 objectDetectorHelper.objectDetectorListener?.onResults(resultBundle)
-            } else {
-                Log.w(TAG, "detectLivestreamBitmap returned null")
-                onDiagnosticUpdate?.invoke("OD: null")
             }
         } catch (e: Exception) {
-            Log.e(TAG, "OD processing error", e)
+            Log.e(TAG, "OD error: ${e.javaClass.simpleName}: ${e.message}", e)
             onDiagnosticUpdate?.invoke("OD ERROR: ${e.message}")
         } finally {
+            // Recycle AFTER detectLivestreamBitmap has fully returned
+            // (the ByteBuffer snapshot is independent of these Bitmaps)
             portrait?.let { if (!it.isRecycled) it.recycle() }
             letterboxed?.let { if (!it.isRecycled && it !== portrait) it.recycle() }
         }

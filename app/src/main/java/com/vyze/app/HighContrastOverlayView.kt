@@ -8,22 +8,19 @@ import android.util.AttributeSet
  * High-contrast overlay view designed for low-vision users.
  *
  * Extends [BaseOverlayView] for shared coordinate pipeline and state.
- * Adds:
- * - Thick yellow-and-black double-border bounding boxes
- * - Ultra-large, high-contrast text labels
- * - Large OCR result text rendered on screen
+ * Renders one clean uppercase label per detection: "COMPUTER KEYBOARD 27%".
+ *
+ * Label backgrounds are dynamically sized and clamped to view boundaries.
  */
 class HighContrastOverlayView(context: Context?, attrs: AttributeSet?) :
     BaseOverlayView(context, attrs) {
 
-    // OCR text to render on screen
     private var ocrText: String = ""
 
-    // Paints for high-contrast rendering
     private var boxOuterPaint = Paint()
     private var boxInnerPaint = Paint()
-    private var textBackgroundPaint = Paint()
-    private var textPaint = Paint()
+    private var labelBgPaint = Paint()
+    private var labelPaint = Paint()
     private var ocrBackgroundPaint = Paint()
     private var ocrTextPaint = Paint()
 
@@ -57,16 +54,18 @@ class HighContrastOverlayView(context: Context?, attrs: AttributeSet?) :
         boxInnerPaint.strokeWidth = BORDER_WIDTH_INNER
         boxInnerPaint.isAntiAlias = true
 
-        textBackgroundPaint.color = Color.BLACK
-        textBackgroundPaint.style = Paint.Style.FILL
-        textBackgroundPaint.isAntiAlias = true
+        labelBgPaint.color = Color.BLACK
+        labelBgPaint.style = Paint.Style.FILL
+        labelBgPaint.textSize = LABEL_TEXT_SIZE
+        labelBgPaint.isFakeBoldText = true
+        labelBgPaint.isAntiAlias = true
 
-        textPaint.color = COLOR_YELLOW
-        textPaint.style = Paint.Style.FILL
-        textPaint.textSize = LABEL_TEXT_SIZE
-        textPaint.isFakeBoldText = true
-        textPaint.isAntiAlias = true
-        textPaint.typeface = Typeface.DEFAULT_BOLD
+        labelPaint.color = COLOR_YELLOW
+        labelPaint.style = Paint.Style.FILL
+        labelPaint.textSize = LABEL_TEXT_SIZE
+        labelPaint.isFakeBoldText = true
+        labelPaint.isAntiAlias = true
+        labelPaint.typeface = Typeface.DEFAULT_BOLD
 
         ocrBackgroundPaint.color = COLOR_OCR_BACKGROUND
         ocrBackgroundPaint.style = Paint.Style.FILL
@@ -81,7 +80,6 @@ class HighContrastOverlayView(context: Context?, attrs: AttributeSet?) :
     }
 
     override fun draw(canvas: Canvas) {
-        // Draw OCR text first (behind boxes)
         if (ocrText.isNotEmpty()) {
             drawOcrText(canvas)
         }
@@ -92,6 +90,9 @@ class HighContrastOverlayView(context: Context?, attrs: AttributeSet?) :
         canvas: Canvas,
         detections: List<ObjectDetectorHelper.VyzeDetection>
     ) {
+        val viewW = width.toFloat()
+        val viewH = height.toFloat()
+
         for (detection in detections) {
             val boxRect = computeBoxRect(detection.boundingBox)
 
@@ -99,37 +100,65 @@ class HighContrastOverlayView(context: Context?, attrs: AttributeSet?) :
             canvas.drawRect(boxRect, boxOuterPaint)
 
             // Draw inner black border for double-border high-contrast effect
+            val inset = BORDER_WIDTH_OUTER / 2
             val innerRect = RectF(
-                boxRect.left + BORDER_WIDTH_OUTER / 2,
-                boxRect.top + BORDER_WIDTH_OUTER / 2,
-                boxRect.right - BORDER_WIDTH_OUTER / 2,
-                boxRect.bottom - BORDER_WIDTH_OUTER / 2
+                boxRect.left + inset,
+                boxRect.top + inset,
+                boxRect.right - inset,
+                boxRect.bottom - inset
             )
             canvas.drawRect(innerRect, boxInnerPaint)
 
-            // Strict pairing: label from THIS detection
+            // Build label: "COMPUTER KEYBOARD 27%"
             val category = detection.categories.firstOrNull() ?: continue
-            val drawableText = "${category.label.uppercase()} ${
-                String.format("%.0f%%", category.score * 100)
-            }"
+            val drawableText = "${category.label.uppercase()} ${(category.score * 100).toInt()}%"
 
-            // Draw label background anchored to THIS box
-            textBackgroundPaint.getTextBounds(drawableText, 0, drawableText.length, bounds)
-            val padding = LABEL_PADDING
-            canvas.drawRect(
-                boxRect.left,
-                boxRect.top - bounds.height() - padding * 2,
-                boxRect.left + bounds.width() + padding,
-                boxRect.top,
-                textBackgroundPaint
-            )
+            // Dynamic text measurement
+            val textWidth = labelPaint.measureText(drawableText)
+            labelPaint.getTextBounds(drawableText, 0, drawableText.length, bounds)
+            val textHeight = bounds.height().toFloat()
+            val pad = LABEL_PADDING
 
-            // Draw label text in high-contrast yellow
+            // Background rect dimensions
+            val bgW = textWidth + pad
+            val bgH = textHeight + pad * 2
+
+            // Position: prefer above box, clamp to view edges
+            var bgLeft = boxRect.left
+            var bgTop = boxRect.top - bgH - BORDER_WIDTH_OUTER
+
+            // If above the box would go off-screen top, place below
+            if (bgTop < 0f) {
+                bgTop = boxRect.bottom + BORDER_WIDTH_OUTER
+            }
+
+            // Clamp horizontal so right edge doesn't exceed view width
+            if (bgLeft + bgW > viewW) {
+                bgLeft = viewW - bgW
+            }
+
+            // Clamp so left edge doesn't go off-screen left
+            if (bgLeft < 0f) {
+                bgLeft = 0f
+            }
+
+            // Clamp vertical so bottom doesn't exceed view height
+            if (bgTop + bgH > viewH) {
+                bgTop = viewH - bgH
+            }
+
+            val bgBottom = bgTop + bgH
+            val bgRight = bgLeft + bgW
+
+            // Draw background rect
+            canvas.drawRect(bgLeft, bgTop, bgRight, bgBottom, labelBgPaint)
+
+            // Draw label text baseline inside the background rect
             canvas.drawText(
                 drawableText,
-                boxRect.left + padding / 2,
-                boxRect.top - padding,
-                textPaint
+                bgLeft + pad / 2,
+                bgBottom - pad / 2 - bounds.bottom, // center vertically
+                labelPaint
             )
         }
     }

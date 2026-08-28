@@ -25,7 +25,7 @@ com.vyze.app
 ├── TextRecognitionHelper.kt    ─── ML Kit OCR with bitmap recycling
 ├── OverlayView.kt              ─── Standard bounding-box overlay
 ├── HighContrastOverlayView.kt  ─── Low-vision yellow/black overlay + OCR text
-├── ObjectDetectorHelper.kt     ─── MediaPipe EfficientDet inference
+├── ObjectDetectorHelper.kt     ─── YOLOv8n TFLite object detection
 ├── MainViewModel.kt            ─── Settings state management
 ├── MainActivity.kt             ─── Single-activity host
 └── fragments/
@@ -78,7 +78,7 @@ com.vyze.app
 ./gradlew.bat assembleRelease
 ```
 
-> Models (`efficientdet-lite0.tflite`, `efficientdet-lite2.tflite`) are downloaded automatically during the first build.
+> YOLOv8n model (`yolov8n.tflite`) is bundled in `app/src/main/assets/`. No download needed.
 
 ### Install
 
@@ -101,8 +101,11 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 
 - **Language:** Kotlin
 - **Camera:** CameraX 1.3.1
-- **Object Detection:** MediaPipe Tasks Vision 0.10.8 (EfficientDet-Lite0/2)
-- **OCR:** Google ML Kit Text Recognition 19.0.0
+- **Object Detection:** YOLOv8n (TFLite) — 601-class model on Open Images V7
+- **OCR:** Google ML Kit Text Recognition 16.0.0 (bundled, offline)
+- **Barcode:** Google ML Kit Barcode Scanning 17.2.0 (bundled, offline)
+- **Face Detection:** Google ML Kit Face Detection 16.1.6 (bundled, offline)
+- **LLM:** Gemini Nano via ML Kit GenAI Prompt API 1.0.0-beta1 (on-device, when AICore available)
 - **UI:** Material Design, ViewBinding, DataBinding
 - **Architecture:** Single-Activity, Fragment-based
 - **Build:** Gradle 8.14, AGP 8.11, R8 minification

@@ -2,43 +2,22 @@ package com.vyze.app
 
 import android.graphics.RectF
 import android.os.SystemClock
+import android.util.Log
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * Pure spatial mapping and speech debouncing for accessibility announcements.
- *
- * Extracted from [ObjectDetectorHelper] to separate presentation/accessibility
- * logic from ML inference. This class has NO dependency on:
- * - Android Context
- * - TTS engine
- * - ML pipeline or camera frames
+ * Pure spatial mapping, scene grouping, and speech debouncing for accessibility announcements.
  *
  * ## Responsibilities
  * 1. Map bounding box coordinates to spatial zones (left / center / right)
  * 2. Compute proximity from box area ratio (close / medium / far)
- * 3. Debounce speech announcements per zone-key
- * 4. Build natural-language announcement strings from [SpatialInfo]
- *
- * ## Usage
- * ```kotlin
- * val announcer = SpatialAnnouncer()
- *
- * // From detection results
- * val announcements = announcer.getAnnounceableDetections(
- *     detections = resultBundle.detections,
- *     frameWidth = resultBundle.inputImageWidth,
- *     frameHeight = resultBundle.inputImageHeight
- * )
- * if (announcements.isNotEmpty()) ttsManager.speakImmediate(announcements.first())
- * ```
+ * 3. Group multiple instances of the same class (e.g. "3 chairs" instead of "chair, chair, chair")
+ * 4. Debounce speech announcements per class with configurable cooldown
+ * 5. Build natural-language announcement strings from [SpatialInfo]
  */
 class SpatialAnnouncer {
 
-    // ── Speech Debounce State ─────────────────────────────────────
-    // Key: "label|direction|proximity", Value: timestamp of last spoken
     private val lastSpokenTimestamp = ConcurrentHashMap<String, Long>()
-
-    // ── Spatial Mapping ───────────────────────────────────────────
 
     data class SpatialInfo(
         val categoryName: String,
@@ -49,15 +28,6 @@ class SpatialAnnouncer {
         val zoneKey: String
     )
 
-    /**
-     * Compute spatial zone and proximity for a single bounding box.
-     *
-     * @param boundingBox  Detection box in frame coordinates (post-unpad).
-     * @param frameWidth   Width of the original camera frame.
-     * @param frameHeight  Height of the original camera frame.
-     * @param categoryName Human-readable label (e.g. "chair").
-     * @param score        Confidence score from the detector.
-     */
     fun computeSpatialInfo(
         boundingBox: RectF,
         frameWidth: Int,
@@ -87,95 +57,189 @@ class SpatialAnnouncer {
 
     // ── Speech Debouncing ─────────────────────────────────────────
 
-    /**
-     * Check if this spatial zone is eligible to be spoken.
-     *
-     * Returns true if:
-     * - The zone was never spoken, OR
-     * - The zone was spoken more than [DEBOUNCE_MS] ago, OR
-     * - The same label is currently being spoken in a different zone
-     *   (e.g. "chair on your left" is active, so "chair on your right" should also speak)
-     */
-    fun isEligibleToSpeak(spatial: SpatialInfo): Boolean {
+    fun isEligibleToSpeak(label: String): Boolean {
         val now = SystemClock.uptimeMillis()
-        val prev = lastSpokenTimestamp[spatial.zoneKey]
-
+        val prev = lastSpokenTimestamp[label]
         if (prev == null || now - prev > DEBOUNCE_MS) {
-            lastSpokenTimestamp[spatial.zoneKey] = now
+            lastSpokenTimestamp[label] = now
             return true
         }
-
-        // Allow cross-zone announcements for the same label
-        val labelPrefix = spatial.categoryName + "|"
-        val hasDifferentZone = lastSpokenTimestamp.any { (key, ts) ->
-            key.startsWith(labelPrefix) && key != spatial.zoneKey && (now - ts <= DEBOUNCE_MS)
-        }
-        if (hasDifferentZone) {
-            lastSpokenTimestamp[spatial.zoneKey] = now
-            return true
-        }
-
+        Log.d(TAG, "isEligibleToSpeak: DEBOUNCE active for '$label' " +
+            "(${now - prev}ms < ${DEBOUNCE_MS}ms)")
         return false
     }
 
-    /**
-     * Clear all debounce timestamps. Call on settings change, mode switch,
-     * or when the user explicitly requests a fresh announcement.
-     */
     fun clearDebounceState() {
         lastSpokenTimestamp.clear()
     }
 
-    // ── Announcement Generation ───────────────────────────────────
+    // ── Scene Grouping ────────────────────────────────────────────
 
     /**
-     * Build a natural-language announcement string from a [SpatialInfo].
+     * Group detections by class label and build a scene description.
      *
-     * Returns null if:
-     * - The proximity is empty (medium = no announcement)
-     * - The zone is debounced (recently spoken)
+     * ALWAYS returns a non-null string when detections is non-empty.
+     * Falls back to raw label list if grouping fails.
      */
-    fun buildAnnouncement(spatial: SpatialInfo): String? {
-        if (spatial.proximity.isEmpty()) return null
-        if (!isEligibleToSpeak(spatial)) return null
-        val proximityText = if (spatial.proximity.isNotEmpty()) ", ${spatial.proximity}" else ""
-        return "${spatial.categoryName} ${spatial.direction}$proximityText"
+    fun buildSceneDescription(
+        detections: List<ObjectDetectorHelper.VyzeDetection>,
+        frameWidth: Int,
+        frameHeight: Int
+    ): String? {
+        if (detections.isEmpty()) {
+            Log.d(TAG, "buildSceneDescription: empty detections → null")
+            return null
+        }
+
+        Log.d(TAG, "buildSceneDescription: ${detections.size} detections, " +
+            "frame=${frameWidth}x${frameHeight}")
+
+        // Group detections by class label
+        val classGroups = mutableMapOf<String, MutableList<SpatialInfo>>()
+
+        for (detection in detections) {
+            val category = detection.categories.firstOrNull() ?: continue
+            val spatial = computeSpatialInfo(
+                detection.boundingBox, frameWidth, frameHeight,
+                category.label, category.score
+            )
+            classGroups.getOrPut(category.label) { mutableListOf() }.add(spatial)
+        }
+
+        if (classGroups.isEmpty()) {
+            // Fallback: extract raw labels from detections
+            val rawLabels = detections.mapNotNull { it.categories.firstOrNull()?.label }
+            if (rawLabels.isNotEmpty()) {
+                val fallback = rawLabels.joinToString(", ")
+                Log.d(TAG, "buildSceneDescription: classGroups empty, fallback=$fallback")
+                return fallback
+            }
+            return null
+        }
+
+        // Build grouped announcements — always include at least one part
+        val parts = mutableListOf<String>()
+
+        for ((label, group) in classGroups) {
+            val count = group.size
+            val pluralLabel = pluralize(label, count)
+
+            // Always include this class in the description (no debounce gate here
+            // — debounce only prevents REPEATS, not first-time announcements)
+            when {
+                count == 1 -> {
+                    val spatial = group.first()
+                    parts.add(formatSingle(spatial))
+                }
+                count == 2 -> {
+                    val positions = group.map { formatDirection(it) }.distinct()
+                    if (positions.size == 1) {
+                        parts.add("$count $pluralLabel ${positions.first()}")
+                    } else {
+                        parts.add("$count $pluralLabel")
+                    }
+                }
+                else -> {
+                    val byDirection = group.groupBy { it.direction }
+                    if (byDirection.size == 1) {
+                        parts.add("$count $pluralLabel ${byDirection.keys.first()}")
+                    } else {
+                        parts.add("$count $pluralLabel")
+                    }
+                }
+            }
+        }
+
+        val result = if (parts.isNotEmpty()) parts.joinToString(". ") else {
+            // Last resort: raw comma-separated labels
+            detections.mapNotNull { it.categories.firstOrNull()?.label }
+                .joinToString(", ")
+                .ifEmpty { null }
+        }
+
+        Log.d(TAG, "buildSceneDescription: result=$result")
+        return result
     }
 
-    /**
-     * Generate announceable strings for all detections in a result bundle.
-     *
-     * Each detection is mapped to spatial info, debounced, and converted
-     * to a natural-language string. Results are sorted by confidence
-     * (highest first) so the most important object is announced first.
-     *
-     * @param detections  Raw detections from the detector (bounding boxes in frame coords).
-     * @param frameWidth  Width of the original camera frame.
-     * @param frameHeight Height of the original camera frame.
-     * @return List of announcement strings, most confident first.
-     */
     fun getAnnounceableDetections(
         detections: List<ObjectDetectorHelper.VyzeDetection>,
         frameWidth: Int,
         frameHeight: Int
     ): List<String> {
-        return detections.mapNotNull { detection ->
+        if (detections.isEmpty()) return emptyList()
+
+        // First try scene grouping
+        val sceneDesc = buildSceneDescription(detections, frameWidth, frameHeight)
+        if (sceneDesc != null) {
+            return listOf(sceneDesc)
+        }
+
+        // Fallback: individual detections — always return something for non-empty
+        val results = detections.mapNotNull { detection ->
             val category = detection.categories.firstOrNull() ?: return@mapNotNull null
             val spatial = computeSpatialInfo(
                 detection.boundingBox, frameWidth, frameHeight,
                 category.label, category.score
             )
             buildAnnouncement(spatial)
-        }.sortedByDescending { ann ->
-            detections.firstOrNull { d ->
-                val cat = d.categories.firstOrNull()
-                cat != null && buildAnnouncement(
-                    computeSpatialInfo(
-                        d.boundingBox, frameWidth, frameHeight,
-                        cat.label, cat.score
-                    )
-                ) == ann
-            }?.categories?.firstOrNull()?.score ?: 0f
+        }
+
+        // If debounce blocked everything, return at least the top detection label
+        if (results.isEmpty() && detections.isNotEmpty()) {
+            val topLabel = detections.maxByOrNull {
+                it.categories.firstOrNull()?.score ?: 0f
+            }?.categories?.firstOrNull()?.label
+            if (topLabel != null) {
+                Log.d(TAG, "getAnnounceableDetections: debounce blocked all, fallback=$topLabel")
+                return listOf(topLabel)
+            }
+        }
+
+        return results
+    }
+
+    // ── Announcement Generation ───────────────────────────────────
+
+    fun buildAnnouncement(spatial: SpatialInfo): String? {
+        if (!isEligibleToSpeak(spatial.categoryName)) return null
+        val proximityText = if (spatial.proximity.isNotEmpty()) ", ${spatial.proximity}" else ""
+        return "${spatial.categoryName} ${spatial.direction}$proximityText"
+    }
+
+    private fun formatSingle(spatial: SpatialInfo): String {
+        val proximityText = if (spatial.proximity.isNotEmpty()) ", ${spatial.proximity}" else ""
+        return "${spatial.categoryName} ${spatial.direction}$proximityText"
+    }
+
+    private fun formatDirection(spatial: SpatialInfo): String {
+        return spatial.direction
+    }
+
+    private fun pluralize(label: String, count: Int): String {
+        if (count == 1) return label
+
+        val irregulars = mapOf(
+            "person" to "people",
+            "mouse" to "mice",
+            "child" to "children",
+            "tooth" to "teeth",
+            "foot" to "feet",
+            "goose" to "geese",
+            "man" to "men",
+            "woman" to "women"
+        )
+
+        val lowerLabel = label.lowercase()
+        if (lowerLabel in irregulars) {
+            return irregulars[lowerLabel]!!
+        }
+
+        return when {
+            lowerLabel.endsWith("s") -> "${label}es"
+            lowerLabel.endsWith("y") && !lowerLabel.endsWith("ay") &&
+                !lowerLabel.endsWith("ey") && !lowerLabel.endsWith("oy") &&
+                !lowerLabel.endsWith("uy") -> "${label.dropLast(1)}ies"
+            else -> "${label}s"
         }
     }
 
@@ -184,16 +248,9 @@ class SpatialAnnouncer {
     companion object {
         private const val TAG = "SpatialAnnouncer"
 
-        /** Fraction of frame width defining the left zone boundary. */
         const val LEFT_THRESHOLD = 0.35f
-
-        /** Fraction of frame width defining the right zone boundary. */
         const val RIGHT_THRESHOLD = 0.65f
-
-        /** Box area > this fraction of frame area = "close". */
         const val CLOSE_THRESHOLD = 0.15f
-
-        /** Box area < this fraction of frame area = "far". */
         const val FAR_THRESHOLD = 0.05f
 
         const val DIR_LEFT   = "on your left"
@@ -204,7 +261,7 @@ class SpatialAnnouncer {
         const val PROX_FAR    = "far"
         const val PROX_MEDIUM = ""
 
-        /** Minimum milliseconds between announcements for the same zone. */
-        const val DEBOUNCE_MS = 3500L
+        /** Per-class debounce cooldown — reduced to 1.5 seconds. */
+        const val DEBOUNCE_MS = 1500L
     }
 }
