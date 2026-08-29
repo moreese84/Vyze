@@ -158,6 +158,9 @@ dependencies {
     // Splash Screen API (AndroidX compat for API 31+ splash)
     implementation("androidx.core:core-splashscreen:1.0.1")
 
+    // Unit testing
+    testImplementation("junit:junit:4.13.2")
+
     // Instrumented testing
     androidTestImplementation("androidx.test.ext:junit:1.1.5")
     androidTestImplementation("androidx.test:core:1.5.0")
