@@ -18,8 +18,12 @@ package com.vyze.app.fragments
 
 import android.Manifest
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
+import android.os.Environment
+import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
@@ -36,6 +40,10 @@ private val PERMISSIONS_REQUIRED = arrayOf(
 /**
  * The sole purpose of this fragment is to request permissions and, once granted, display the camera
  * fragment to the user.
+ *
+ * On Android 11+ (API 30+), also checks [Environment.isExternalStorageManager()]
+ * for `MANAGE_EXTERNAL_STORAGE`. This is non-blocking — if the user denies it,
+ * we still navigate to camera but the model must be loaded from bundled assets.
  */
 class PermissionsFragment : Fragment() {
 
@@ -48,7 +56,6 @@ class PermissionsFragment : Fragment() {
                     "All permissions granted",
                     Toast.LENGTH_LONG
                 ).show()
-                navigateToCamera()
             } else {
                 // Check which permissions were denied
                 val denied = permissions.filter { !it.value }.keys
@@ -58,6 +65,29 @@ class PermissionsFragment : Fragment() {
                     Toast.LENGTH_LONG
                 ).show()
             }
+            // Always navigate to camera — storage permission is non-blocking
+            checkAndRequestStoragePermission()
+        }
+
+    /**
+     * Launcher for the "All files access" settings page on Android 11+.
+     * Non-blocking: navigates to camera regardless of result.
+     */
+    private val storageSettingsLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+            // User returned from Settings — check result and navigate
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+                Environment.isExternalStorageManager()
+            ) {
+                Toast.makeText(context, "Storage access granted", Toast.LENGTH_SHORT).show()
+            } else {
+                Toast.makeText(
+                    context,
+                    "Storage access not granted — model will load from bundled assets",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+            navigateToCamera()
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -69,10 +99,36 @@ class PermissionsFragment : Fragment() {
         }
 
         if (missingPermissions.isEmpty()) {
-            navigateToCamera()
+            // Camera/audio permissions already granted — check storage next
+            checkAndRequestStoragePermission()
         } else {
             requestPermissionLauncher.launch(missingPermissions.toTypedArray())
         }
+    }
+
+    /**
+     * On Android 11+ (API 30+), check if `MANAGE_EXTERNAL_STORAGE` is granted.
+     * If not, open the system settings page so the user can enable it.
+     * This is non-blocking — we navigate to camera either way.
+     */
+    private fun checkAndRequestStoragePermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            if (!Environment.isExternalStorageManager()) {
+                Toast.makeText(
+                    requireContext(),
+                    "For VLM model loading from Downloads, grant 'All files access' in the next screen",
+                    Toast.LENGTH_LONG
+                ).show()
+
+                val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+                    data = android.net.Uri.parse("package:${requireContext().packageName}")
+                }
+                storageSettingsLauncher.launch(intent)
+                return
+            }
+        }
+        // Android 10 and below, or already granted — proceed directly
+        navigateToCamera()
     }
 
     private fun navigateToCamera() {

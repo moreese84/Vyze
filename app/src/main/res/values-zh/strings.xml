@@ -103,10 +103,7 @@
 
     <!-- ── Accessibility (TalkBack) ────────────────────────────────── -->
     <string name="camera_container_desc">Vyze相机屏幕。点击检测物体。双击读取文字。长按查看场景摘要。</string>
-    <string name="view_finder_desc">显示实时检测结果的相机预览</string>
-    <string name="overlay_desc">物体检测边界框覆盖层</string>
-    <string name="high_contrast_overlay_desc">为低视力用户设计的高对比度检测覆盖层</string>
-    <string name="bottom_sheet_desc">物体检测设置面板</string>
+    <string name="view_finder_desc">相机预览 — 点击任意处获取场景描述</string>
 
     <!-- ── Emergency SOS ───────────────────────────────────────────── -->
     <string name="sos_activated">紧急模式已激活。正在打开拨号器。</string>
@@ -173,18 +170,7 @@
     <string name="accessibility_service_disabled">Vyze辅助功能服务已禁用。</string>
 
     <!-- ── UI Labels ─────────────────────────────────────────────── -->
-    <string name="alt_bottom_sheet_chevron">可展开面板指示器</string>
-    <string name="alt_bottom_sheet_max_results_button_minus">减少最大检测结果数按钮</string>
-    <string name="alt_bottom_sheet_max_results_button_plus">增加最大检测结果数按钮</string>
-    <string name="alt_bottom_sheet_threshold_button_minus">降低检测结果置信度阈值按钮</string>
-    <string name="alt_bottom_sheet_threshold_button_plus">提高检测结果置信度阈值按钮</string>
-    <string name="label_inference_time">推理时间</string>
-    <string name="label_fps">每秒帧数</string>
-    <string name="label_confidence_threshold">置信度阈值</string>
-    <string name="label_max_results">最大结果数</string>
-    <string name="label_delegate">委托方式</string>
-    <string name="label_models">机器学习模型</string>
     <string name="menu_camera">相机</string>
     <string name="menu_gallery">图库</string>
-    <string name="tv_gallery_placeholder">点击+添加图片或视频以开始运行物体检测。</string>
+    <string name="tv_gallery_placeholder">点击+添加图片进行场景分析。</string>
 </resources>

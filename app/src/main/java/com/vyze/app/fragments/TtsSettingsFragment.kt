@@ -63,7 +63,6 @@ class TtsSettingsFragment : Fragment() {
     private lateinit var btnMedicineMode: Button
     private lateinit var btnGestureTutorial: Button
     private lateinit var btnErrorLog: Button
-    private lateinit var nightModeHelper: com.vyze.app.NightModeHelper
 
     // Debounce for slider changes — speak sample only after 500ms of inactivity
     private val handler = android.os.Handler(android.os.Looper.getMainLooper())
@@ -110,8 +109,7 @@ class TtsSettingsFragment : Fragment() {
         setupVolumeSlider()
         setupTestButton()
 
-        // P2: Night mode + specialized modes
-        nightModeHelper = com.vyze.app.NightModeHelper(requireContext().applicationContext)
+        // P2 views
         valueNightMode = view.findViewById(R.id.value_night_mode)
         spinnerNightMode = view.findViewById(R.id.spinner_night_mode)
         btnReadingMode = view.findViewById(R.id.btn_reading_mode)
@@ -344,15 +342,9 @@ class TtsSettingsFragment : Fragment() {
         adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
         spinnerNightMode.adapter = adapter
 
-        // Set current selection
-        val currentMode = nightModeHelper.getNightMode()
-        val selectedIndex = when (currentMode) {
-            androidx.appcompat.app.AppCompatDelegate.MODE_NIGHT_NO -> 0
-            androidx.appcompat.app.AppCompatDelegate.MODE_NIGHT_YES -> 1
-            else -> 2
-        }
-        spinnerNightMode.setSelection(selectedIndex, false)
-        valueNightMode.text = nightModeHelper.getCurrentModeName()
+        // Set current selection to system default
+        spinnerNightMode.setSelection(2, false)
+        valueNightMode.text = requireContext().getString(R.string.night_mode_system)
 
         spinnerNightMode.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
             override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
@@ -361,13 +353,14 @@ class TtsSettingsFragment : Fragment() {
                     1 -> androidx.appcompat.app.AppCompatDelegate.MODE_NIGHT_YES
                     else -> androidx.appcompat.app.AppCompatDelegate.MODE_NIGHT_FOLLOW_SYSTEM
                 }
-                if (mode != nightModeHelper.getNightMode()) {
-                    nightModeHelper.setNightMode(mode)
-                    valueNightMode.text = nightModeHelper.getCurrentModeName()
-                    ttsManager.speakImmediate(
-                        requireContext().getString(R.string.night_mode_toggled, nightModeHelper.getCurrentModeName())
-                    )
+                androidx.appcompat.app.AppCompatDelegate.setDefaultNightMode(mode)
+                val modeName = when (position) {
+                    0 -> requireContext().getString(R.string.night_mode_light)
+                    1 -> requireContext().getString(R.string.night_mode_dark)
+                    else -> requireContext().getString(R.string.night_mode_system)
                 }
+                valueNightMode.text = modeName
+                ttsManager.speakImmediate(modeName)
             }
             override fun onNothingSelected(parent: AdapterView<*>?) {}
         }

@@ -36,10 +36,6 @@
         <item name="postSplashScreenTheme">@style/Theme.Vyze</item>
     </style>
 
-    <style name="BottomSheetSpinnerItemStyle" parent="Widget.AppCompat.Light.DropDownItem.Spinner">
-        <item name="android:textSize">@dimen/bottom_sheet_text_size</item>
-    </style>
-
     <style name="AppThemeProgressStyle">
         <item name="colorAccent">@color/mp_variant</item>
     </style>

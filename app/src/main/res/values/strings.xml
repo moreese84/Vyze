@@ -3,20 +3,9 @@
     <string name="app_name">Vyze</string>
 
     <!-- ── UI Labels ─────────────────────────────────────────────────── -->
-    <string name="alt_bottom_sheet_chevron">Bottom sheet expandable indicator</string>
-    <string name="alt_bottom_sheet_max_results_button_minus">Decreasing maxium detected results button</string>
-    <string name="alt_bottom_sheet_max_results_button_plus">Increasing maxium detected results button</string>
-    <string name="alt_bottom_sheet_threshold_button_minus">Decreasing threshold of detected object results button</string>
-    <string name="alt_bottom_sheet_threshold_button_plus">Increasing threshold of detected object results button</string>
-    <string name="label_inference_time">Inference Time</string>
-    <string name="label_fps">Frames per Second</string>
-    <string name="label_confidence_threshold">Threshold</string>
-    <string name="label_max_results">Max Results</string>
-    <string name="label_delegate">Delegate</string>
-    <string name="label_models">ML Model</string>
     <string name="menu_camera">Camera</string>
     <string name="menu_gallery">Gallery</string>
-    <string name="tv_gallery_placeholder">Click + to add an image or a video to begin running the object detection.</string>
+    <string name="tv_gallery_placeholder">Tap + to add an image for scene analysis.</string>
 
 
 
@@ -121,10 +110,7 @@
 
     <!-- ── Accessibility (TalkBack) ────────────────────────────────── -->
     <string name="camera_container_desc">Vyze camera screen. Tap to detect objects. Double-tap to read text. Long-press for scene summary.</string>
-    <string name="view_finder_desc">Camera preview feed showing live detection results</string>
-    <string name="overlay_desc">Object detection bounding box overlay</string>
-    <string name="high_contrast_overlay_desc">High-contrast detection overlay for low-vision users</string>
-    <string name="bottom_sheet_desc">Object detection settings panel</string>
+    <string name="view_finder_desc">Camera preview feed — tap anywhere for scene description</string>
 
     <!-- ── Emergency SOS ───────────────────────────────────────────── -->
     <string name="sos_activated">Emergency mode activated. Opening dialer.</string>

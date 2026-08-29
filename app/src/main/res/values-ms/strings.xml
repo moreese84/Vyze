@@ -103,10 +103,7 @@
 
     <!-- ── Accessibility (TalkBack) ────────────────────────────────── -->
     <string name="camera_container_desc">Skrin kamera Vyze. Sentuh untuk mengesan objek. Sentuh dua kali untuk membaca teks. Tekan tahan untuk ringkasan pemandangan.</string>
-    <string name="view_finder_desc">Suapan pratonton kamera dengan hasil pengesanan langsung</string>
-    <string name="overlay_desc">Tindanan kotak sempadan pengesanan objek</string>
-    <string name="high_contrast_overlay_desc">Tindanan pengesanan kontras tinggi untuk pengguna penglihatan rendah</string>
-    <string name="bottom_sheet_desc">Panel tetapan pengesanan objek</string>
+    <string name="view_finder_desc">Pratonton kamera — sentuh di mana-mana untuk deskripsi pemandangan</string>
 
     <!-- ── Emergency SOS ───────────────────────────────────────────── -->
     <string name="sos_activated">Mod kecemasan diaktifkan. Membuka dialer.</string>
@@ -173,18 +170,7 @@
     <string name="accessibility_service_disabled">Perkhidmatan kebolehcapaian Vyze dinyahaktifkan.</string>
 
     <!-- ── UI Labels ─────────────────────────────────────────────── -->
-    <string name="alt_bottom_sheet_chevron">Penunjuk panel boleh kembang</string>
-    <string name="alt_bottom_sheet_max_results_button_minus">Butang mengurangkan jumlah hasil yang dikesan</string>
-    <string name="alt_bottom_sheet_max_results_button_plus">Butang menambah jumlah hasil yang dikesan</string>
-    <string name="alt_bottom_sheet_threshold_button_minus">Butang mengurangkan ambang hasil pengesanan</string>
-    <string name="alt_bottom_sheet_threshold_button_plus">Butang menambah ambang hasil pengesanan</string>
-    <string name="label_inference_time">Masa Inferens</string>
-    <string name="label_fps">Bingkai sesaat</string>
-    <string name="label_confidence_threshold">Ambang</string>
-    <string name="label_max_results">Jumlah Maksimum</string>
-    <string name="label_delegate">Delegasi</string>
-    <string name="label_models">Model ML</string>
     <string name="menu_camera">Kamera</string>
     <string name="menu_gallery">Galeri</string>
-    <string name="tv_gallery_placeholder">Klik + untuk menambah imej atau video untuk menjalankan pengesanan objek.</string>
+    <string name="tv_gallery_placeholder">Klik + untuk menambah imej untuk analisis pemandangan.</string>
 </resources>

@@ -21,8 +21,7 @@
 
     <androidx.constraintlayout.widget.ConstraintLayout
         android:layout_width="match_parent"
-        android:layout_height="match_parent"
-        android:layout_marginBottom="@dimen/bottom_sheet_peek_height">
+        android:layout_height="match_parent">
 
         <TextView
             android:id="@+id/tvPlaceholder"
@@ -34,8 +33,7 @@
 
         <RelativeLayout
             android:layout_width="match_parent"
-            android:layout_height="match_parent"
-            android:layout_marginBottom="@dimen/bottom_sheet_peek_height">
+            android:layout_height="match_parent">
 
             <ImageView
                 android:id="@+id/imageResult"
@@ -51,11 +49,7 @@
                 android:layout_height="match_parent"
                 android:visibility="gone" />
 
-            <com.vyze.app.OverlayView
-                android:id="@+id/overlay"
-                android:layout_width="match_parent"
-                android:layout_height="match_parent"
-                android:layout_centerInParent="true" />
+
 
             <androidx.core.widget.ContentLoadingProgressBar
                 android:id="@+id/progress"
@@ -83,7 +77,5 @@
             app:layout_constraintEnd_toEndOf="parent" />
     </androidx.constraintlayout.widget.ConstraintLayout>
 
-    <include
-        android:id="@+id/bottom_sheet_layout"
-        layout="@layout/info_bottom_sheet" />
+
 </androidx.coordinatorlayout.widget.CoordinatorLayout>

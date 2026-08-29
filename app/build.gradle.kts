@@ -17,7 +17,7 @@
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
-    id("kotlin-kapt")
+    id("com.google.devtools.ksp")
     id("androidx.navigation.safeargs")
     id("de.undercouch.download")
 }
@@ -60,17 +60,18 @@ android {
         }
     }
 
-    dataBinding {
-        isEnabled = true
+    buildFeatures {
+        dataBinding = true
+        viewBinding = true
     }
 
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_1_8
-        targetCompatibility = JavaVersion.VERSION_1_8
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = "1.8"
+    kotlin {
+        jvmToolchain(17)
     }
 
     buildTypes {
@@ -88,25 +89,32 @@ android {
         }
     }
 
-    buildFeatures {
-        viewBinding = true
-    }
+
 
     androidResources {
+        noCompress += "litertlm"
         noCompress += "tflite"
-        noCompress += "txt"
+    }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
     }
 }
 
 // Download default models; if you wish to use your own models then
 // place them in the "assets" directory and comment out this line.
-apply(from = "download_models.gradle")
+// Models are bundled in app/src/main/assets/
 
 dependencies {
     // Kotlin
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("org.jetbrains.kotlin:kotlin-stdlib:${rootProject.extra["kotlin_version"]}")
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+    // kotlinx-coroutines MUST be 1.9.0+ to match litertlm-android:0.16.1
+    // (SendChannel.close$default signature changed in 1.9.0)
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
 
     // AppCompat and UI
     implementation("androidx.appcompat:appcompat:1.6.1")
@@ -131,27 +139,14 @@ dependencies {
     implementation("androidx.camera:camera-lifecycle:$camerax_version")
     implementation("androidx.camera:camera-view:$camerax_version")
 
-    // ML Kit (bundled — models are statically linked in the APK, fully offline)
-    implementation("com.google.mlkit:text-recognition:16.0.0")
-    implementation("com.google.mlkit:barcode-scanning:17.2.0")
-    implementation("com.google.mlkit:face-detection:16.1.6")
+    // LiteRT-LM runtime for on-device VLM inference (SmolVLM2-500M)
+    implementation("com.google.ai.edge.litertlm:litertlm-android:0.16.1")
 
-    // MediaPipe (kept for RunningMode enum used by OverlayView)
-    implementation("com.google.mediapipe:tasks-vision:0.10.8")
-
-    // TensorFlow Lite (YOLOv8 object detection)
-    implementation("org.tensorflow:tensorflow-lite:2.14.0")
-    implementation("org.tensorflow:tensorflow-lite-support:0.4.4")
-    implementation("org.tensorflow:tensorflow-lite-gpu:2.14.0")
-
-    // ML Kit GenAI Prompt API (Gemini Nano on-device agent)
-    implementation("com.google.mlkit:genai-prompt:1.0.0-beta1")
-
-    // Room (local database for scan history)
+    // Room (local database for scan history + VLM memory)
     val room_version = "2.7.0"
     implementation("androidx.room:room-runtime:$room_version")
     implementation("androidx.room:room-ktx:$room_version")
-    kapt("androidx.room:room-compiler:$room_version")
+    ksp("androidx.room:room-compiler:$room_version")
 
     // SavedStateHandle
     implementation("androidx.lifecycle:lifecycle-viewmodel-savedstate:2.7.0")
@@ -162,18 +157,6 @@ dependencies {
 
     // Splash Screen API (AndroidX compat for API 31+ splash)
     implementation("androidx.core:core-splashscreen:1.0.1")
-
-    // Instrumented testing — Room
-    androidTestImplementation("androidx.room:room-testing:2.7.0")
-    androidTestImplementation("androidx.test.espresso:espresso-contrib:3.5.1")
-    androidTestImplementation("androidx.test.espresso:espresso-intents:3.5.1")
-
-    // Unit testing
-    testImplementation("androidx.test.ext:junit:1.1.5")
-    testImplementation("androidx.test:rules:1.5.0")
-    testImplementation("androidx.test:runner:1.5.2")
-    testImplementation("androidx.test.espresso:espresso-core:3.5.1")
-    testImplementation("org.robolectric:robolectric:4.11.1")
 
     // Instrumented testing
     androidTestImplementation("androidx.test.ext:junit:1.1.5")

@@ -1,5 +1,0 @@
-/*
- * All models are now bundled directly in app/src/main/assets/.
- * YOLOv8n (yolov8n.tflite) is the sole object detection model.
- * Legacy EfficientDet download tasks have been removed.
- */

@@ -1,79 +1,149 @@
-/*
- * Copyright 2022 The TensorFlow Authors. All Rights Reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *       http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 package com.vyze.app
 
+import android.graphics.Color
 import android.os.Bundle
+import android.util.Log
+import android.widget.ScrollView
+import android.widget.TextView
+import android.widget.Toast
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.viewModels
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.navigation.fragment.NavHostFragment
-import androidx.navigation.ui.setupWithNavController
 import com.vyze.app.databinding.ActivityMainBinding
 
 /**
- * Main entry point into our app. This app follows the single-activity pattern, and all
- * functionality is implemented in the form of fragments.
+ * Main entry point into the Vyze app. Single-activity pattern with
+ * Navigation component hosting all fragments.
+ *
+ * ## Crash Safety
+ * The entire onCreate() is wrapped in a try-catch. If ANY Throwable occurs
+ * during splash setup, layout inflation, or navigation init, the crash is
+ * caught and a red error TextView is shown so the user can report it.
+ *
+ * A [superCalled] flag prevents calling super.onCreate() twice in the
+ * catch block, which would throw IllegalStateException and prevent
+ * the red error screen from rendering.
  */
 class MainActivity : AppCompatActivity() {
 
-    private lateinit var activityMainBinding: ActivityMainBinding
+    private var activityMainBinding: ActivityMainBinding? = null
     private val viewModel: MainViewModel by viewModels()
-
-    private lateinit var hapticManager: HapticManager
+    private var hapticManager: HapticManager? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        // Install splash screen BEFORE super.onCreate() — reads Theme.App.Starting
-        // from the manifest and renders the dark background with the Vyze mark.
-        val splashScreen = installSplashScreen()
+        // Track whether super.onCreate() has already been called.
+        // If it was called in the try block, we must NOT call it again
+        // in the catch block — Android throws IllegalStateException.
+        var superCalled = false
 
-        // Hold the splash screen visible until the ML pipeline has finished
-        // initializing on the background thread.  Without this, the splash
-        // dismisses instantly and the user sees a dead camera preview for
-        // 1-3 seconds while models bind — especially confusing for low-vision
-        // users who rely on haptic/TTS confirmation.
-        splashScreen.setKeepOnScreenCondition { !SplashViewModel.isMlReady }
+        try {
+            CrashLogFile.log(TAG, "onCreate start")
 
-        super.onCreate(savedInstanceState)
+            // Install splash screen BEFORE super.onCreate()
+            val splashScreen = installSplashScreen()
+            splashScreen.setKeepOnScreenCondition { !SplashViewModel.isMlReady }
 
-        // ── Immediate haptic confirmation ──────────────────────────────
-        // Low-vision users need tactile proof that the process is alive
-        // before ML models finish binding. This fires instantly on launch
-        // while the splash is still held by setKeepOnScreenCondition.
-        hapticManager = HapticManager(applicationContext)
-        hapticManager.vibrateTap()
+            super.onCreate(savedInstanceState)
+            superCalled = true
 
-        activityMainBinding = ActivityMainBinding.inflate(layoutInflater)
-        setContentView(activityMainBinding.root)
+            // Haptic confirmation for low-vision users
+            try {
+                hapticManager = HapticManager(applicationContext)
+                hapticManager?.vibrateTap()
+            } catch (e: Throwable) {
+                Log.e(TAG, "HapticManager init failed: ${e.message}")
+            }
 
-        val navHostFragment =
-            supportFragmentManager.findFragmentById(R.id.fragment_container) as NavHostFragment
-        val navController = navHostFragment.navController
-        activityMainBinding.navigation.setupWithNavController(navController)
-        activityMainBinding.navigation.setOnNavigationItemReselectedListener {
-            // ignore the reselection
+            activityMainBinding = ActivityMainBinding.inflate(layoutInflater)
+            setContentView(activityMainBinding!!.root)
+
+            // Verify NavHostFragment is present (non-fatal if missing)
+            try {
+                supportFragmentManager.findFragmentById(R.id.fragment_container) as? NavHostFragment
+            } catch (e: Throwable) {
+                Log.e(TAG, "NavHostFragment lookup failed: ${e.message}")
+            }
+
+            // Back press: finish the activity
+            onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+                override fun handleOnBackPressed() {
+                    finish()
+                }
+            })
+
+            CrashLogFile.log(TAG, "onCreate completed successfully")
+
+        } catch (e: Throwable) {
+            // ═══ CRITICAL SAFETY NET ═══
+            Log.e(TAG, "FATAL onCreate crash: ${e.javaClass.simpleName}: ${e.message}", e)
+            CrashLogFile.logError(TAG, "FATAL onCreate crash", e)
+            CrashLogFile.flush()
+
+            // ONLY call super.onCreate() if it hasn't been called yet.
+            // If superCalled is true, the activity is already in a valid state
+            // and we can just replace the content view with the error screen.
+            if (!superCalled) {
+                try {
+                    super.onCreate(savedInstanceState)
+                    superCalled = true
+                } catch (_: Throwable) {
+                    // super.onCreate() itself crashed — can't recover the activity.
+                    // Log and bail out — the system will show "Vyze has stopped".
+                    Log.e(TAG, "super.onCreate() failed in catch block — unrecoverable")
+                    return
+                }
+            }
+
+            // Build a fallback error screen programmatically
+            try {
+                val errorText = buildString {
+                    appendLine("VYZE LAUNCH ERROR")
+                    appendLine()
+                    appendLine("${e.javaClass.simpleName}: ${e.message}")
+                    appendLine()
+                    appendLine("Stack trace:")
+                    appendLine(e.stackTraceToString())
+                }
+
+                val scrollView = ScrollView(this)
+                val textView = TextView(this).apply {
+                    text = errorText
+                    setTextColor(Color.RED)
+                    setBackgroundColor(Color.BLACK)
+                    textSize = 12f
+                    setPadding(32, 32, 32, 32)
+                    setOnLongClickListener {
+                        val clipboard = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                        clipboard.setPrimaryClip(
+                            android.content.ClipData.newPlainText("crash", errorText)
+                        )
+                        Toast.makeText(this@MainActivity, "Copied to clipboard", Toast.LENGTH_SHORT).show()
+                        true
+                    }
+                }
+
+                scrollView.addView(textView)
+                setContentView(scrollView)
+            } catch (e2: Throwable) {
+                // Even the error screen failed — log it and show a toast as last resort
+                Log.e(TAG, "Error screen itself crashed: ${e2.message}")
+                try {
+                    Toast.makeText(this, "VYZE CRASH: ${e.message}", Toast.LENGTH_LONG).show()
+                } catch (_: Throwable) {
+                    // Nothing more we can do
+                }
+            }
         }
-    }
-
-    override fun onBackPressed() {
-        finish()
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        if (::hapticManager.isInitialized) hapticManager.cancel()
+        hapticManager?.cancel()
+    }
+
+    companion object {
+        private const val TAG = "MainActivity"
     }
 }

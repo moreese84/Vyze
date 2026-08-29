@@ -33,7 +33,7 @@ class GestureRouter(
     private val context: Context,
     private val ttsManager: TTSManager,
     private val hapticManager: HapticManager,
-    private val colorAnalyzer: ColorAnalyzer,
+    private val colorAnalyzer: ColorAnalyzer = ColorAnalyzer(),
     private val scanRepository: ScanRepository,
     private val mainHandler: Handler = Handler(Looper.getMainLooper())
 ) {

@@ -60,7 +60,7 @@ class FlashlightManager {
 
     /**
      * Sets the torch state based on the hysteresis decision from
-     * [LuminanceAnalyzer].
+     * ambient light level checks.
      *
      * The dual-threshold hysteresis (ON < 35 lux, OFF > 65 lux) is already
      * computed by the analyzer, so this method simply applies the result

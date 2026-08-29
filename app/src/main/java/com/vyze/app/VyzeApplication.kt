@@ -3,6 +3,7 @@ package com.vyze.app
 import android.app.Application
 import android.util.Log
 import com.vyze.app.data.ErrorLogRepository
+import com.vyze.app.data.MemoryDao
 import com.vyze.app.data.ScanRepository
 import com.vyze.app.data.VyzeDatabase
 import kotlinx.coroutines.CoroutineScope
@@ -42,6 +43,18 @@ class VyzeApplication : Application() {
         ErrorLogRepository(applicationContext)
     }
 
+    /** Memory DAO for adaptive personal intelligence. */
+    val memoryDao: MemoryDao by lazy {
+        database.memoryDao()
+    }
+
+    /**
+     * Singleton VyzeCoreController, created by LoadingFragment after VLM init
+     * and shared with CameraFragment so the initialized engine is reused.
+     */
+    @Volatile
+    var coreController: VyzeCoreController? = null
+
     /** Singleton TTSManager. Managed externally via TtsViewModel. */
     val ttsManager: TTSManager by lazy {
         TTSManager(applicationContext).apply {
@@ -53,6 +66,7 @@ class VyzeApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        CrashLogFile.init(this)
         installGlobalErrorHandler()
         pruneOldErrorLogs()
         Log.d(TAG, "VyzeApplication created")
@@ -92,6 +106,10 @@ class VyzeApplication : Application() {
             }
 
             Log.e(TAG, errorMessage, throwable)
+
+            // Write to crash log file (synchronous — survives native crashes)
+            CrashLogFile.logError("UncaughtHandler", errorMessage, throwable)
+            CrashLogFile.flush()
 
             // Log to Room database (best-effort, non-blocking)
             applicationScope.launch {

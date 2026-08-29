@@ -31,7 +31,7 @@
         android:importantForAccessibility="no"
         app:scaleType="fillStart"/>
 
-    <!-- Diagnostic overlay — shows pipeline state on screen (temporary) -->
+    <!-- Status overlay — shows VLM pipeline state -->
     <TextView
         android:id="@+id/diagnostic_overlay"
         android:layout_width="wrap_content"
@@ -43,31 +43,7 @@
         android:textSize="10sp"
         android:fontFamily="monospace"
         android:padding="6dp"
-        android:text="INIT..."
-        android:importantForAccessibility="no" />
-
-    <!-- Standard bounding box overlay for object detection.
-         clickable=false, focusable=false so touch events pass through
-         to the parent container's gesture listener. -->
-    <com.vyze.app.OverlayView
-        android:id="@+id/overlay"
-        android:layout_width="match_parent"
-        android:layout_height="match_parent"
-        android:clickable="false"
-        android:focusable="false"
-        android:contentDescription="@string/overlay_desc"
-        android:importantForAccessibility="no" />
-
-    <!-- High-contrast overlay for low-vision users.
-         clickable=false, focusable=false so touch events pass through
-         to the parent container's gesture listener. -->
-    <com.vyze.app.HighContrastOverlayView
-        android:id="@+id/high_contrast_overlay"
-        android:layout_width="match_parent"
-        android:layout_height="match_parent"
-        android:clickable="false"
-        android:focusable="false"
-        android:contentDescription="@string/high_contrast_overlay_desc"
+        android:text="Loading VLM..."
         android:importantForAccessibility="no" />
 
     <!-- Onboarding overlay — shown on first launch.  Semi-transparent dark
@@ -114,10 +90,5 @@
 
     </FrameLayout>
 
-    <!-- Bottom sheet with detection settings -->
-    <include
-        android:id="@+id/bottom_sheet_layout"
-        android:contentDescription="@string/bottom_sheet_desc"
-        layout="@layout/info_bottom_sheet" />
 
 </androidx.coordinatorlayout.widget.CoordinatorLayout>

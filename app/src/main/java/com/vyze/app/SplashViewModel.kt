@@ -3,51 +3,37 @@ package com.vyze.app
 import androidx.lifecycle.ViewModel
 
 /**
- * Minimal ViewModel that bridges the ML pipeline initialization state
- * between [MainActivity] (splash screen holder) and [CameraFragment]
- * (pipeline initializer).
+ * Minimal ViewModel that controls the splash screen duration.
  *
- * [isMlReady] starts as `false`.  Once the background thread in
- * CameraFragment finishes binding all ML models, it sets this flag to
- * `true` on the main thread.  The splash screen's
- * [setKeepOnScreenCondition] polls this flag every frame and dismisses
- * the splash as soon as it becomes `true`.
+ * Previously this held `isMlReady` to keep the splash visible while ML models
+ * loaded. Now LoadingFragment handles the full init pipeline, so the splash
+ * dismisses immediately — LoadingFragment is the real loading screen.
  *
- * The flag is intentionally a plain `@Volatile` Boolean rather than
- * `LiveData` because `setKeepOnScreenCondition` needs a synchronous,
- * non-observable check that runs on every choreographer frame.
+ * The flag is kept as `true` so [MainActivity]'s
+ * [setKeepOnScreenCondition] releases the splash instantly on launch.
  */
 class SplashViewModel : ViewModel() {
 
     companion object {
         /**
-         * Shared flag — `false` while ML models are still binding,
-         * `true` once [CameraFragment] has finished [MlPipelineManager.initialize].
-         *
-         * Written from the main thread (CameraFragment's post-init callback),
-         * read from the main thread (choreographer frame callback via
-         * `setKeepOnScreenCondition`).  `@Volatile` ensures the write is
-         * immediately visible across threads if the reads ever move off the
-         * main thread in the future.
+         * Shared flag — always `true` so the splash screen dismisses immediately.
+         * LoadingFragment is now responsible for showing the real loading state.
          */
         @Volatile
         @JvmStatic
-        var isMlReady: Boolean = false
+        var isMlReady: Boolean = true
             private set
 
-        /**
-         * Reset to `false` — call when the activity is recreated so the
-         * splash holds again for the new ML initialization cycle.
-         */
+        /** Reset to false — kept for API compatibility but no longer used. */
         @JvmStatic
         fun reset() {
-            isMlReady = false
+            isMlReady = true
         }
     }
 
     /**
-     * Called by [CameraFragment] on the main thread after
-     * [MlPipelineManager.initialize] completes and the camera is set up.
+     * Called by [CameraFragment] for API compatibility — now a no-op since
+     * the splash is already dismissed by LoadingFragment.
      */
     fun markMlReady() {
         isMlReady = true

@@ -7,21 +7,22 @@ import android.view.Display
 import androidx.camera.core.AspectRatio
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
-import androidx.camera.core.ImageAnalysis
-import androidx.camera.core.ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888
+import androidx.camera.core.ImageCapture
+import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
 import com.vyze.app.FlashlightManager
+import java.io.File
 import java.util.concurrent.ExecutorService
 
 /**
  * Handles all CameraX lifecycle and setup operations.
  *
- * Extracted from CameraFragment to keep camera setup isolated and testable.
- * Manages preview binding, image analysis setup, and torch/flashlight control.
+ * Manages preview binding and ImageCapture for snapshot-mode VLM inference.
+ * The VLM runs on-demand (triggered by tap/volume key), not continuously.
  */
 class CameraSetupDelegate {
 
@@ -29,7 +30,7 @@ class CameraSetupDelegate {
 
     var preview: Preview? = null
         private set
-    var imageAnalyzer: ImageAnalysis? = null
+    var imageCapture: ImageCapture? = null
         private set
     var camera: Camera? = null
         private set
@@ -40,30 +41,20 @@ class CameraSetupDelegate {
 
     /**
      * Initializes the camera provider and binds use cases.
-     *
-     * @param context       Application context.
-     * @param lifecycleOwner The fragment/activity lifecycle owner.
-     * @param previewView   The PreviewView for camera preview.
-     * @param backgroundExecutor Executor for image analysis.
-     * @param analyzer      The composite ImageAnalysis.Analyzer.
-     * @param flashlightManager FlashlightManager to control torch.
      */
     @SuppressLint("UnsafeOptInUsageError")
     fun setupCamera(
         context: Context,
         lifecycleOwner: LifecycleOwner,
         previewView: PreviewView,
-        backgroundExecutor: ExecutorService,
-        analyzer: ImageAnalysis.Analyzer,
         flashlightMgr: FlashlightManager
     ) {
         this.flashlightManager = flashlightMgr
 
-
         val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
         cameraProviderFuture.addListener({
             cameraProvider = cameraProviderFuture.get()
-            bindUseCases(context, lifecycleOwner, previewView, backgroundExecutor, analyzer)
+            bindUseCases(context, lifecycleOwner, previewView)
         }, ContextCompat.getMainExecutor(context))
     }
 
@@ -74,21 +65,17 @@ class CameraSetupDelegate {
     fun rebindCamera(
         context: Context,
         lifecycleOwner: LifecycleOwner,
-        previewView: PreviewView,
-        backgroundExecutor: ExecutorService,
-        analyzer: ImageAnalysis.Analyzer
+        previewView: PreviewView
     ) {
         if (cameraProvider == null) return
-        bindUseCases(context, lifecycleOwner, previewView, backgroundExecutor, analyzer)
+        bindUseCases(context, lifecycleOwner, previewView)
     }
 
     @SuppressLint("UnsafeOptInUsageError")
     private fun bindUseCases(
         context: Context,
         lifecycleOwner: LifecycleOwner,
-        previewView: PreviewView,
-        backgroundExecutor: ExecutorService,
-        analyzer: ImageAnalysis.Analyzer
+        previewView: PreviewView
     ) {
         val provider = cameraProvider ?: throw IllegalStateException("Camera initialization failed.")
         val cameraSelector = CameraSelector.Builder()
@@ -100,17 +87,15 @@ class CameraSetupDelegate {
             .setTargetRotation(previewView.display.rotation)
             .build()
 
-        imageAnalyzer = ImageAnalysis.Builder()
+        imageCapture = ImageCapture.Builder()
             .setTargetAspectRatio(AspectRatio.RATIO_4_3)
             .setTargetRotation(previewView.display.rotation)
-            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-            .setOutputImageFormat(OUTPUT_IMAGE_FORMAT_RGBA_8888)
+            .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
             .build()
-            .also { it.setAnalyzer(backgroundExecutor, analyzer) }
 
         provider.unbindAll()
         try {
-            camera = provider.bindToLifecycle(lifecycleOwner, cameraSelector, preview, imageAnalyzer)
+            camera = provider.bindToLifecycle(lifecycleOwner, cameraSelector, preview, imageCapture)
             flashlightManager.camera = camera
             preview?.setSurfaceProvider(previewView.surfaceProvider)
         } catch (exc: Exception) {
@@ -119,10 +104,66 @@ class CameraSetupDelegate {
     }
 
     /**
-     * Updates the target rotation for the image analyzer.
+     * Take a snapshot and return the bitmap via callback.
+     * Used for on-demand VLM inference.
+     *
+     * @param onBitmap Callback with the captured bitmap (always on main thread).
+     * @param onError  Callback with the error (always on main thread).
+     */
+    fun takeSnapshot(
+        onBitmap: (android.graphics.Bitmap) -> Unit,
+        onError: (String) -> Unit
+    ) {
+        val capture = imageCapture
+        if (capture == null) {
+            onError("ImageCapture not initialized")
+            return
+        }
+
+        val tempFile = File.createTempFile("vyze_snapshot", ".jpg", context?.cacheDir)
+
+        val outputOptions = ImageCapture.OutputFileOptions.Builder(tempFile).build()
+
+        capture.takePicture(
+            outputOptions,
+            ContextCompat.getMainExecutor(context!!),
+            object : ImageCapture.OnImageSavedCallback {
+                override fun onImageSaved(output: ImageCapture.OutputFileResults) {
+                    try {
+                        val bitmap = android.graphics.BitmapFactory.decodeFile(tempFile.absolutePath)
+                        tempFile.delete()
+                        if (bitmap != null) {
+                            onBitmap(bitmap)
+                        } else {
+                            onError("Failed to decode snapshot")
+                        }
+                    } catch (e: Exception) {
+                        tempFile.delete()
+                        onError("Snapshot decode failed: ${e.message}")
+                    }
+                }
+
+                override fun onError(exception: ImageCaptureException) {
+                    tempFile.delete()
+                    onError("Snapshot capture failed: ${exception.message}")
+                }
+            }
+        )
+    }
+
+    /** Reference to the application context for temp file creation. */
+    private var context: Context? = null
+
+    /** Set context for snapshot file creation. */
+    fun setContext(context: Context) {
+        this.context = context.applicationContext
+    }
+
+    /**
+     * Updates the target rotation for the image capture.
      */
     fun updateRotation(display: Display) {
-        imageAnalyzer?.targetRotation = display.rotation
+        imageCapture?.targetRotation = display.rotation
     }
 
     /**
@@ -140,5 +181,6 @@ class CameraSetupDelegate {
     fun destroy() {
         releaseCamera()
         cameraProvider = null
+        context = null
     }
 }

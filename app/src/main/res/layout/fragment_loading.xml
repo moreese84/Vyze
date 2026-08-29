@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:id="@+id/loading_container"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#F5F6F7"
+    android:contentDescription="Vyze loading screen">
+
+    <LinearLayout
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:orientation="vertical"
+        android:gravity="center_horizontal"
+        android:padding="32dp">
+
+        <!-- Full Vyze wordmark logo — uses the adaptive icon foreground which
+             contains the complete v+y+z+e wordmark with red and yellow dots,
+             properly scaled via nested transform groups. -->
+        <ImageView
+            android:id="@+id/logo_image"
+            android:layout_width="200dp"
+            android:layout_height="200dp"
+            android:src="@drawable/ic_launcher_foreground"
+            android:scaleType="fitCenter"
+            android:contentDescription="@string/app_name"
+            android:importantForAccessibility="yes" />
+
+        <!-- Progress bar with percentage -->
+        <FrameLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="48dp"
+            android:clipChildren="false">
+
+            <ProgressBar
+                android:id="@+id/progress_bar"
+                style="@android:style/Widget.ProgressBar.Horizontal"
+                android:layout_width="match_parent"
+                android:layout_height="8dp"
+                android:layout_gravity="center_vertical"
+                android:max="100"
+                android:progress="0"
+                tools:progress="45" />
+
+            <TextView
+                android:id="@+id/progress_text"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="end|top"
+                android:layout_marginTop="-2dp"
+                android:text="0%"
+                android:textColor="#007F8B"
+                android:textSize="12sp"
+                android:fontFamily="monospace"
+                tools:text="45%" />
+        </FrameLayout>
+
+        <!-- Status text -->
+        <TextView
+            android:id="@+id/status_text"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:text="Preparing Vyze..."
+            android:textColor="#666666"
+            android:textSize="14sp"
+            android:gravity="center"
+            android:importantForAccessibility="yes"
+            tools:text="Copying SmolVLM2 model..." />
+
+        <!-- Error state: Retry button -->
+        <Button
+            android:id="@+id/retry_button"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="32dp"
+            android:text="Retry"
+            android:textAllCaps="false"
+            android:textColor="#FFFFFF"
+            android:background="#ce2028"
+            android:visibility="gone"
+            android:importantForAccessibility="yes" />
+
+        <!-- ADB push hint -->
+        <TextView
+            android:id="@+id/hint_text"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:textColor="#999999"
+            android:textSize="11sp"
+            android:gravity="center"
+            android:fontFamily="monospace"
+            android:visibility="gone"
+            tools:text="adb push SmolVLM2-500M.litertlm /sdcard/Download/" />
+
+    </LinearLayout>
+
+</FrameLayout>
