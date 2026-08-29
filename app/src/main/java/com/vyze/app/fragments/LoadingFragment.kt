@@ -199,7 +199,8 @@ class LoadingFragment : Fragment() {
             coreController = VyzeCoreController(
                 context = requireContext().applicationContext,
                 ttsManager = app.ttsManager,
-                memoryDao = app.memoryDao
+                memoryDao = app.memoryDao,
+                interactionDao = app.interactionDao
             )
 
             // Store immediately so CameraFragment can reuse if it ever gets there

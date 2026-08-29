@@ -2,6 +2,7 @@ package com.vyze.app
 
 import android.util.Log
 import com.vyze.app.data.MemoryDao
+import com.vyze.app.memory.SimilarInteraction
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -38,11 +39,13 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
      *                             (e.g., "single tap at position (500, 300)")
      * @param queryOverride        Optional user query override
      *                             (e.g., "Where is the nearest door?")
+     * @param similarInteractions  Visually similar past interactions for contextual reference
      * @return The complete prompt string ready for VLM inference.
      */
     suspend fun buildPrompt(
         snapshotDescription: String = "",
-        queryOverride: String? = null
+        queryOverride: String? = null,
+        similarInteractions: List<SimilarInteraction> = emptyList()
     ): String = withContext(Dispatchers.IO) {
         try {
             val sb = StringBuilder()
@@ -57,20 +60,25 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
                 sb.appendLine(formatPreferencesSection(preferences))
             }
 
-            // 3. Room memory — recent scenes + known local items
+            // 3. Similar past interactions — adaptive intelligence context
+            if (similarInteractions.isNotEmpty()) {
+                sb.appendLine(formatSimilarInteractionsSection(similarInteractions))
+            }
+
+            // 4. Room memory — recent scenes + known local items
             val envMemories = memoryDao.getRecentEnvironment(limit = 5)
             if (envMemories.isNotEmpty()) {
                 sb.appendLine(formatRoomMemorySection(envMemories))
             }
 
-            // 4. Snapshot trigger context
+            // 5. Snapshot trigger context
             if (snapshotDescription.isNotBlank()) {
                 sb.appendLine("--- SNAPSHOT ---")
                 sb.appendLine(snapshotDescription)
                 sb.appendLine()
             }
 
-            // 5. User query or default navigation task
+            // 6. User query or default navigation task
             sb.appendLine("--- TASK ---")
             sb.appendLine(queryOverride ?: DEFAULT_NAVIGATION_QUERY)
             sb.appendLine()
@@ -78,7 +86,7 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
 
             val prompt = sb.toString()
             Log.d(TAG, "Built prompt: ${prompt.length} chars, " +
-                "${preferences.size} prefs, ${envMemories.size} env memories")
+                "${preferences.size} prefs, ${similarInteractions.size} similar, ${envMemories.size} env memories")
             prompt
 
         } catch (e: Exception) {
@@ -147,6 +155,42 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
     }
 
     // ── Section Formatters ─────────────────────────────────────────
+
+    /**
+     * Format similar past interactions into a structured section.
+     * Provides the model with context from visually similar past frames
+     * to enable spatial continuity and personalized responses.
+     */
+    private fun formatSimilarInteractionsSection(
+        similarInteractions: List<SimilarInteraction>
+    ): String {
+        val sb = StringBuilder()
+        sb.appendLine("--- SIMILAR PAST INTERACTIONS ---")
+        sb.appendLine("These are visually similar scenes from this user's history:")
+        sb.appendLine()
+
+        for ((index, similar) in similarInteractions.withIndex()) {
+            val record = similar.record
+            val score = String.format("%.2f", similar.similarityScore)
+            val timeAgo = formatTimestamp(record.timestamp)
+
+            sb.appendLine("[${index + 1}] (similarity: $score, $timeAgo)")
+            sb.appendLine("  Previous query: ${record.prompt.take(100)}")
+            sb.appendLine("  Previous output: ${record.output.take(200)}")
+            if (record.feedback.isNotBlank()) {
+                sb.appendLine("  User feedback: ${record.feedback.take(100)}")
+            }
+            sb.appendLine()
+        }
+
+        sb.appendLine("Use this history to:")
+        sb.appendLine("- Provide spatial continuity (what changed or remained the same)")
+        sb.appendLine("- Reference known objects from past observations")
+        sb.appendLine("- Avoid repeating information already given")
+        sb.appendLine("- Learn from any user feedback to improve this response")
+        sb.appendLine()
+        return sb.toString()
+    }
 
     /**
      * Format user preferences into a structured section.

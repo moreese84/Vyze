@@ -20,9 +20,9 @@
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:contentDescription="@string/camera_container_desc"
-    android:importantForAccessibility="yes">
+    android:importantForAccessibility="no">
 
-    <!-- Camera preview feed -->
+    <!-- Camera preview feed — full screen, no tint -->
     <androidx.camera.view.PreviewView
         android:id="@+id/view_finder"
         android:layout_width="match_parent"
@@ -31,64 +31,32 @@
         android:importantForAccessibility="no"
         app:scaleType="fillStart"/>
 
-    <!-- Status overlay — shows VLM pipeline state -->
-    <TextView
-        android:id="@+id/diagnostic_overlay"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_gravity="top|start"
-        android:layout_margin="4dp"
-        android:background="#CC000000"
-        android:textColor="#FF00FF00"
-        android:textSize="10sp"
-        android:fontFamily="monospace"
-        android:padding="6dp"
-        android:text="Loading VLM..."
-        android:importantForAccessibility="no" />
-
-    <!-- Onboarding overlay — shown on first launch.  Semi-transparent dark
-         background dims the camera feed while the welcome TTS plays.
-         Tap anywhere to dismiss and begin using the app. -->
+    <!-- Minimal floating status bar — bottom center -->
     <FrameLayout
-        android:id="@+id/onboarding_overlay"
+        android:id="@+id/status_bar_container"
         android:layout_width="match_parent"
-        android:layout_height="match_parent"
-        android:background="#CC000000"
-        android:clickable="true"
-        android:focusable="true"
-        android:visibility="gone"
-        android:contentDescription="@string/onboarding_overlay_desc">
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom"
+        android:padding="12dp"
+        android:importantForAccessibility="no">
 
-        <LinearLayout
+        <TextView
+            android:id="@+id/status_text"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_gravity="center"
-            android:orientation="vertical"
+            android:layout_gravity="center_horizontal"
+            android:background="#AA000000"
+            android:textColor="#FFFFFF"
+            android:textSize="14sp"
+            android:fontFamily="sans-serif-medium"
+            android:paddingHorizontal="16dp"
+            android:paddingVertical="8dp"
+            android:maxLines="2"
+            android:ellipsize="end"
             android:gravity="center"
-            android:padding="32dp">
-
-            <TextView
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="@string/app_name"
-                android:textColor="#FFFFFF"
-                android:textSize="28sp"
-                android:textStyle="bold"
-                android:layout_marginBottom="16dp"
-                android:importantForAccessibility="no" />
-
-            <TextView
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="@string/onboarding_tap_to_begin"
-                android:textColor="#B0FFFFFF"
-                android:textSize="16sp"
-                android:gravity="center"
-                android:importantForAccessibility="yes" />
-
-        </LinearLayout>
+            android:text="Initializing..."
+            android:importantForAccessibility="yes" />
 
     </FrameLayout>
-
 
 </androidx.coordinatorlayout.widget.CoordinatorLayout>

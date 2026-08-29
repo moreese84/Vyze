@@ -3,6 +3,7 @@ package com.vyze.app
 import android.app.Application
 import android.util.Log
 import com.vyze.app.data.ErrorLogRepository
+import com.vyze.app.data.InteractionDao
 import com.vyze.app.data.MemoryDao
 import com.vyze.app.data.ScanRepository
 import com.vyze.app.data.VyzeDatabase
@@ -46,6 +47,11 @@ class VyzeApplication : Application() {
     /** Memory DAO for adaptive personal intelligence. */
     val memoryDao: MemoryDao by lazy {
         database.memoryDao()
+    }
+
+    /** DAO for interaction records (image embeddings + past conversations). */
+    val interactionDao: InteractionDao by lazy {
+        database.interactionDao()
     }
 
     /**

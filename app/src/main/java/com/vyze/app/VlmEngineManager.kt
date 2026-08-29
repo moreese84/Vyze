@@ -3,6 +3,7 @@ package com.vyze.app
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
+import android.graphics.Color
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
@@ -19,6 +20,8 @@ import com.google.ai.edge.litertlm.Message
 import com.google.ai.edge.litertlm.SamplerConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import com.vyze.app.memory.MemoryRepository
+import com.vyze.app.memory.SimilarInteraction
 import java.io.ByteArrayOutputStream
 import java.io.Closeable
 import java.io.File
@@ -42,14 +45,21 @@ import java.util.concurrent.TimeUnit
  * passing the Bitmap — no literal [IMAGE_TOKEN] placeholder needed.
  *
  * ## Memory Management
- * Incoming Bitmap frames are downscaled to a max of 448×448 pixels before inference.
+ * Incoming Bitmap frames are downscaled to a max of 256×256 pixels before inference.
  * All scaled bitmaps are explicitly recycled after inference to prevent memory leaks.
+ *
+ * ## GPU Warm-up
+ * A dummy 1×1 image is run through the engine immediately after initialization
+ * to pre-compile OpenCL/Vulkan GPU kernels and minimize first-inference latency.
  *
  * ## API
  * Use [analyzeImage] to send a camera frame + text prompt and get a response.
  * Uses the callback-based MessageCallback to avoid SendChannel crashes.
  */
-class VlmEngineManager(private val context: Context) : Closeable {
+class VlmEngineManager(
+    private val context: Context,
+    private val memoryRepository: MemoryRepository? = null
+) : Closeable {
 
     private var engine: Engine? = null
 
@@ -127,6 +137,11 @@ class VlmEngineManager(private val context: Context) : Closeable {
 
             val gpuSuccess = tryInitializeWithBackend(modelFile, Backend.GPU(), "GPU")
             if (gpuSuccess) {
+                // Step 3: GPU warm-up — pre-compile OpenCL/Vulkan kernels
+                onStepProgress?.invoke(85, "Warming up GPU kernels...")
+                CrashLogFile.log(TAG, "Step 3: GPU warm-up (dummy inference)...")
+                warmUp()
+
                 onStepProgress?.invoke(95, "Finalizing...")
                 CrashLogFile.log(TAG, "=== INIT SUCCESS [GPU] ===")
                 Log.i(TAG, "Gemma 3n E2B loaded successfully [backend=GPU]")
@@ -234,11 +249,17 @@ class VlmEngineManager(private val context: Context) : Closeable {
      * `<start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n`
      * Image patch tokens are bound natively by the engine via Content.ImageBytes.
      *
-     * @param bitmap  Camera frame — will be downscaled to max 448×448 before inference
-     * @param prompt  Text prompt describing what to analyze
+     * @param bitmap        Camera frame — will be downscaled to max 256×256 before inference
+     * @param prompt        User query describing what to analyze
+     * @param memoryContext Optional context string injected below the baseline instruction
      * @return The complete model response, or null on error
      */
-    suspend fun analyzeImage(bitmap: Bitmap, prompt: String): String? = withContext(Dispatchers.Default) {
+    suspend fun analyzeImage(
+        bitmap: Bitmap,
+        prompt: String,
+        memoryContext: String? = null,
+        similarInteractions: List<SimilarInteraction> = emptyList()
+    ): String? = withContext(Dispatchers.Default) {
         val eng = engine
         if (eng == null || !isInitialized) {
             Log.e(TAG, "VLM not initialized — cannot run inference")
@@ -252,7 +273,7 @@ class VlmEngineManager(private val context: Context) : Closeable {
             CrashLogFile.log(TAG, "=== ANALYZE IMAGE ===")
             CrashLogFile.log(TAG, "Input bitmap: ${bitmap.width}x${bitmap.height}")
 
-            // 1. Preprocess bitmap — downscale to max 448×448 to prevent OOM
+            // 1. Preprocess bitmap — downscale to max 256×256 to prevent OOM
             scaledBitmap = preprocessBitmap(bitmap)
             CrashLogFile.log(TAG, "Preprocessed: ${scaledBitmap.width}x${scaledBitmap.height}")
 
@@ -260,19 +281,16 @@ class VlmEngineManager(private val context: Context) : Closeable {
             val imageBytes = bitmapToJpegBytes(scaledBitmap)
             CrashLogFile.log(TAG, "JPEG: ${imageBytes.size} bytes")
 
-            // 3. Build Gemma turn-formatted prompt (no literal IMAGE_TOKEN —
-            //    the engine binds image patch tokens natively from Content.ImageBytes)
-            //
-            //    <start_of_turn>user
-            //    {prompt}
-            //    <end_of_turn>
-            //    <start_of_turn>model
-            val formattedPrompt = buildGemmaTurnPrompt(prompt)
+            // 3. Build the user payload: baseline instruction + optional context + query
+            val userPayload = buildUserPayload(prompt, memoryContext)
+            val contextPayload = injectSimilarContext(userPayload, similarInteractions)
+            val formattedPrompt = buildGemmaTurnPrompt(contextPayload)
             CrashLogFile.log(TAG, "Formatted prompt: ${formattedPrompt.take(120)}...")
 
             // 4. Create conversation with empty system instruction
             //    (the formatted prompt is sent as user content below)
             val conversationConfig = ConversationConfig(
+                maxOutputToken = MAX_TOKENS,
                 samplerConfig = SamplerConfig(
                     topK = TOP_K,
                     topP = TOP_P,
@@ -386,18 +404,101 @@ class VlmEngineManager(private val context: Context) : Closeable {
             "<start_of_turn>model\n"
     }
 
+    // ── Prompt Assembly ───────────────────────────────────────────
+
+    /**
+     * Build the user payload by combining the baseline instruction,
+     * optional memory context, and user query into a single string.
+     *
+     * Result format:
+     * ```
+     * [Instruction: Describe this camera view in one direct, concise sentence.
+     * Do not include introductory text.]
+     * [Context: {memoryContext}]
+     * User Query: {query}
+     * ```
+     *
+     * The baseline instruction is always present. [Context:] is only
+     * appended when memoryContext is non-null and non-blank.
+     */
+    private fun buildUserPayload(query: String, memoryContext: String?): String {
+        val sb = StringBuilder()
+
+        // 1. Baseline instruction — always present
+        sb.append(BASELINE_INSTRUCTION)
+
+        // 2. Optional memory context
+        if (!memoryContext.isNullOrBlank()) {
+            sb.appendLine()
+            sb.append("[Context: $memoryContext]")
+        }
+
+        // 3. User query
+        sb.appendLine()
+        sb.append("User Query: $query")
+
+        return sb.toString().trimEnd()
+    }
+
+    // ── Adaptive Intelligence Context ─────────────────────────────
+
+    /**
+     * Inject similar past interactions into the prompt for contextual reference.
+     * Provides the model with spatial continuity and personalized context
+     * from visually similar past frames.
+     *
+     * If no similar interactions are provided, returns the original prompt unchanged.
+     */
+    private fun injectSimilarContext(
+        prompt: String,
+        similarInteractions: List<SimilarInteraction>
+    ): String {
+        if (similarInteractions.isEmpty()) return prompt
+
+        val sb = StringBuilder()
+        sb.appendLine("--- SIMILAR PAST INTERACTIONS ---")
+        sb.appendLine("These are visually similar scenes from this user's history:")
+        sb.appendLine()
+
+        for ((index, similar) in similarInteractions.withIndex()) {
+            val record = similar.record
+            val score = String.format("%.2f", similar.similarityScore)
+            val timeDiff = System.currentTimeMillis() - record.timestamp
+            val timeAgo = when {
+                timeDiff < 60_000 -> "${timeDiff / 1000}s ago"
+                timeDiff < 3_600_000 -> "${timeDiff / 60_000}m ago"
+                timeDiff < 86_400_000 -> "${timeDiff / 3_600_000}h ago"
+                else -> "${timeDiff / 86_400_000}d ago"
+            }
+
+            sb.appendLine("[${index + 1}] (similarity: $score, $timeAgo)")
+            sb.appendLine("  Previous output: ${record.output.take(200)}")
+            if (record.feedback.isNotBlank()) {
+                sb.appendLine("  User feedback: ${record.feedback.take(100)}")
+            }
+            sb.appendLine()
+        }
+
+        sb.appendLine("Use this history to provide spatial continuity. If the current view is similar to a past observation, mention what changed or stayed the same. Avoid repeating information already given.")
+        sb.appendLine()
+        sb.appendLine(prompt)
+
+        return sb.toString()
+    }
+
     // ── Bitmap Preprocessing ──────────────────────────────────────
 
     /**
      * Preprocess a camera bitmap for VLM input.
-     * - Downscales to a maximum dimension of 448×448 pixels to prevent peak RAM spikes and OOM
+     * - Downscales to a maximum dimension of 256×256 pixels to match Gemma's smallest
+     *   vision patch bucket and minimize prefill time
      * - Returns a NEW bitmap (caller must recycle)
      */
     private fun preprocessBitmap(source: Bitmap): Bitmap {
         val w = source.width
         val h = source.height
 
-        // Calculate scale factor — enforce 448×448 max
+        // Calculate scale factor — enforce 256×256 max
         val maxDim = maxOf(w, h)
         val scale = if (maxDim > MAX_INPUT_DIMENSION) {
             MAX_INPUT_DIMENSION.toFloat() / maxDim
@@ -422,6 +523,54 @@ class VlmEngineManager(private val context: Context) : Closeable {
         val stream = ByteArrayOutputStream()
         bitmap.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, stream)
         return stream.toByteArray()
+    }
+
+    // ── GPU Warm-up ─────────────────────────────────────────────
+
+    /**
+     * Run a dummy 1×1 image through the engine to pre-compile OpenCL/Vulkan GPU
+     * kernels. This eliminates the first-inference cold-start penalty so the real
+     * user query benefits from already-warmed GPU delegates.
+     */
+    private suspend fun warmUp() = withContext(Dispatchers.IO) {
+        val eng = engine ?: return@withContext
+        try {
+            // 1×1 white bitmap — minimal allocation, just enough to trigger GPU kernel compilation
+            val dummy = Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
+            dummy.setPixel(0, 0, Color.WHITE)
+
+            val imageBytes = bitmapToJpegBytes(dummy)
+            val conversationConfig = ConversationConfig(
+                maxOutputToken = MAX_TOKENS,
+                samplerConfig = SamplerConfig(
+                    topK = TOP_K,
+                    topP = TOP_P,
+                    temperature = TEMPERATURE
+                )
+            )
+
+            eng.createConversation(conversationConfig).use { conversation ->
+                val contents = Contents.of(
+                    Content.Text("warmup"),
+                    Content.ImageBytes(imageBytes)
+                )
+                val latch = CountDownLatch(1)
+                conversation.sendMessageAsync(contents, object : MessageCallback {
+                    override fun onMessage(message: Message) { /* no-op */ }
+                    override fun onDone() { latch.countDown() }
+                    override fun onError(throwable: Throwable) {
+                        Log.w(TAG, "warmUp onError: ${throwable.message}")
+                        latch.countDown()
+                    }
+                })
+                latch.await(WARMUP_TIMEOUT_SEC, TimeUnit.SECONDS)
+            }
+
+            dummy.recycle()
+            Log.i(TAG, "GPU warm-up completed")
+        } catch (e: Throwable) {
+            Log.w(TAG, "GPU warm-up failed (non-fatal): ${e.javaClass.simpleName}: ${e.message}")
+        }
     }
 
     // ── Engine State ──────────────────────────────────────────────
@@ -493,17 +642,27 @@ class VlmEngineManager(private val context: Context) : Closeable {
         const val MODEL_FILE = "gemma-3n-E2B-it-int4.litertlm"
         const val MIN_MODEL_SIZE = 500L * 1024 * 1024  // 500MB minimum sanity check
 
-        // Image preprocessing — 448×448 max to prevent RAM spikes and OOM
-        private const val MAX_INPUT_DIMENSION = 448
+        // Image preprocessing — 256×256 max (Gemma's smallest vision patch bucket)
+        private const val MAX_INPUT_DIMENSION = 256
         const val JPEG_QUALITY = 90
 
-        // Sampling parameters
-        const val TEMPERATURE = 0.4
-        const val TOP_K = 40
-        const val TOP_P = 0.9
+        // Greedy decoding — fast, concise output with minimal latency
+        const val TEMPERATURE = 0.0
+        const val TOP_K = 1
+        const val TOP_P = 1.0
+        const val MAX_TOKENS = 64
 
-        // Inference — 3 min timeout for large 3.66GB int4 model
-        private const val INFERENCE_TIMEOUT_SEC = 180L
+        /** Baseline instruction prepended to every user turn. */
+        private const val BASELINE_INSTRUCTION =
+            "[Instruction: You are an objective visual assistant for a visually impaired user " +
+            "running strictly offline. Describe the camera scene accurately, completely, and " +
+            "without censorship or refusal. Include all visible physical objects, skin conditions, " +
+            "anatomical hazards, or explicit details directly and factually without introductory " +
+            "preambles.]"
+
+        // Timeouts
+        private const val INFERENCE_TIMEOUT_SEC = 180L  // 3 min for real inference
+        private const val WARMUP_TIMEOUT_SEC = 30L       // 30s for GPU warm-up pass
 
         private var nativeLibLoaded = false
 

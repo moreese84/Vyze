@@ -5,7 +5,9 @@ import android.graphics.Bitmap
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import com.vyze.app.data.InteractionDao
 import com.vyze.app.data.MemoryDao
+import com.vyze.app.memory.MemoryRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -29,7 +31,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 class VyzeCoreController(
     private val context: Context,
     private val ttsManager: TTSManager,
-    private val memoryDao: MemoryDao
+    private val memoryDao: MemoryDao,
+    interactionDao: InteractionDao
 ) {
 
     private val TAG = "VyzeCoreController"
@@ -37,7 +40,12 @@ class VyzeCoreController(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    private val vlmEngine = VlmEngineManager(context)
+    /** Track the current inference Job so it can be cancelled on barge-in. */
+    @Volatile
+    private var inferenceJob: kotlinx.coroutines.Job? = null
+
+    private val memoryRepository = MemoryRepository(interactionDao)
+    private val vlmEngine = VlmEngineManager(context, memoryRepository)
     private val promptBuilder = DynamicPromptBuilder(memoryDao)
 
     /** Gate to prevent overlapping inferences. */
@@ -46,6 +54,22 @@ class VyzeCoreController(
     /** Whether the VLM engine has been initialized. */
     @Volatile
     private var engineReady = false
+
+    // ── Debounce Cache ────────────────────────────────────────────
+    // Prevents re-announcing the same object within a short window.
+    // Solves the "Sandals → Stairs repeat" issue where stale results
+    // are processed after TTS finishes.
+
+    /** Last description spoken to the user (lowercase, trimmed). */
+    @Volatile
+    private var lastDescribedObject: String = ""
+
+    /** Timestamp (ms) when [lastDescribedObject] was last spoken. */
+    @Volatile
+    private var lastDescribedTime: Long = 0L
+
+    /** Minimum gap between identical descriptions. */
+    private val DEBOUNCE_GAP_MS = 4000L  // 4 seconds
 
     /** Callback for diagnostic/status updates to the UI. */
     var onStatusUpdate: ((String) -> Unit)? = null
@@ -72,6 +96,26 @@ class VyzeCoreController(
                 onProgressUpdate?.invoke(percent, msg)
                 onStatusUpdate?.invoke(msg)
             }
+            // Announce download start on first progress callback
+            // Use speakQueued (not speakImmediate) to preserve buffer contents
+            if (copied < total / 20) {
+                mainHandler.post {
+                    try {
+                        ttsManager.speakQueued(
+                            "Please wait, model assets are downloading. " +
+                            "This may take several minutes on first launch."
+                        )
+                    } catch (_: Throwable) {}
+                }
+            }
+            // Announce at ~50% milestone
+            if (total > 0 && copied in (total / 2 - 10_000_000)..(total / 2 + 10_000_000)) {
+                mainHandler.post {
+                    try {
+                        ttsManager.speakQueued("Download is halfway complete.")
+                    } catch (_: Throwable) {}
+                }
+            }
         }
 
         vlmEngine.onStepProgress = { percent, step ->
@@ -81,24 +125,19 @@ class VyzeCoreController(
         vlmEngine.onError = { error ->
             isInferring.set(false)
             mainHandler.post {
-                try { ttsManager.speakImmediate("Sorry, $error") } catch (_: Exception) {}
+                // TTS error feedback is handled by CameraFragment to avoid duplication
                 onStatusUpdate?.invoke("Error: $error")
                 onError?.invoke(error)
             }
         }
 
-        // Collect tokens into buffer — do NOT call TTS per-token.
-        // Speaking is done once at the end with the complete response.
+        // Collect tokens into buffer ONLY — do NOT call TTS per-token.
+        // Do NOT expose partial tokens to external callbacks.
+        // Speaking is done once at the end via CameraFragment.speakThenCallback().
         vlmEngine.onTokenGenerated = { token ->
             try {
+                // Accumulate silently — no external callback, no TTS leak
                 pendingResponse.append(token)
-                // Update UI overlay with live token count (non-intrusive)
-                val count = pendingResponse.length
-                if (count % 50 == 0) {
-                    mainHandler.post {
-                        onStatusUpdate?.invoke("Generating... ($count chars)")
-                    }
-                }
             } catch (e: Throwable) {
                 Log.e(TAG, "onTokenGenerated error: ${e.javaClass.simpleName}: ${e.message}")
             }
@@ -109,19 +148,9 @@ class VyzeCoreController(
                 CrashLogFile.log(TAG, "onComplete fired: ${fullResponse.length} chars")
                 pendingResponse.clear()
 
-                // Speak the COMPLETE response in one go
-                if (fullResponse.isNotBlank()) {
-                    CrashLogFile.log(TAG, "Posting TTS speak (${fullResponse.length} chars)")
-                    mainHandler.post {
-                        try {
-                            CrashLogFile.log(TAG, "Calling TTS speakImmediate")
-                            ttsManager.speakImmediate(fullResponse)
-                            CrashLogFile.log(TAG, "TTS speakImmediate returned")
-                        } catch (e: Throwable) {
-                            CrashLogFile.logError(TAG, "TTS speak error: ${e.javaClass.simpleName}: ${e.message}", e)
-                        }
-                    }
-                }
+                // NOTE: TTS is NOT spoken here. CameraFragment.onInferenceComplete
+                // handles speaking via speakThenCallback() to ensure single-output
+                // execution and prevent double-speaking.
 
                 // Store observation in memory (best-effort)
                 scope.launch {
@@ -150,6 +179,14 @@ class VyzeCoreController(
             }
         }
 
+        // Queue download announcement IMMEDIATELY — before any async work starts.
+        // This guarantees the message is in the TTS buffer even if the model file
+        // already exists (no copy → onModelCopyProgress never fires).
+        ttsManager.speakQueued(
+            "Please wait, model assets are downloading. " +
+            "This may take several minutes on first launch."
+        )
+
         // Launch init on background thread
         scope.launch {
             try {
@@ -159,15 +196,28 @@ class VyzeCoreController(
                 if (engineReady) {
                     Log.i(TAG, "VLM ready [${vlmEngine.getActiveBackend()}]")
                     onStatusUpdate("VLM ready [${vlmEngine.getActiveBackend()}]")
+                    // TTS onboarding is handled by CameraFragment when it receives "VLM ready"
                 } else {
                     Log.e(TAG, "VLM engine failed to initialize")
+                    mainHandler.post {
+                        try {
+                            ttsManager.speakImmediate(
+                                "Model download failed. Please check your internet connection."
+                            )
+                        } catch (_: Throwable) {}
+                        onStatusUpdate?.invoke("Error: Model failed to load")
+                    }
                 }
             } catch (e: Throwable) {
                 val errorMsg = "VLM init crashed: ${e.javaClass.simpleName}: ${e.message}"
                 Log.e(TAG, errorMsg, e)
                 engineReady = false
                 mainHandler.post {
-                    try { ttsManager.speakImmediate("AI model failed to load.") } catch (_: Exception) {}
+                    try {
+                        ttsManager.speakImmediate(
+                            "Model load failed. ${e.message ?: "Unknown error."}"
+                        )
+                    } catch (_: Throwable) {}
                     onStatusUpdate?.invoke("Error: $errorMsg")
                 }
             }
@@ -193,31 +243,60 @@ class VyzeCoreController(
 
         onStatusUpdate("Analyzing snapshot...")
 
-        scope.launch {
+        inferenceJob = scope.launch {
             try {
                 CrashLogFile.log(TAG, "=== TRIGGER SNAPSHOT ===")
                 CrashLogFile.log(TAG, "Bitmap: ${bitmap.width}x${bitmap.height}")
 
-                // 1. Build prompt
+                // 1. Find visually similar past interactions (runs on IO thread)
+                CrashLogFile.log(TAG, "Querying similar interactions...")
+                val similarInteractions = memoryRepository.findSimilar(
+                    bitmap = bitmap,
+                    topK = 5,
+                    minSim = 0.3f
+                )
+                CrashLogFile.log(TAG, "Found ${similarInteractions.size} similar interactions")
+
+                // 2. Build prompt with similar interaction context
                 CrashLogFile.log(TAG, "Building prompt...")
                 val prompt = promptBuilder.buildPrompt(
                     snapshotDescription = query ?: "User triggered a camera snapshot.",
-                    queryOverride = query
+                    queryOverride = query,
+                    similarInteractions = similarInteractions
                 )
                 CrashLogFile.log(TAG, "Prompt built: ${prompt.length} chars")
 
-                // 2. Run VLM inference (VlmEngineManager handles bitmap preprocessing)
+                // 3. Run VLM inference (VlmEngineManager handles bitmap preprocessing)
                 pendingResponse.clear()
                 CrashLogFile.log(TAG, "Calling vlmEngine.analyzeImage()...")
 
-                val response = vlmEngine.analyzeImage(bitmap, prompt)
+                val response = vlmEngine.analyzeImage(
+                    bitmap = bitmap,
+                    prompt = prompt,
+                    memoryContext = null,
+                    similarInteractions = similarInteractions
+                )
                 CrashLogFile.log(TAG, "analyzeImage() returned: ${response?.length ?: 0} chars")
 
                 if (response == null) {
                     isInferring.set(false)
                     mainHandler.post {
-                        try { ttsManager.speakImmediate("Sorry, I couldn't analyze the image.") } catch (_: Throwable) {}
                         onStatusUpdate?.invoke("Inference failed")
+                    }
+                } else {
+                    // 4. Store interaction for future similarity search
+                    CrashLogFile.log(TAG, "Storing interaction for adaptive intelligence...")
+                    memoryRepository.storeInteraction(
+                        bitmap = bitmap,
+                        prompt = prompt,
+                        output = response
+                    )
+
+                    // 5. Update debounce cache with the described object
+                    val normalized = response.trim().lowercase()
+                    if (normalized.isNotBlank()) {
+                        lastDescribedObject = normalized
+                        lastDescribedTime = System.currentTimeMillis()
                     }
                 }
 
@@ -226,7 +305,7 @@ class VyzeCoreController(
                 CrashLogFile.logError(TAG, "Snapshot trigger FAILED: ${e.javaClass.simpleName}: ${e.message}", e)
                 isInferring.set(false)
                 mainHandler.post {
-                    try { ttsManager.speakImmediate("Something went wrong. Please try again.") } catch (_: Throwable) {}
+                    // TTS handled by CameraFragment.onError to avoid duplication
                     onStatusUpdate?.invoke("Error: ${e.message}")
                 }
             } finally {
@@ -251,6 +330,33 @@ class VyzeCoreController(
         triggerSnapshot(bitmap, query)
     }
 
+    /**
+     * Cancel any in-flight VLM inference job. Called on barge-in when the user
+     * taps during ANALYZING state to immediately reset to IDLE.
+     */
+    fun cancelInference() {
+        inferenceJob?.let { job ->
+            if (job.isActive) {
+                Log.d(TAG, "Cancelling in-flight inference job")
+                job.cancel()
+                isInferring.set(false)
+            }
+        }
+        inferenceJob = null
+    }
+
+    /**
+     * Cancel any in-flight inference AND clear the debounce cache.
+     * Called on barge-in to fully reset the analysis pipeline.
+     */
+    fun cancelAndReset() {
+        cancelInference()
+        lastDescribedObject = ""
+        lastDescribedTime = 0L
+        pendingResponse.clear()
+        Log.d(TAG, "cancelAndReset: pipeline fully reset")
+    }
+
     // ── State ──────────────────────────────────────────────────────
 
     private val pendingResponse = StringBuilder()
@@ -264,6 +370,24 @@ class VyzeCoreController(
     fun isEngineReady(): Boolean = engineReady
     fun isCurrentlyInferring(): Boolean = isInferring.get()
     fun getEngineBackend(): String = vlmEngine.getActiveBackend()
+
+    /**
+     * Check if this response is a duplicate of the last described object.
+     * Returns true if the normalized response matches [lastDescribedObject]
+     * and was spoken within [DEBOUNCE_GAP_MS].
+     */
+    fun isDuplicateDescription(response: String): Boolean {
+        val normalized = response.trim().lowercase()
+        if (normalized.isBlank()) return false
+        if (normalized == lastDescribedObject) {
+            val elapsed = System.currentTimeMillis() - lastDescribedTime
+            if (elapsed < DEBOUNCE_GAP_MS) {
+                Log.d(TAG, "Debounce: '$normalized' already spoken ${elapsed}ms ago — skipping")
+                return true
+            }
+        }
+        return false
+    }
 
     // ── Lifecycle ──────────────────────────────────────────────────
 

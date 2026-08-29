@@ -6,9 +6,13 @@ import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
+import com.vyze.app.data.InteractionRecord
 
 /**
  * Room database for Vyze.
+ *
+ * Version 5 — Added `interaction_records` table with image embeddings for adaptive
+ * intelligence and similarity-based retrieval.
  *
  * Version 4 — Added indexes on `vyze_memory` for efficient preference
  * lookups and environment memory pruning. Removed destructive migration
@@ -21,8 +25,8 @@ import androidx.sqlite.db.SupportSQLiteDatabase
  * history that the VLM needs for personalized responses.
  */
 @Database(
-    entities = [ScanEntity::class, ErrorLogEntity::class, VyzeMemoryEntity::class],
-    version = 4,
+    entities = [ScanEntity::class, ErrorLogEntity::class, VyzeMemoryEntity::class, InteractionRecord::class],
+    version = 5,
     exportSchema = false
 )
 abstract class VyzeDatabase : RoomDatabase() {
@@ -30,6 +34,7 @@ abstract class VyzeDatabase : RoomDatabase() {
     abstract fun scanDao(): ScanDao
     abstract fun errorLogDao(): ErrorLogDao
     abstract fun memoryDao(): MemoryDao
+    abstract fun interactionDao(): InteractionDao
 
     companion object {
         private const val DATABASE_NAME = "vyze_scans.db"
@@ -90,10 +95,43 @@ abstract class VyzeDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * Migration 4 → 5: Added `interaction_records` table for adaptive intelligence.
+         * Stores image embeddings (BLOB), prompts, outputs, and feedback for
+         * similarity-based retrieval. Includes index on timestamp for efficient
+         * pruning and recency queries.
+         */
+        val MIGRATION_4_5 = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """CREATE TABLE IF NOT EXISTS `interaction_records` (
+                        `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        `image_embedding` BLOB NOT NULL,
+                        `prompt` TEXT NOT NULL,
+                        `output` TEXT NOT NULL,
+                        `feedback` TEXT NOT NULL DEFAULT '',
+                        `timestamp` INTEGER NOT NULL,
+                        `tags` TEXT NOT NULL DEFAULT ''
+                    )"""
+                )
+                // Index for efficient pruning and recency queries
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `idx_interaction_timestamp` " +
+                    "ON `interaction_records` (`timestamp`)"
+                )
+                // Index for tag-based filtering
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `idx_interaction_tags` " +
+                    "ON `interaction_records` (`tags`)"
+                )
+            }
+        }
+
         /** All registered migrations, in order. */
         private val ALL_MIGRATIONS = arrayOf(
             MIGRATION_2_3,
-            MIGRATION_3_4
+            MIGRATION_3_4,
+            MIGRATION_4_5
         )
 
         // ── Instance Creation ──────────────────────────────────────

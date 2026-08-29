@@ -6,11 +6,9 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
-import android.view.KeyEvent
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
-import android.widget.Toast
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.activityViewModels
 import androidx.fragment.app.viewModels
@@ -28,18 +26,14 @@ import java.util.concurrent.TimeUnit
 /**
  * Main camera fragment for Vyze accessibility app — VLM Snapshot Mode.
  *
- * ## Architecture
- * This fragment is a thin lifecycle shell that delegates all heavy lifting to:
+ * ## Accessibility Flow
+ * - Onboarding fires after VLM model is ready (deferred from TTS init)
+ * - Barge-in: touch events instantly silence any active TTS
+ * - Single-output: speak VLM result once, return to IDLE (no infinite loop)
+ * - Touch anywhere to interrupt TTS and trigger a new capture
  *
- * - **[CameraSetupDelegate]** — CameraX lifecycle, preview binding, ImageCapture for snapshots
- * - **[VyzeCoreController]** — Central VLM pipeline: snapshot → prompt → inference → TTS
- * - **[GestureRouter]** — Gesture-to-action routing (tap/double-tap/long-press)
- * - **[TtsViewModel]** — Singleton TTSManager across fragments
- *
- * ## Snapshot Execution Mode
- * The VLM runs **on-demand only** — never continuously. Each tap or volume key
- * press triggers a single ImageCapture.takePicture(), feeds the bitmap into the
- * VLM, and streams the response to TTS.
+ * ## State Machine
+ * IDLE → listening → (speech result) → analyzing → (VLM result) → speaking → IDLE
  */
 class CameraFragment : Fragment() {
 
@@ -73,18 +67,20 @@ class CameraFragment : Fragment() {
     private lateinit var backgroundExecutor: ExecutorService
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    // ── State ─────────────────────────────────────────────────────────
+    // ── State Machine ────────────────────────────────────────────────
+
+    /** Explicit states to prevent race conditions on rapid taps. */
+    private enum class AppState { LOADING, IDLE, LISTENING, ANALYZING, SPEAKING }
+
+    @Volatile
+    private var appState = AppState.LOADING
 
     @Volatile
     private var isCameraActive = false
 
-    // ── Snapshot Tap Feedback ─────────────────────────────────────────
-
-    private val snapshotTapFeedback = object : Runnable {
-        override fun run() {
-            // No-op: just a placeholder for future tap feedback animation
-        }
-    }
+    /** Track whether onboarding has been spoken (one-time). */
+    @Volatile
+    private var onboardingSpoken = false
 
     // ══════════════════════════════════════════════════════════════════
     // Lifecycle
@@ -107,58 +103,131 @@ class CameraFragment : Fragment() {
         flashlightManager = FlashlightManager()
 
         // ── Initialize Memory + VLM Pipeline ─────────────────────────
-        // Reuse the VyzeCoreController that LoadingFragment already initialized.
-        // If it's not available (e.g. deep link), create a fallback one.
         val app = requireActivity().applicationContext as VyzeApplication
         memoryDao = app.memoryDao
 
         coreController = app.coreController ?: VyzeCoreController(
             context = requireContext().applicationContext,
             ttsManager = ttsManager,
-            memoryDao = memoryDao
+            memoryDao = memoryDao,
+            interactionDao = app.interactionDao
         )
 
+        // Wire VLM completion → speak result once, go to IDLE
         coreController.onInferenceComplete = { response ->
             activity?.runOnUiThread {
                 try {
                     if (isAdded && _fragmentCameraBinding != null) {
                         Log.d(TAG, "VLM response: ${response.take(100)}...")
-                        fragmentCameraBinding.diagnosticOverlay.text = "Ready"
-                        fragmentCameraBinding.diagnosticOverlay.setTextColor(0xFF00FF00.toInt())
+                        appState = AppState.SPEAKING
+                        updateStatus("Ready")
+
+                        val mainActivity = activity as? MainActivity
+                        if (mainActivity != null && response.isNotBlank()) {
+                            // Debounce: skip if this is a duplicate of the last described object
+                            if (coreController.isDuplicateDescription(response)) {
+                                Log.d(TAG, "Duplicate description — skipping TTS, returning to IDLE")
+                                appState = AppState.IDLE
+                                mainHandler.postDelayed({ startVoiceListening() }, 300L)
+                            } else {
+                                // Speak result once, then auto-restart mic for next query
+                                mainActivity.speakThenCallback(response) {
+                                    // TTS finished — go to IDLE and reopen mic
+                                    appState = AppState.IDLE
+                                    Log.d(TAG, "Response spoken — returning to IDLE, restarting mic")
+                                    mainHandler.postDelayed({ startVoiceListening() }, 300L)
+                                }
+                            }
+                        } else {
+                            appState = AppState.IDLE
+                        }
                     }
                 } catch (e: Exception) {
                     Log.w(TAG, "onInferenceComplete UI error: ${e.message}")
+                    appState = AppState.IDLE
                 }
             }
         }
 
-        // Show engine status in the overlay
+        coreController.onProgressUpdate = { percent, step ->
+            activity?.runOnUiThread {
+                if (isAdded && _fragmentCameraBinding != null) {
+                    updateStatus(step)
+                }
+            }
+        }
+
+        coreController.onError = { error ->
+            activity?.runOnUiThread {
+                if (isAdded && _fragmentCameraBinding != null) {
+                    appState = AppState.IDLE
+                    updateStatus("Error: $error")
+                    (activity as? MainActivity)?.announceStatus("Error: $error")
+                    mainHandler.postDelayed({ startVoiceListening() }, 1000L)
+                }
+            }
+        }
+
+        // ── Deferred Onboarding: fire when VLM engine is ready ───────
+        // Listen for engine ready state — speak onboarding once, then start mic
+        coreController.onStatusUpdate = { msg ->
+            activity?.runOnUiThread {
+                if (isAdded && _fragmentCameraBinding != null) {
+                    updateStatus(msg)
+                    if (msg.startsWith("VLM ready") && !onboardingSpoken) {
+                        onboardingSpoken = true
+                        // Use speakThenCallback to auto-restart mic after onboarding finishes
+                        val mainActivity = activity as? MainActivity
+                        if (mainActivity != null && mainActivity.isTtsReady()) {
+                            appState = AppState.IDLE
+                            mainActivity.speakThenCallback(
+                                "Vyze model ready. Tap anywhere or speak to ask a question, " +
+                                "such as what is in front of me. Tap again to interrupt or ask a new question."
+                            ) {
+                                // TTS onboarding finished — start listening
+                                Log.d(TAG, "Onboarding spoken — starting voice listening")
+                                mainHandler.postDelayed({ startVoiceListening() }, 300L)
+                            }
+                        } else {
+                            // TTS not ready yet — just start listening
+                            startVoiceListening()
+                        }
+                    }
+                }
+            }
+        }
+
+        // Show engine status
         try {
             val backend = coreController.getEngineBackend()
             if (coreController.isEngineReady()) {
-                fragmentCameraBinding.diagnosticOverlay.text = "Ready [$backend]"
-                fragmentCameraBinding.diagnosticOverlay.setTextColor(0xFF00FF00.toInt())
-            } else {
-                fragmentCameraBinding.diagnosticOverlay.text = "VLM not ready — tap to retry"
-                fragmentCameraBinding.diagnosticOverlay.setTextColor(0xFFFF4444.toInt())
-                fragmentCameraBinding.diagnosticOverlay.setOnClickListener {
-                    coreController.onStatusUpdate = { msg ->
-                        activity?.runOnUiThread {
-                            if (isAdded && _fragmentCameraBinding != null) {
-                                fragmentCameraBinding.diagnosticOverlay.text = msg
-                                val isErr = msg.startsWith("Error") || msg.contains("failed")
-                                fragmentCameraBinding.diagnosticOverlay.setTextColor(
-                                    if (isErr) 0xFFFF4444.toInt() else 0xFF00FF00.toInt()
-                                )
-                            }
+                updateStatus("Ready [$backend]")
+                // VLM already ready — speak onboarding now, then start mic
+                if (!onboardingSpoken) {
+                    onboardingSpoken = true
+                    val mainActivity = activity as? MainActivity
+                    if (mainActivity != null && mainActivity.isTtsReady()) {
+                        appState = AppState.IDLE
+                        mainActivity.speakThenCallback(
+                            "Vyze model ready. Tap anywhere or speak to ask a question, " +
+                            "such as what is in front of me. Tap again to interrupt or ask a new question."
+                        ) {
+                            Log.d(TAG, "Onboarding spoken — starting voice listening")
+                            mainHandler.postDelayed({ startVoiceListening() }, 300L)
                         }
+                    } else {
+                        startVoiceListening()
                     }
-                    coreController.initialize()
                 }
+            } else {
+                updateStatus("Model still loading...")
             }
         } catch (e: Exception) {
             Log.e(TAG, "Engine status UI error: ${e.message}")
         }
+
+        // ── Wire Speech Recognition Callbacks ────────────────────────
+        wireSpeechCallbacks()
 
         // ── Initialize Camera ────────────────────────────────────────
         cameraSetup = CameraSetupDelegate()
@@ -174,20 +243,19 @@ class CameraFragment : Fragment() {
             mainHandler = mainHandler
         )
 
-        // Single tap → trigger VLM snapshot
+        // Single tap → barge-in (with mic pause) + force manual capture
         gestureRouter.onSingleTapAction = { x, y ->
-            mainHandler.removeCallbacks(snapshotTapFeedback)
-            triggerVlmSnapshot("User tapped at position (${x.toInt()}, ${y.toInt()})")
+            bargeInAndCapture("User tapped at position (${x.toInt()}, ${y.toInt()})")
         }
 
-        // Double tap → describe surroundings
+        // Double tap → barge-in + describe surroundings
         gestureRouter.onDoubleTapAction = {
-            triggerVlmSnapshot("Describe what is in front of me and around me for navigation.")
+            bargeInAndCapture("Describe what is in front of me and around me for navigation.")
         }
 
-        // Long press → detailed scene description
+        // Long press → barge-in + detailed scene description
         gestureRouter.onLongPressAction = {
-            triggerVlmSnapshot("Give me a detailed description of my surroundings including obstacles, furniture, and navigation paths.")
+            bargeInAndCapture("Give me a detailed description of my surroundings including obstacles, furniture, and navigation paths.")
         }
 
         gestureRouter.attach(fragmentCameraBinding.cameraContainer)
@@ -199,21 +267,16 @@ class CameraFragment : Fragment() {
             }
         }
 
-        // ── Onboarding ───────────────────────────────────────────────
-        setupOnboarding()
-
-        // ── Volume Key Support ───────────────────────────────────────
-        setupVolumeKeyTrigger()
-
-        // ── Initial Status ───────────────────────────────────────────
-        fragmentCameraBinding.diagnosticOverlay.text = "Ready"
-        fragmentCameraBinding.diagnosticOverlay.setTextColor(0xFF00FF00.toInt())
+        // ── Touch fallback — barge-in (with mic pause) + manual capture
+        fragmentCameraBinding.viewFinder.setOnClickListener {
+            Log.d(TAG, "Touch fallback — barge-in + manual capture")
+            bargeInAndCapture("User tapped to capture scene.")
+        }
     }
 
     override fun onResume() {
         super.onResume()
-        // Permissions are handled by LoadingFragment before navigating here.
-        // Only re-request if somehow we got here without permissions.
+
         if (!PermissionsFragment.hasPermissions(requireContext())) {
             Log.w(TAG, "Permissions missing — requesting via PermissionsFragment")
             try {
@@ -232,11 +295,22 @@ class CameraFragment : Fragment() {
         }
 
         isCameraActive = true
+
+        // If VLM is already ready (e.g. returning from another activity),
+        // go straight to IDLE and start listening. Otherwise stay LOADING
+        // until onStatusUpdate("VLM ready") fires.
+        if (coreController.isEngineReady() && onboardingSpoken) {
+            appState = AppState.IDLE
+            startVoiceListening()
+        } else {
+            appState = AppState.LOADING
+        }
     }
 
     override fun onPause() {
         super.onPause()
         isCameraActive = false
+        stopVoiceListening()
         cameraSetup.releaseCamera()
     }
 
@@ -246,14 +320,10 @@ class CameraFragment : Fragment() {
 
         if (this::gestureRouter.isInitialized) gestureRouter.detach()
 
-        // CRITICAL: Do NOT destroy the shared coreController from VyzeApplication.
-        // It holds the VLM engine state that LoadingFragment initialized.
-        // Only destroy if we created a local fallback instance.
         val app = try {
             requireActivity().applicationContext as VyzeApplication
         } catch (e: Exception) { null }
         if (app?.coreController != coreController && this::coreController.isInitialized) {
-            // This was a locally-created fallback — safe to destroy
             coreController.destroy()
         }
 
@@ -285,34 +355,69 @@ class CameraFragment : Fragment() {
     }
 
     // ══════════════════════════════════════════════════════════════════
-    // VLM Snapshot Trigger
+    // Barge-In + Capture
     // ══════════════════════════════════════════════════════════════════
 
     /**
-     * Capture a snapshot and run VLM inference.
-     *
-     * Uses ImageCapture.takePicture() to get a single frame, then feeds it
-     * into VyzeCoreController for on-demand VLM inference.
+     * Unified barge-in handler: cancels any active TTS AND in-flight VLM
+     * inference if we're in ANALYZING state, then triggers a fresh capture.
+     * This prevents race conditions on rapid taps.
      */
+    private fun bargeInAndCapture(query: String) {
+        // 0. Cancel SpeechRecognizer to avoid hardware conflict with ImageCapture
+        val mainActivity = activity as? MainActivity
+        mainActivity?.stopListening()
+
+        // 1. Fully reset the pipeline: cancel inference + clear debounce cache
+        //    This prevents stale results from being processed after barge-in.
+        if (appState == AppState.ANALYZING || appState == AppState.SPEAKING) {
+            Log.d(TAG, "Barge-in during $appState — resetting pipeline")
+            coreController.cancelAndReset()
+            appState = AppState.IDLE
+        }
+
+        // 2. Stop TTS and pause mic to avoid tap sound capture
+        mainActivity?.interruptTtsWithMicPause()
+
+        // 3. Trigger fresh capture
+        triggerVlmSnapshot(query)
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // VLM Snapshot Trigger
+    // ══════════════════════════════════════════════════════════════════
+
     private fun triggerVlmSnapshot(query: String) {
-        CrashLogFile.log(TAG, "triggerVlmSnapshot: engineReady=${coreController.isEngineReady()}, inferring=${coreController.isCurrentlyInferring()}")
+        CrashLogFile.log(TAG, "triggerVlmSnapshot: state=$appState, engineReady=${coreController.isEngineReady()}, inferring=${coreController.isCurrentlyInferring()}")
+
+        // Drop frames while TTS is actively speaking — prevents stale frame backlog
+        if (ttsManager.isSpeaking()) {
+            Log.d(TAG, "TTS speaking — dropping snapshot trigger")
+            updateStatus("Speaking...")
+            return
+        }
+
+        // State machine guard: reject if not IDLE or LISTENING
+        if (appState != AppState.IDLE && appState != AppState.LISTENING) {
+            Log.d(TAG, "State=$appState — rejecting snapshot trigger")
+            updateStatus("Busy...")
+            return
+        }
 
         if (!coreController.isEngineReady()) {
-            fragmentCameraBinding.diagnosticOverlay.text = "Model still loading..."
-            fragmentCameraBinding.diagnosticOverlay.setTextColor(0xFFFFAA00.toInt())
+            updateStatus("Model still loading...")
             Log.d(TAG, "VLM not ready yet")
             return
         }
 
         if (coreController.isCurrentlyInferring()) {
-            fragmentCameraBinding.diagnosticOverlay.text = "Already analyzing..."
-            fragmentCameraBinding.diagnosticOverlay.setTextColor(0xFFFFAA00.toInt())
-            Log.d(TAG, "Engine busy — ignoring tap")
+            updateStatus("Already analyzing...")
+            Log.d(TAG, "Engine busy — ignoring")
             return
         }
 
         hapticManager.vibrateTap()
-        fragmentCameraBinding.diagnosticOverlay.text = "Capturing snapshot..."
+        updateStatus("Capturing...")
         CrashLogFile.log(TAG, "Calling cameraSetup.takeSnapshot()")
 
         cameraSetup.takeSnapshot(
@@ -320,14 +425,12 @@ class CameraFragment : Fragment() {
                 try {
                     CrashLogFile.log(TAG, "onBitmap callback: ${bitmap.width}x${bitmap.height}")
 
-                    // If engine is already inferring, recycle this bitmap immediately
-                    // to prevent OOM from accumulating full-res bitmaps.
                     if (coreController.isCurrentlyInferring()) {
                         CrashLogFile.log(TAG, "Engine busy — recycling bitmap")
                         bitmap.recycle()
                         activity?.runOnUiThread {
                             if (isAdded && _fragmentCameraBinding != null) {
-                                fragmentCameraBinding.diagnosticOverlay.text = "Already analyzing..."
+                                updateStatus("Already analyzing...")
                             }
                         }
                         return@takeSnapshot
@@ -335,7 +438,9 @@ class CameraFragment : Fragment() {
 
                     activity?.runOnUiThread {
                         if (isAdded && _fragmentCameraBinding != null) {
-                            fragmentCameraBinding.diagnosticOverlay.text = "Analyzing..."
+                            appState = AppState.ANALYZING
+                            updateStatus("Analyzing...")
+                            (activity as? MainActivity)?.announceStatus("Analyzing scene...")
                         }
                     }
                     CrashLogFile.log(TAG, "Calling coreController.triggerSnapshot()")
@@ -350,8 +455,11 @@ class CameraFragment : Fragment() {
                 Log.e(TAG, "Snapshot failed: $error")
                 activity?.runOnUiThread {
                     if (isAdded && _fragmentCameraBinding != null) {
+                        appState = AppState.IDLE
                         ttsManager.speakImmediate("Failed to capture image. $error")
-                        fragmentCameraBinding.diagnosticOverlay.text = "Snapshot failed"
+                        updateStatus("Capture failed")
+                        // Auto-restart mic after error
+                        mainHandler.postDelayed({ startVoiceListening() }, 1000L)
                     }
                 }
             }
@@ -359,49 +467,77 @@ class CameraFragment : Fragment() {
     }
 
     // ══════════════════════════════════════════════════════════════════
-    // Volume Key Trigger
+    // Speech Recognition Integration
     // ══════════════════════════════════════════════════════════════════
 
-    private fun setupVolumeKeyTrigger() {
-        fragmentCameraBinding.viewFinder.isFocusableInTouchMode = true
-        fragmentCameraBinding.viewFinder.requestFocus()
-        fragmentCameraBinding.viewFinder.setOnKeyListener { _, keyCode, event ->
-            if (event.action == KeyEvent.ACTION_DOWN) {
-                when (keyCode) {
-                    KeyEvent.KEYCODE_VOLUME_UP, KeyEvent.KEYCODE_VOLUME_DOWN -> {
-                        triggerVlmSnapshot("User pressed volume key to trigger scene description.")
-                        true
-                    }
-                    else -> false
+    /**
+     * Wire speech recognition callbacks from MainActivity to this fragment.
+     */
+    private fun wireSpeechCallbacks() {
+        val activity = requireActivity() as? MainActivity ?: return
+
+        // Final speech result → barge-in + trigger VLM
+        activity.onSpeechResult = { spokenText ->
+            if (spokenText.isNotBlank()) {
+                Log.i(TAG, "Speech result: \"$spokenText\"")
+                // Barge-in: silence TTS (mic is already open, no tap sound risk)
+                activity.interruptTts()
+                appState = AppState.IDLE  // reset from LISTENING
+                updateStatus("Heard: \"$spokenText\"")
+                triggerVlmSnapshot(spokenText)
+            }
+        }
+
+        // Partial results → show live transcription in status bar
+        activity.onPartialSpeechResult = { partial ->
+            if (isAdded && _fragmentCameraBinding != null) {
+                if (partial.isNullOrBlank()) {
+                    appState = AppState.LISTENING
+                    updateStatus("Listening...")
+                } else {
+                    updateStatus("Listening: \"$partial\"")
                 }
-            } else false
+            }
+        }
+
+        // Speech errors → reset to IDLE and restart mic silently
+        activity.onSpeechError = { errorMsg ->
+            if (isAdded && _fragmentCameraBinding != null) {
+                Log.w(TAG, "Speech error: $errorMsg")
+                appState = AppState.IDLE
+                updateStatus("Ready")
+                mainHandler.postDelayed({ startVoiceListening() }, 300L)
+            }
+        }
+    }
+
+    private fun startVoiceListening() {
+        if (!isAdded) return
+        try {
+            val activity = requireActivity() as? MainActivity ?: return
+            activity.startListeningSafely()
+        } catch (e: Throwable) {
+            Log.w(TAG, "startVoiceListening failed: ${e.message}")
+        }
+    }
+
+    private fun stopVoiceListening() {
+        try {
+            val activity = requireActivity() as? MainActivity ?: return
+            activity.stopListening()
+        } catch (e: Throwable) {
+            Log.w(TAG, "stopVoiceListening failed: ${e.message}")
         }
     }
 
     // ══════════════════════════════════════════════════════════════════
-    // Onboarding
+    // Status Bar
     // ══════════════════════════════════════════════════════════════════
 
-    private fun setupOnboarding() {
-        val prefs = requireContext().getSharedPreferences("vyze_prefs", 0)
-        val isFirstLaunch = prefs.getBoolean("first_launch", true)
-
-        if (isFirstLaunch) {
-            fragmentCameraBinding.onboardingOverlay.visibility = View.VISIBLE
-            mainHandler.postDelayed({
-                if (isAdded) {
-                    ttsManager.speakImmediate(
-                        "Welcome to Vyze. Tap anywhere to hear what's in front of you. " +
-                        "Double tap for a scene description. Long press for a detailed description. " +
-                        "You can also use volume keys to trigger descriptions. Tap to begin."
-                    )
-                }
-            }, 1500L)
-
-            fragmentCameraBinding.onboardingOverlay.setOnClickListener {
-                prefs.edit().putBoolean("first_launch", false).apply()
-                fragmentCameraBinding.onboardingOverlay.visibility = View.GONE
-                ttsManager.speakImmediate("Ready. Tap anywhere to start.")
+    private fun updateStatus(text: String) {
+        activity?.runOnUiThread {
+            if (isAdded && _fragmentCameraBinding != null) {
+                fragmentCameraBinding.statusText.text = text
             }
         }
     }
