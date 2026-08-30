@@ -46,30 +46,19 @@ class CameraFragment : Fragment() {
     private val ttsViewModel: TtsViewModel by activityViewModels()
     private val splashViewModel: SplashViewModel by viewModels()
 
-    // ── Delegates ─────────────────────────────────────────────────────
-
     private lateinit var cameraSetup: CameraSetupDelegate
     private lateinit var gestureRouter: GestureRouter
 
-    // ── VLM Pipeline ─────────────────────────────────────────────────
-
     private lateinit var coreController: VyzeCoreController
     private lateinit var memoryDao: MemoryDao
-
-    // ── Managers ──────────────────────────────────────────────────────
 
     private lateinit var ttsManager: TTSManager
     private lateinit var hapticManager: HapticManager
     private lateinit var flashlightManager: FlashlightManager
 
-    // ── Executors & Handlers ──────────────────────────────────────────
-
     private lateinit var backgroundExecutor: ExecutorService
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    // ── State Machine ────────────────────────────────────────────────
-
-    /** Explicit states to prevent race conditions on rapid taps. */
     private enum class AppState { LOADING, IDLE, LISTENING, ANALYZING, SPEAKING }
 
     @Volatile
@@ -78,7 +67,6 @@ class CameraFragment : Fragment() {
     @Volatile
     private var isCameraActive = false
 
-    /** Track whether onboarding has been spoken (one-time). */
     @Volatile
     private var onboardingSpoken = false
 
@@ -97,12 +85,10 @@ class CameraFragment : Fragment() {
 
         backgroundExecutor = Executors.newSingleThreadExecutor()
 
-        // ── Initialize Managers ──────────────────────────────────────
         ttsManager = ttsViewModel.ttsManager
         hapticManager = HapticManager(requireContext().applicationContext)
         flashlightManager = FlashlightManager()
 
-        // ── Initialize Memory + VLM Pipeline ─────────────────────────
         val app = requireActivity().applicationContext as VyzeApplication
         memoryDao = app.memoryDao
 
@@ -124,15 +110,19 @@ class CameraFragment : Fragment() {
 
                         val mainActivity = activity as? MainActivity
                         if (mainActivity != null && response.isNotBlank()) {
-                            // Debounce: skip if this is a duplicate of the last described object
                             if (coreController.isDuplicateDescription(response)) {
                                 Log.d(TAG, "Duplicate description — skipping TTS, returning to IDLE")
                                 appState = AppState.IDLE
                                 mainHandler.postDelayed({ startVoiceListening() }, 300L)
+                            } else if (coreController.isStreamingActive()) {
+                                Log.d(TAG, "Streaming active — waiting for TTS queue to drain")
+                                waitForTtsDrain {
+                                    appState = AppState.IDLE
+                                    Log.d(TAG, "TTS drain complete — returning to IDLE, restarting mic")
+                                    mainHandler.postDelayed({ startVoiceListening() }, 300L)
+                                }
                             } else {
-                                // Speak result once, then auto-restart mic for next query
                                 mainActivity.speakThenCallback(response) {
-                                    // TTS finished — go to IDLE and reopen mic
                                     appState = AppState.IDLE
                                     Log.d(TAG, "Response spoken — returning to IDLE, restarting mic")
                                     mainHandler.postDelayed({ startVoiceListening() }, 300L)
@@ -168,15 +158,12 @@ class CameraFragment : Fragment() {
             }
         }
 
-        // ── Deferred Onboarding: fire when VLM engine is ready ───────
-        // Listen for engine ready state — speak onboarding once, then start mic
         coreController.onStatusUpdate = { msg ->
             activity?.runOnUiThread {
                 if (isAdded && _fragmentCameraBinding != null) {
                     updateStatus(msg)
                     if (msg.startsWith("VLM ready") && !onboardingSpoken) {
                         onboardingSpoken = true
-                        // Use speakThenCallback to auto-restart mic after onboarding finishes
                         val mainActivity = activity as? MainActivity
                         if (mainActivity != null && mainActivity.isTtsReady()) {
                             appState = AppState.IDLE
@@ -184,12 +171,10 @@ class CameraFragment : Fragment() {
                                 "Vyze model ready. Tap anywhere or speak to ask a question, " +
                                 "such as what is in front of me. Tap again to interrupt or ask a new question."
                             ) {
-                                // TTS onboarding finished — start listening
                                 Log.d(TAG, "Onboarding spoken — starting voice listening")
                                 mainHandler.postDelayed({ startVoiceListening() }, 300L)
                             }
                         } else {
-                            // TTS not ready yet — just start listening
                             startVoiceListening()
                         }
                     }
@@ -197,12 +182,10 @@ class CameraFragment : Fragment() {
             }
         }
 
-        // Show engine status
         try {
             val backend = coreController.getEngineBackend()
             if (coreController.isEngineReady()) {
                 updateStatus("Ready [$backend]")
-                // VLM already ready — speak onboarding now, then start mic
                 if (!onboardingSpoken) {
                     onboardingSpoken = true
                     val mainActivity = activity as? MainActivity
@@ -226,14 +209,11 @@ class CameraFragment : Fragment() {
             Log.e(TAG, "Engine status UI error: ${e.message}")
         }
 
-        // ── Wire Speech Recognition Callbacks ────────────────────────
         wireSpeechCallbacks()
 
-        // ── Initialize Camera ────────────────────────────────────────
         cameraSetup = CameraSetupDelegate()
         cameraSetup.setContext(requireContext().applicationContext)
 
-        // ── Initialize Gesture Router ────────────────────────────────
         gestureRouter = GestureRouter(
             context = requireContext(),
             ttsManager = ttsManager,
@@ -243,31 +223,26 @@ class CameraFragment : Fragment() {
             mainHandler = mainHandler
         )
 
-        // Single tap → barge-in (with mic pause) + force manual capture
         gestureRouter.onSingleTapAction = { x, y ->
             bargeInAndCapture("User tapped at position (${x.toInt()}, ${y.toInt()})")
         }
 
-        // Double tap → barge-in + describe surroundings
         gestureRouter.onDoubleTapAction = {
             bargeInAndCapture("Describe what is in front of me and around me for navigation.")
         }
 
-        // Long press → barge-in + detailed scene description
         gestureRouter.onLongPressAction = {
             bargeInAndCapture("Give me a detailed description of my surroundings including obstacles, furniture, and navigation paths.")
         }
 
         gestureRouter.attach(fragmentCameraBinding.cameraContainer)
 
-        // ── Initialize Camera on Background Thread ───────────────────
         backgroundExecutor.execute {
             fragmentCameraBinding.viewFinder.post {
                 setUpCamera()
             }
         }
 
-        // ── Touch fallback — barge-in (with mic pause) + manual capture
         fragmentCameraBinding.viewFinder.setOnClickListener {
             Log.d(TAG, "Touch fallback — barge-in + manual capture")
             bargeInAndCapture("User tapped to capture scene.")
@@ -276,6 +251,10 @@ class CameraFragment : Fragment() {
 
     override fun onResume() {
         super.onResume()
+
+        if (::coreController.isInitialized) {
+            coreController.resetSessionState()
+        }
 
         if (!PermissionsFragment.hasPermissions(requireContext())) {
             Log.w(TAG, "Permissions missing — requesting via PermissionsFragment")
@@ -296,9 +275,6 @@ class CameraFragment : Fragment() {
 
         isCameraActive = true
 
-        // If VLM is already ready (e.g. returning from another activity),
-        // go straight to IDLE and start listening. Otherwise stay LOADING
-        // until onStatusUpdate("VLM ready") fires.
         if (coreController.isEngineReady() && onboardingSpoken) {
             appState = AppState.IDLE
             startVoiceListening()
@@ -358,28 +334,16 @@ class CameraFragment : Fragment() {
     // Barge-In + Capture
     // ══════════════════════════════════════════════════════════════════
 
-    /**
-     * Unified barge-in handler: cancels any active TTS AND in-flight VLM
-     * inference if we're in ANALYZING state, then triggers a fresh capture.
-     * This prevents race conditions on rapid taps.
-     */
     private fun bargeInAndCapture(query: String) {
-        // 0. Cancel SpeechRecognizer to avoid hardware conflict with ImageCapture
         val mainActivity = activity as? MainActivity
         mainActivity?.stopListening()
 
-        // 1. Fully reset the pipeline: cancel inference + clear debounce cache
-        //    This prevents stale results from being processed after barge-in.
-        if (appState == AppState.ANALYZING || appState == AppState.SPEAKING) {
-            Log.d(TAG, "Barge-in during $appState — resetting pipeline")
-            coreController.cancelAndReset()
-            appState = AppState.IDLE
-        }
+        Log.d(TAG, "Barge-in: full pipeline reset before new capture")
+        coreController.resetForNewCapture()
+        appState = AppState.IDLE
 
-        // 2. Stop TTS and pause mic to avoid tap sound capture
         mainActivity?.interruptTtsWithMicPause()
 
-        // 3. Trigger fresh capture
         triggerVlmSnapshot(query)
     }
 
@@ -390,14 +354,17 @@ class CameraFragment : Fragment() {
     private fun triggerVlmSnapshot(query: String) {
         CrashLogFile.log(TAG, "triggerVlmSnapshot: state=$appState, engineReady=${coreController.isEngineReady()}, inferring=${coreController.isCurrentlyInferring()}")
 
-        // Drop frames while TTS is actively speaking — prevents stale frame backlog
-        if (ttsManager.isSpeaking()) {
-            Log.d(TAG, "TTS speaking — dropping snapshot trigger")
+        if (ttsManager.hasPendingSpeech()) {
+            Log.d(TAG, "TTS still has pending utterances — forcing full reset before new capture")
+            coreController.resetForNewCapture()
+        }
+
+        if (ttsManager.hasPendingSpeech()) {
+            Log.d(TAG, "TTS still has pending utterances — dropping snapshot trigger")
             updateStatus("Speaking...")
             return
         }
 
-        // State machine guard: reject if not IDLE or LISTENING
         if (appState != AppState.IDLE && appState != AppState.LISTENING) {
             Log.d(TAG, "State=$appState — rejecting snapshot trigger")
             updateStatus("Busy...")
@@ -458,7 +425,6 @@ class CameraFragment : Fragment() {
                         appState = AppState.IDLE
                         ttsManager.speakImmediate("Failed to capture image. $error")
                         updateStatus("Capture failed")
-                        // Auto-restart mic after error
                         mainHandler.postDelayed({ startVoiceListening() }, 1000L)
                     }
                 }
@@ -470,25 +436,19 @@ class CameraFragment : Fragment() {
     // Speech Recognition Integration
     // ══════════════════════════════════════════════════════════════════
 
-    /**
-     * Wire speech recognition callbacks from MainActivity to this fragment.
-     */
     private fun wireSpeechCallbacks() {
         val activity = requireActivity() as? MainActivity ?: return
 
-        // Final speech result → barge-in + trigger VLM
         activity.onSpeechResult = { spokenText ->
             if (spokenText.isNotBlank()) {
                 Log.i(TAG, "Speech result: \"$spokenText\"")
-                // Barge-in: silence TTS (mic is already open, no tap sound risk)
                 activity.interruptTts()
-                appState = AppState.IDLE  // reset from LISTENING
+                appState = AppState.IDLE
                 updateStatus("Heard: \"$spokenText\"")
                 triggerVlmSnapshot(spokenText)
             }
         }
 
-        // Partial results → show live transcription in status bar
         activity.onPartialSpeechResult = { partial ->
             if (isAdded && _fragmentCameraBinding != null) {
                 if (partial.isNullOrBlank()) {
@@ -500,7 +460,6 @@ class CameraFragment : Fragment() {
             }
         }
 
-        // Speech errors → reset to IDLE and restart mic silently
         activity.onSpeechError = { errorMsg ->
             if (isAdded && _fragmentCameraBinding != null) {
                 Log.w(TAG, "Speech error: $errorMsg")
@@ -509,6 +468,48 @@ class CameraFragment : Fragment() {
                 mainHandler.postDelayed({ startVoiceListening() }, 300L)
             }
         }
+    }
+
+    /**
+     * Wait for the TTS engine to finish playing all queued utterances.
+     *
+     * KEY FIX: Initial delay of 500ms before first poll. The final
+     * flushRemainingSentenceBuffer() posts speak() to mainHandler, and
+     * then onInferenceComplete also posts to mainHandler. When
+     * waitForTtsDrain runs, the TTS engine may not have registered the
+     * utterance as "speaking" yet — isSpeaking() returns false on the
+     * first check, causing premature exit and audio cutoff.
+     *
+     * The 500ms initial delay gives the TTS engine time to transition
+     * from "queued" to "active playback" before we start polling.
+     */
+    private fun waitForTtsDrain(onDone: () -> Unit) {
+        // Use deterministic utterance ID tracking instead of isSpeaking() polling.
+        // hasPendingSpeech() returns true iff pendingUtteranceIds is non-empty.
+        // Each speak() call adds an ID; onDone/onError removes it.
+        //
+        // The final utterance in the queue includes a silent tail padding
+        // (via TTSManager.playSilentUtterance) that keeps hasPendingSpeech()
+        // true until the hardware AudioTrack buffer is fully drained.
+        //
+        // After hasPendingSpeech() == false, an additional 400ms grace
+        // period ensures the speaker has finished emitting the last
+        // audible phoneme before we release audio focus and restart mic.
+        val checkRunnable = object : Runnable {
+            override fun run() {
+                if (ttsManager.hasPendingSpeech()) {
+                    mainHandler.postDelayed(this, 150L)
+                } else {
+                    // All utterances (including silent tail) have completed.
+                    // Add a final 400ms grace for AudioTrack hardware drain.
+                    mainHandler.postDelayed({
+                        ttsManager.abandonFocus()
+                        onDone()
+                    }, AUDIO_DRAIN_GRACE_MS)
+                }
+            }
+        }
+        mainHandler.postDelayed(checkRunnable, 300L)
     }
 
     private fun startVoiceListening() {
@@ -540,5 +541,14 @@ class CameraFragment : Fragment() {
                 fragmentCameraBinding.statusText.text = text
             }
         }
+    }
+
+    companion object {
+        /**
+         * Grace period (ms) after all pending utterances complete before
+         * releasing audio focus. Compensates for Android AudioTrack
+         * hardware drain latency after onDone() fires.
+         */
+        private const val AUDIO_DRAIN_GRACE_MS = 400L
     }
 }

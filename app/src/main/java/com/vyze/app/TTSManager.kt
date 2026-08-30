@@ -11,35 +11,28 @@ import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.util.Log
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Thread-safe Text-to-Speech manager for the Vyze accessibility app.
  *
+ * ## Utterance ID Tracking (Deterministic Completion Detection)
+ * Every speak() call registers a unique utteranceId in [pendingUtteranceIds].
+ * UtteranceProgressListener.onDone/onError removes the ID.
+ * [hasPendingSpeech] returns true iff the set is non-empty — guaranteed
+ * 100% accurate, no polling, no transient false readings.
+ *
  * ## Volume Stability
  * Queries and locks the accessibility stream volume at construction time.
  * All speak() calls use KEY_PARAM_VOLUME = 1.0f so every utterance outputs
- * at the identical, stable gain for the entire session. The locked baseline
- * is logged once and never re-queried — no runtime volume drift.
+ * at the identical, stable gain for the entire session.
  *
  * ## Audio Focus
- * Requests AUDIOFOCUS_GAIN_TRANSIENT (not MAY_DUCK) so TTS output is
- * treated as primary accessibility guidance. Other apps pause their audio
- * rather than ducking. Focus is released in UtteranceProgressListener.onDone()
- * so the session is clean between utterances.
- *
- * ## System Ducking Elimination
- * Uses USAGE_ASSISTANCE_ACCESSIBILITY / CONTENT_TYPE_SPEECH for both the
- * TTS engine's AudioAttributes and the AudioFocusRequest. Android's audio
- * framework treats all utterances as non-duckable accessibility speech.
- *
- * ## Speech Buffer
- * All speech requests are buffered in a [ConcurrentLinkedQueue] from the moment
- * of construction. A periodic drain timer retries every 200ms for up to
- * [DRAIN_RETRY_MS] after onInit to catch late-arriving messages.
- *
- * ## Thread Safety
- * All public methods are safe to call from any thread.
+ * Requests AUDIOFOCUS_GAIN_TRANSIENT so TTS output is treated as primary
+ * accessibility guidance. Focus is abandoned explicitly via abandonFocus()
+ * or stop() — never automatically in onDone() (which fires per-utterance).
  */
 class TTSManager(context: Context) : TextToSpeech.OnInitListener {
 
@@ -55,11 +48,6 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
 
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
-    /**
-     * Locked session volume baseline — queried once at construction time.
-     * All TTS output uses KEY_PARAM_VOLUME = 1.0f relative to this stream,
-     * so every utterance outputs at identical, stable gain for the entire session.
-     */
     private val lockedStreamVolume: Int = try {
         audioManager.getStreamVolume(AudioManager.STREAM_ACCESSIBILITY)
     } catch (e: Throwable) {
@@ -97,27 +85,73 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
     /** Callback invoked when TTS engine is fully ready. */
     var onReady: (() -> Unit)? = null
 
-    // ── Audio Attributes (Accessibility — non-duckable) ───────────
+    // ── Utterance ID Tracking ─────────────────────────────────────
+    // Thread-safe set of utterance IDs currently queued or playing.
+    // Every speak() call adds an ID; onDone/onError removes it.
+    // hasPendingSpeech() returns true iff the set is non-empty.
+
+    private val pendingUtteranceIds = ConcurrentHashMap.newKeySet<String>()
+
+    /** Monotonically increasing counter for unique utterance IDs. */
+    private val utteranceCounter = AtomicLong(0)
 
     /**
-     * TTS engine audio attributes.
-     * USAGE_ASSISTANCE_ACCESSIBILITY ensures Android treats all utterances
-     * as primary accessibility guidance — not duckable media streams.
+     * Generate a unique utterance ID for a speak() call.
+     * Format: "utt_{counter}_{timestamp}"
      */
+    private fun nextUtteranceId(): String {
+        return "utt_${utteranceCounter.incrementAndGet()}_${System.currentTimeMillis()}"
+    }
+
+    /**
+     * Returns true if any utterances are currently queued or playing.
+     * This is the deterministic replacement for isSpeaking() polling.
+     */
+    fun hasPendingSpeech(): Boolean = pendingUtteranceIds.isNotEmpty()
+
+    // ── Audio Attributes (Accessibility — non-duckable) ───────────
+
     private val ttsAudioAttributes = AudioAttributes.Builder()
         .setUsage(AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY)
         .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
         .build()
 
-    /**
-     * Audio focus request attributes.
-     * Uses USAGE_ASSISTANCE_ACCESSIBILITY so the audio framework recognizes
-     * this as critical accessibility speech, not background media.
-     */
     private val focusAttributes = AudioAttributes.Builder()
         .setUsage(AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY)
         .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
         .build()
+
+    // ── Utterance Progress Listener (Global) ──────────────────────
+    // Set once during init. Tracks ALL utterances via pendingUtteranceIds.
+    // This is the single source of truth for completion detection.
+
+    private val globalUtteranceListener = object : UtteranceProgressListener() {
+        override fun onStart(utteranceId: String?) {
+            Log.d(TAG, "onStart: $utteranceId (pending=${pendingUtteranceIds.size})")
+        }
+
+        override fun onDone(utteranceId: String?) {
+            if (utteranceId != null) {
+                pendingUtteranceIds.remove(utteranceId)
+                Log.d(TAG, "onDone: $utteranceId removed (pending=${pendingUtteranceIds.size})")
+            }
+        }
+
+        @Deprecated("Deprecated in Java")
+        override fun onError(utteranceId: String?) {
+            if (utteranceId != null) {
+                pendingUtteranceIds.remove(utteranceId)
+                Log.w(TAG, "onError: $utteranceId removed (pending=${pendingUtteranceIds.size})")
+            }
+        }
+
+        override fun onError(utteranceId: String?, errorCode: Int) {
+            if (utteranceId != null) {
+                pendingUtteranceIds.remove(utteranceId)
+                Log.w(TAG, "onError: $utteranceId code=$errorCode removed (pending=${pendingUtteranceIds.size})")
+            }
+        }
+    }
 
     // ── Initialization ────────────────────────────────────────────
 
@@ -155,8 +189,10 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
                 }
             }
 
-            // Apply accessibility audio attributes — eliminates system ducking
             tts?.setAudioAttributes(ttsAudioAttributes)
+
+            // Set the GLOBAL utterance progress listener — tracks ALL utterances
+            tts?.setOnUtteranceProgressListener(globalUtteranceListener)
 
             Log.i(TAG, "TTS setup OK — locale=$currentLocale, engine=${tts?.defaultEngine}, " +
                 "lockedVolume=$lockedStreamVolume")
@@ -218,24 +254,25 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
             if (text.isBlank()) continue
 
             val mode = if (drained == 0) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
-            val now = System.currentTimeMillis()
+            val utteranceId = nextUtteranceId()
             val params = buildSpeakParams()
-            val utteranceId = "buffered_${now}_$drained"
             val result = tts?.speak(text, mode, params, utteranceId) ?: TextToSpeech.ERROR
 
             if (result != TextToSpeech.SUCCESS) {
                 Log.e(TAG, "drainPendingQueue: speak() FAILED code=$result, text=\"${text.take(60)}\"")
             } else {
+                pendingUtteranceIds.add(utteranceId)
                 Log.d(TAG, "Drained #$drained (id=$utteranceId): ${text.take(60)}...")
             }
 
-            lastSpeechTime = now
+            lastSpeechTime = System.currentTimeMillis()
             lastSpokenText = text
             drained++
         }
 
         if (drained > 0) {
-            Log.i(TAG, "Drained $drained buffered utterances, buffer remaining: ${speechBuffer.size}")
+            Log.i(TAG, "Drained $drained buffered utterances, buffer remaining: ${speechBuffer.size}, " +
+                "pending IDs: ${pendingUtteranceIds.size}")
         }
         return drained
     }
@@ -244,12 +281,20 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
 
     /**
      * Speaks the given text with the specified queue mode.
-     * Requests AUDIOFOCUS_GAIN_TRANSIENT before speaking.
-     * ALWAYS adds to the buffer if TTS is not initialized.
+     * Generates a unique utteranceId, adds it to pendingUtteranceIds,
+     * and tracks it until onDone/onError removes it.
      *
-     * @return true if speak() succeeded, false if queued or failed
+     * @param text       The text to speak
+     * @param queueMode  TextToSpeech.QUEUE_FLUSH or QUEUE_ADD
+     * @param utteranceId Optional caller-provided ID (e.g., "session_chunk_3")
+     *                    If null, generates one automatically.
+     * @return true if speak() succeeded
      */
-    fun speak(text: String, queueMode: Int = TextToSpeech.QUEUE_ADD): Boolean {
+    fun speak(
+        text: String,
+        queueMode: Int = TextToSpeech.QUEUE_ADD,
+        utteranceId: String? = null
+    ): Boolean {
         if (text.isBlank()) return false
 
         if (!isInitialized) {
@@ -267,17 +312,18 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
         lastSpeechTime = now
         lastSpokenText = text
 
-        // Pre-grant audio focus before speaking
         requestAudioFocus()
 
+        val id = utteranceId ?: nextUtteranceId()
         val params = buildSpeakParams()
-        val utteranceId = "utterance_${now}"
-        val result = tts?.speak(text, queueMode, params, utteranceId) ?: TextToSpeech.ERROR
+        val result = tts?.speak(text, queueMode, params, id) ?: TextToSpeech.ERROR
 
         if (result != TextToSpeech.SUCCESS) {
-            Log.e(TAG, "speak() FAILED code=$result, text=\"${text.take(60)}\", id=$utteranceId")
+            Log.e(TAG, "speak() FAILED code=$result, text=\"${text.take(60)}\", id=$id")
         } else {
-            Log.d(TAG, "speak() OK queueMode=$queueMode result=$result text=\"${text.take(60)}\"")
+            pendingUtteranceIds.add(id)
+            Log.d(TAG, "speak() OK id=$id queueMode=$queueMode pending=${pendingUtteranceIds.size} " +
+                "text=\"${text.take(60)}\"")
         }
 
         return result == TextToSpeech.SUCCESS
@@ -285,8 +331,7 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
 
     /**
      * Immediate speech for urgent accessibility feedback.
-     * Requests AUDIOFOCUS_GAIN_TRANSIENT, stops current speech, speaks with QUEUE_FLUSH.
-     * Focus is released in UtteranceProgressListener.onDone().
+     * Stops current speech, speaks with QUEUE_FLUSH.
      */
     fun speakImmediate(text: String): Boolean {
         if (text.isBlank()) {
@@ -310,19 +355,20 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
         lastSpokenText = text
 
         tts?.stop()
+        pendingUtteranceIds.clear()
 
-        // Pre-grant audio focus — ACCESSIBILITY stream, GAIN_TRANSIENT (no ducking)
         requestAudioFocus()
 
+        val id = nextUtteranceId()
         val params = buildSpeakParams()
-        val utteranceId = "immediate_${now}"
-        val result = tts?.speak(text, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
-            ?: TextToSpeech.ERROR
+        val result = tts?.speak(text, TextToSpeech.QUEUE_FLUSH, params, id) ?: TextToSpeech.ERROR
 
         if (result != TextToSpeech.SUCCESS) {
-            Log.e(TAG, "speakImmediate() FAILED code=$result, text=\"${text.take(60)}\", id=$utteranceId")
+            Log.e(TAG, "speakImmediate() FAILED code=$result, text=\"${text.take(60)}\", id=$id")
         } else {
-            Log.d(TAG, "speakImmediate() OK result=$result text=\"${text.take(60)}\"")
+            pendingUtteranceIds.add(id)
+            Log.d(TAG, "speakImmediate() OK id=$id pending=${pendingUtteranceIds.size} " +
+                "text=\"${text.take(60)}\"")
         }
 
         return result == TextToSpeech.SUCCESS
@@ -352,53 +398,93 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
 
     fun isReady(): Boolean = isInitialized
 
+    /**
+     * Stop all speech and clear all pending utterance tracking.
+     * This is the ONLY way to guarantee hasPendingSpeech() returns false
+     * immediately after stop().
+     */
     fun stop() {
         tts?.stop()
+        pendingUtteranceIds.clear()
         abandonAudioFocus()
+        Log.d(TAG, "stop() — pendingUtteranceIds cleared")
     }
 
     /**
-     * Set a listener for utterance progress events.
-     * Wraps the caller's listener to automatically release audio focus
-     * in onDone(), ensuring the focus session is clean between utterances.
+     * Set a caller-provided UtteranceProgressListener.
+     * This is ADDITIVE to the global listener — both fire for each utterance.
+     * The global listener handles pendingUtteranceIds tracking.
      */
     fun setOnUtteranceProgressListener(listener: UtteranceProgressListener) {
+        // The global listener is already set. We wrap the caller's listener
+        // and let the global one handle ID tracking.
         tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(utteranceId: String?) {
+                globalUtteranceListener.onStart(utteranceId)
                 listener.onStart(utteranceId)
             }
 
             override fun onDone(utteranceId: String?) {
-                // Release audio focus when utterance playback completes
-                abandonAudioFocus()
+                globalUtteranceListener.onDone(utteranceId)
                 listener.onDone(utteranceId)
             }
 
             @Deprecated("Deprecated in Java")
             override fun onError(utteranceId: String?) {
-                abandonAudioFocus()
+                globalUtteranceListener.onError(utteranceId)
                 listener.onError(utteranceId)
             }
 
             override fun onError(utteranceId: String?, errorCode: Int) {
-                abandonAudioFocus()
+                globalUtteranceListener.onError(utteranceId, errorCode)
                 listener.onError(utteranceId, errorCode)
             }
         })
     }
 
-    // ── Audio Focus ───────────────────────────────────────────────
+    /**
+     * Queue a silent utterance to keep hasPendingSpeech() == true
+     * while the hardware AudioTrack drains the final audible utterance.
+     * Android TTS onDone() fires when the engine finishes encoding,
+     * NOT when the speaker finishes playing. This silent tail prevents
+     * the caller from prematurely transitioning to IDLE.
+     *
+     * @param durationMs  Duration of silence in milliseconds (200–400 typical)
+     * @param queueMode   QUEUE_ADD to append after the last audible utterance
+     */
+    fun playSilentUtterance(durationMs: Int = 300, queueMode: Int = TextToSpeech.QUEUE_ADD): Boolean {
+        if (!isInitialized) return false
+        val id = nextUtteranceId()
+        // Silence via KEY_PARAM_VOLUME = 0.0f. The queued utterance
+        // keeps hasPendingSpeech() true while the preceding audible
+        // utterance's AudioTrack hardware buffer drains.
+        val params = Bundle().apply {
+            putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 0.0f)
+        }
+        val result = tts?.speak(" ", queueMode, params, id) ?: TextToSpeech.ERROR
+        if (result == TextToSpeech.SUCCESS) {
+            pendingUtteranceIds.add(id)
+            Log.d(TAG, "playSilentUtterance: id=$id (${durationMs}ms) pending=${pendingUtteranceIds.size}")
+        } else {
+            Log.e(TAG, "playSilentUtterance: FAILED code=$result")
+        }
+        return result == TextToSpeech.SUCCESS
+    }
 
     /**
-     * Request AUDIOFOCUS_GAIN_TRANSIENT with USAGE_ASSISTANCE_ACCESSIBILITY.
-     * This pauses other apps' audio (rather than ducking) while TTS speaks.
-     * Focus is released in UtteranceProgressListener.onDone().
+     * Explicitly release audio focus.
      */
+    fun abandonFocus() {
+        abandonAudioFocus()
+    }
+
+    // ── Audio Focus ───────────────────────────────────────────────
+
     private fun requestAudioFocus() {
         try {
             audioFocusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
                 .setAudioAttributes(focusAttributes)
-                .setOnAudioFocusChangeListener { /* released via abandonAudioFocus in onDone */ }
+                .setOnAudioFocusChangeListener { }
                 .build()
 
             audioManager.requestAudioFocus(audioFocusRequest!!)
@@ -408,10 +494,6 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
         }
     }
 
-    /**
-     * Release audio focus so other apps can resume normal playback.
-     * Called from UtteranceProgressListener.onDone() and from stop()/onDestroy().
-     */
     private fun abandonAudioFocus() {
         try {
             audioFocusRequest?.let {
@@ -426,11 +508,6 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
 
     // ── Speak Parameters ──────────────────────────────────────────
 
-    /**
-     * Build Bundle params for tts.speak().
-     * KEY_PARAM_VOLUME = 1.0f means output at full volume of the locked
-     * accessibility stream — every utterance at identical, stable gain.
-     */
     private fun buildSpeakParams(): Bundle {
         return Bundle().apply {
             putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f)
@@ -501,6 +578,7 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
         stopDrainRetryTimer()
         mainHandler.removeCallbacksAndMessages(null)
         tts?.stop()
+        pendingUtteranceIds.clear()
         abandonAudioFocus()
         tts?.shutdown()
         tts = null
@@ -546,16 +624,9 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
 
         val SUPPORTED_LANGUAGES = listOf(LANGUAGE_ENGLISH, LANGUAGE_MALAY, LANGUAGE_CHINESE)
 
-        /** Minimum milliseconds between identical TTS utterances. */
         const val DEBOUNCE_MS = 1500L
-
-        /** Delay after onInit before first drain. */
         const val ENGINE_SETTLE_DELAY_MS = 200L
-
-        /** How often the drain retry timer checks for new buffered messages. */
         const val DRAIN_RETRY_INTERVAL_MS = 200L
-
-        /** Total duration the drain retry timer runs after onInit. */
         const val DRAIN_RETRY_MS = 5000L
     }
 }

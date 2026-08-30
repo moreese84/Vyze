@@ -231,18 +231,25 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 override fun onDone(utteranceId: String?) {
-                    Log.d(TAG, "TTS onDone: $utteranceId — going to IDLE")
+                    Log.d(TAG, "TTS onDone: $utteranceId — releasing focus, going to IDLE")
+                    // Release audio focus now that this utterance is complete.
+                    // For single-utterance calls, this is the right place.
+                    // For streaming (QUEUE_ADD), focus is abandoned when the
+                    // entire stream finishes via onInferenceComplete.
+                    ttsManager.abandonFocus()
                     runOnUiThread { onDone() }
                 }
 
                 @Deprecated("Deprecated in Java")
                 override fun onError(utteranceId: String?) {
                     Log.w(TAG, "TTS onError: $utteranceId")
+                    ttsManager.abandonFocus()
                     runOnUiThread { onDone() }
                 }
 
                 override fun onError(utteranceId: String?, errorCode: Int) {
                     Log.w(TAG, "TTS onError: $utteranceId code=$errorCode")
+                    ttsManager.abandonFocus()
                     runOnUiThread { onDone() }
                 }
             })
@@ -278,7 +285,7 @@ class MainActivity : AppCompatActivity() {
      * is not captured as a false audio intent.
      * After the settle period the mic automatically resumes.
      */
-    fun interruptTtsWithMicPause(settleMs: Long = 200L) {
+    fun interruptTtsWithMicPause(settleMs: Long = 100L) {
         // 0. Cancel SpeechRecognizer session to avoid hw conflict with ImageCapture
         mainHandler.post {
             try {

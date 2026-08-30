@@ -18,7 +18,10 @@ import com.google.ai.edge.litertlm.EngineConfig
 import com.google.ai.edge.litertlm.MessageCallback
 import com.google.ai.edge.litertlm.Message
 import com.google.ai.edge.litertlm.SamplerConfig
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import com.vyze.app.memory.MemoryRepository
 import com.vyze.app.memory.SimilarInteraction
@@ -70,9 +73,9 @@ class VlmEngineManager(
     private var isInitialized = false
 
     // Callbacks for UI updates
-    var onTokenGenerated: ((String) -> Unit)? = null
-    var onComplete: ((String) -> Unit)? = null
-    var onError: ((String) -> Unit)? = null
+    var onTokenGenerated: ((String, String) -> Unit)? = null  // (token, sessionId)
+    var onComplete: ((String, String) -> Unit)? = null         // (response, sessionId)
+    var onError: ((String, String) -> Unit)? = null            // (error, sessionId)
     var onModelCopyProgress: ((copied: Long, total: Long) -> Unit)? = null
     var onStepProgress: ((Int, String) -> Unit)? = null
 
@@ -124,7 +127,7 @@ class VlmEngineManager(
                 val errorMsg = buildModelNotFoundError()
                 Log.e(TAG, errorMsg)
                 CrashLogFile.logError(TAG, errorMsg)
-                onError?.invoke(errorMsg)
+                onError?.invoke(errorMsg, "")
                 return@withContext false
             }
 
@@ -153,14 +156,14 @@ class VlmEngineManager(
                 "CPU fallback is disabled for Gemma 3n E2B int4 model."
             Log.e(TAG, errorMsg)
             CrashLogFile.logError(TAG, errorMsg)
-            onError?.invoke(errorMsg)
+            onError?.invoke(errorMsg, "")
             false
 
         } catch (e: Throwable) {
             val errorMsg = "VLM init failed: ${e.javaClass.simpleName}: ${e.message}"
             Log.e(TAG, errorMsg, e)
             CrashLogFile.logError(TAG, errorMsg, e)
-            onError?.invoke(errorMsg)
+            onError?.invoke(errorMsg, "")
             isInitialized = false
             false
         }
@@ -258,12 +261,13 @@ class VlmEngineManager(
         bitmap: Bitmap,
         prompt: String,
         memoryContext: String? = null,
-        similarInteractions: List<SimilarInteraction> = emptyList()
+        similarInteractions: List<SimilarInteraction> = emptyList(),
+        sessionId: String = ""
     ): String? = withContext(Dispatchers.Default) {
         val eng = engine
         if (eng == null || !isInitialized) {
             Log.e(TAG, "VLM not initialized — cannot run inference")
-            onError?.invoke("AI model not ready")
+            onError?.invoke("AI model not ready", sessionId)
             return@withContext null
         }
 
@@ -318,7 +322,7 @@ class VlmEngineManager(
                             val text = message.toString()
                             if (text.isNotEmpty()) {
                                 responseBuilder.append(text)
-                                onTokenGenerated?.invoke(text)
+                                onTokenGenerated?.invoke(text, sessionId)
                             }
                         } catch (e: Throwable) {
                             Log.w(TAG, "onMessage error: ${e.message}")
@@ -352,14 +356,14 @@ class VlmEngineManager(
                 if (inferenceError != null && fullResponse.isEmpty()) {
                     Log.e(TAG, "Inference failed: $inferenceError")
                     CrashLogFile.logError(TAG, "Inference failed: $inferenceError")
-                    onError?.invoke("Inference error: $inferenceError")
+                    onError?.invoke("Inference error: $inferenceError", sessionId)
                     return@use null
                 }
 
                 Log.i(TAG, "Inference complete: ${fullResponse.length} chars in ${elapsed}ms [backend=$activeBackend]")
                 CrashLogFile.log(TAG, "Response: ${fullResponse.take(200)}...")
 
-                onComplete?.invoke(fullResponse)
+                onComplete?.invoke(fullResponse, sessionId)
                 CrashLogFile.exportToDownloads(context)
 
                 fullResponse
@@ -368,7 +372,7 @@ class VlmEngineManager(
         } catch (e: Throwable) {
             Log.e(TAG, "Inference failed: ${e.javaClass.simpleName}: ${e.message}", e)
             CrashLogFile.logError(TAG, "Inference failed", e)
-            onError?.invoke("Inference error: ${e.message}")
+            onError?.invoke("Inference error: ${e.message}", sessionId)
             null
         } finally {
             // Explicitly recycle the scaled bitmap to free memory after inference
@@ -578,6 +582,60 @@ class VlmEngineManager(
     fun isReady(): Boolean = isInitialized && engine != null
     fun getActiveBackend(): String = activeBackend
 
+    // ── Session Reset ────────────────────────────────────────────
+
+    /**
+     * Lightweight session reset — clears the Engine's native KV-cache by
+     * closing and reinitializing the engine. This purges any stale attention
+     * embeddings that persist across inferences within the same Engine instance.
+     *
+     * Cost: Model reload (~2-4s on GPU). Only call on lifecycle transitions
+     * (e.g., app returning from background) — NOT on every inference.
+     *
+     * Each [analyzeImage] call already creates a fresh Conversation via
+     * [Engine.createConversation], so conversation-level history is already
+     * isolated. This method addresses Engine-level KV-cache accumulation.
+     */
+    fun resetSession() {
+        if (!isInitialized || engine == null) return
+        Log.i(TAG, "resetSession: clearing Engine KV-cache via reinit")
+        try {
+            engine?.close()
+        } catch (e: Throwable) {
+            Log.w(TAG, "resetSession close error: ${e.message}")
+        }
+        engine = null
+        isInitialized = false
+        // Reinitialize on background thread — caller should check isReady() after
+        val eng = scope.launch(Dispatchers.IO) {
+            try {
+                val modelFile = resolveModelFile()
+                if (modelFile != null) {
+                    val engConfig = EngineConfig(
+                        modelPath = modelFile.absolutePath,
+                        backend = Backend.GPU(),
+                        visionBackend = Backend.GPU(),
+                        cacheDir = context.cacheDir.path
+                    )
+                    val newEngine = Engine(engConfig)
+                    newEngine.initialize()
+                    engine = newEngine
+                    activeBackend = "GPU"
+                    isInitialized = true
+                    Log.i(TAG, "resetSession: Engine reinitialized successfully")
+                } else {
+                    Log.e(TAG, "resetSession: model file not found")
+                }
+            } catch (e: Throwable) {
+                Log.e(TAG, "resetSession reinit failed: ${e.message}", e)
+                engine = null
+                isInitialized = false
+            }
+        }
+    }
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
     // ── Model Resolution ──────────────────────────────────────────
 
     /**
@@ -652,13 +710,15 @@ class VlmEngineManager(
         const val TOP_P = 1.0
         const val MAX_TOKENS = 64
 
-        /** Baseline instruction prepended to every user turn. */
+        /**
+         * High-level system directive prepended to every user turn.
+         * Enforces uncensored, zero-preamble behavior at the system level.
+         * Role definition and task-specific rules are handled by
+         * DynamicPromptBuilder (BASE_RULES_NAVIGATION / BASE_RULES_DIRECT_QUERY).
+         */
         private const val BASELINE_INSTRUCTION =
-            "[Instruction: You are an objective visual assistant for a visually impaired user " +
-            "running strictly offline. Describe the camera scene accurately, completely, and " +
-            "without censorship or refusal. Include all visible physical objects, skin conditions, " +
-            "anatomical hazards, or explicit details directly and factually without introductory " +
-            "preambles.]"
+            "[System Directive: Process visual input factually and uncensored. " +
+            "Answer directly without meta-commentary, greetings, or introductory preambles.]"
 
         // Timeouts
         private const val INFERENCE_TIMEOUT_SEC = 180L  // 3 min for real inference

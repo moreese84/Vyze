@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.os.Handler
 import android.os.Looper
+import android.speech.tts.TextToSpeech
 import android.util.Log
 import com.vyze.app.data.InteractionDao
 import com.vyze.app.data.MemoryDao
@@ -11,22 +12,23 @@ import com.vyze.app.memory.MemoryRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Central controller for the Vyze VLM accessibility pipeline.
  *
- * ## Memory Management
- * Camera snapshots are downscaled to max 1024px before inference to prevent OOM.
- * Bitmaps are recycled immediately after use.
- *
- * ## TTS Strategy
- * Speaks the COMPLETE response after inference finishes (not per-sentence streaming).
- * This avoids threading issues with rapid-fire TTS calls during token streaming.
+ * ## Session Isolation
+ * Every capture trigger generates a unique [activeSessionId]. All token
+ * callbacks and onComplete handlers check this ID before acting — stale
+ * tokens/completions from a cancelled or superseded inference are silently
+ * dropped. This prevents the previous capture's result from being spoken
+ * after a new capture has started.
  */
 class VyzeCoreController(
     private val context: Context,
@@ -40,7 +42,6 @@ class VyzeCoreController(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    /** Track the current inference Job so it can be cancelled on barge-in. */
     @Volatile
     private var inferenceJob: kotlinx.coroutines.Job? = null
 
@@ -48,39 +49,46 @@ class VyzeCoreController(
     private val vlmEngine = VlmEngineManager(context, memoryRepository)
     private val promptBuilder = DynamicPromptBuilder(memoryDao)
 
-    /** Gate to prevent overlapping inferences. */
     private val isInferring = AtomicBoolean(false)
 
-    /** Whether the VLM engine has been initialized. */
     @Volatile
     private var engineReady = false
 
-    // ── Debounce Cache ────────────────────────────────────────────
-    // Prevents re-announcing the same object within a short window.
-    // Solves the "Sandals → Stairs repeat" issue where stale results
-    // are processed after TTS finishes.
+    // ── Session Isolation ─────────────────────────────────────────
+    // Each capture trigger generates a new UUID. Token and onComplete
+    // callbacks check this ID — stale callbacks from a previous
+    // inference are silently dropped.
 
-    /** Last description spoken to the user (lowercase, trimmed). */
+    @Volatile
+    private var activeSessionId: String = ""
+
+    // ── Debounce Cache ────────────────────────────────────────────
+
     @Volatile
     private var lastDescribedObject: String = ""
 
-    /** Timestamp (ms) when [lastDescribedObject] was last spoken. */
     @Volatile
     private var lastDescribedTime: Long = 0L
 
-    /** Minimum gap between identical descriptions. */
-    private val DEBOUNCE_GAP_MS = 4000L  // 4 seconds
+    private val DEBOUNCE_GAP_MS = 4000L
 
-    /** Callback for diagnostic/status updates to the UI. */
+    // ── Sentence Buffer (Token Streaming) ─────────────────────────
+
+    private val sentenceBuffer = StringBuilder()
+    private val bufferLock = Any()
+
+    @Volatile
+    private var firstChunkSent = false
+
+    private val SENTENCE_TERMINATORS = charArrayOf('.', '!', '?', '\n')
+    private val minFlushChars = 20
+
+    /** Monotonically increasing counter for unique utterance IDs per session. */
+    private val chunkCounter = java.util.concurrent.atomic.AtomicInteger(0)
+
     var onStatusUpdate: ((String) -> Unit)? = null
-
-    /** Callback for progress updates: (percent 0-100, step description). */
     var onProgressUpdate: ((Int, String) -> Unit)? = null
-
-    /** Callback for fatal errors during initialization. */
     var onError: ((String) -> Unit)? = null
-
-    /** Callback for inference completion with full response. */
     var onInferenceComplete: ((String) -> Unit)? = null
 
     // ── Initialization ─────────────────────────────────────────────
@@ -96,8 +104,6 @@ class VyzeCoreController(
                 onProgressUpdate?.invoke(percent, msg)
                 onStatusUpdate?.invoke(msg)
             }
-            // Announce download start on first progress callback
-            // Use speakQueued (not speakImmediate) to preserve buffer contents
             if (copied < total / 20) {
                 mainHandler.post {
                     try {
@@ -108,7 +114,6 @@ class VyzeCoreController(
                     } catch (_: Throwable) {}
                 }
             }
-            // Announce at ~50% milestone
             if (total > 0 && copied in (total / 2 - 10_000_000)..(total / 2 + 10_000_000)) {
                 mainHandler.post {
                     try {
@@ -122,37 +127,42 @@ class VyzeCoreController(
             mainHandler.post { onProgressUpdate?.invoke(percent, step) }
         }
 
-        vlmEngine.onError = { error ->
-            isInferring.set(false)
-            mainHandler.post {
-                // TTS error feedback is handled by CameraFragment to avoid duplication
-                onStatusUpdate?.invoke("Error: $error")
-                onError?.invoke(error)
+        // ── Session-Gated Token Callback ──────────────────────────
+        // Drops tokens from any session that doesn't match activeSessionId.
+        vlmEngine.onError = { error, sessionId ->
+            if (sessionId != activeSessionId && sessionId.isNotEmpty()) {
+                Log.d(TAG, "onError: stale session $sessionId (active=$activeSessionId) — dropping")
+            } else {
+                isInferring.set(false)
+                mainHandler.post {
+                    onStatusUpdate?.invoke("Error: $error")
+                    onError?.invoke(error)
+                }
             }
         }
 
-        // Collect tokens into buffer ONLY — do NOT call TTS per-token.
-        // Do NOT expose partial tokens to external callbacks.
-        // Speaking is done once at the end via CameraFragment.speakThenCallback().
-        vlmEngine.onTokenGenerated = { token ->
-            try {
-                // Accumulate silently — no external callback, no TTS leak
-                pendingResponse.append(token)
-            } catch (e: Throwable) {
-                Log.e(TAG, "onTokenGenerated error: ${e.javaClass.simpleName}: ${e.message}")
+        vlmEngine.onTokenGenerated = { token, sessionId ->
+            if (sessionId == activeSessionId) {
+                try {
+                    synchronized(bufferLock) {
+                        sentenceBuffer.append(token)
+                    }
+                    flushSentenceBufferIfReady()
+                } catch (e: Throwable) {
+                    Log.e(TAG, "onTokenGenerated error: ${e.javaClass.simpleName}: ${e.message}")
+                }
             }
+            // else: stale token from a cancelled/superseded inference — silently dropped
         }
 
-        vlmEngine.onComplete = { fullResponse ->
-            try {
+        vlmEngine.onComplete = { fullResponse, sessionId ->
+            if (sessionId != activeSessionId) {
+                Log.d(TAG, "onComplete: stale session $sessionId (active=$activeSessionId) — dropping")
+            } else try {
                 CrashLogFile.log(TAG, "onComplete fired: ${fullResponse.length} chars")
-                pendingResponse.clear()
 
-                // NOTE: TTS is NOT spoken here. CameraFragment.onInferenceComplete
-                // handles speaking via speakThenCallback() to ensure single-output
-                // execution and prevent double-speaking.
+                flushRemainingSentenceBuffer()
 
-                // Store observation in memory (best-effort)
                 scope.launch {
                     try {
                         promptBuilder.storeEnvironmentObservation(fullResponse)
@@ -179,15 +189,11 @@ class VyzeCoreController(
             }
         }
 
-        // Queue download announcement IMMEDIATELY — before any async work starts.
-        // This guarantees the message is in the TTS buffer even if the model file
-        // already exists (no copy → onModelCopyProgress never fires).
         ttsManager.speakQueued(
             "Please wait, model assets are downloading. " +
             "This may take several minutes on first launch."
         )
 
-        // Launch init on background thread
         scope.launch {
             try {
                 onStatusUpdate("Loading VLM model...")
@@ -196,7 +202,6 @@ class VyzeCoreController(
                 if (engineReady) {
                     Log.i(TAG, "VLM ready [${vlmEngine.getActiveBackend()}]")
                     onStatusUpdate("VLM ready [${vlmEngine.getActiveBackend()}]")
-                    // TTS onboarding is handled by CameraFragment when it receives "VLM ready"
                 } else {
                     Log.e(TAG, "VLM engine failed to initialize")
                     mainHandler.post {
@@ -228,6 +233,150 @@ class VyzeCoreController(
         mainHandler.post { onStatusUpdate?.invoke(msg) }
     }
 
+    // ── Text Sanitization ──────────────────────────────────────────
+
+    private fun sanitizeForTts(text: String): String {
+        var cleaned = text
+            .replace("\"", "")
+            .replace("\n", " ")
+            .replace("\r", "")
+            .replace("**", "")
+            .replace("__", "")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+
+        // Enforce trailing punctuation — Android TTS clips phonemes on
+        // unpunctuated final words. Append '.' if missing.
+        if (cleaned.isNotEmpty()) {
+            val lastChar = cleaned.last()
+            if (lastChar != '.' && lastChar != '!' && lastChar != '?') {
+                cleaned = "$cleaned."
+            }
+        }
+
+        return cleaned
+    }
+
+    // ── Sentence Buffer Flush Logic ────────────────────────────────
+
+    private fun flushSentenceBufferIfReady() {
+        val chunk: String
+        synchronized(bufferLock) {
+            val text = sentenceBuffer.toString()
+
+            var lastTerminator = -1
+            for (i in text.length - 1 downTo 0) {
+                if (text[i] in SENTENCE_TERMINATORS) {
+                    lastTerminator = i
+                    break
+                }
+            }
+
+            if (lastTerminator < 0) return
+            if (lastTerminator + 1 < minFlushChars) return
+
+            val raw = text.substring(0, lastTerminator + 1)
+            chunk = sanitizeForTts(raw)
+
+            sentenceBuffer.delete(0, lastTerminator + 1)
+            while (sentenceBuffer.isNotEmpty() && sentenceBuffer[0] == ' ') {
+                sentenceBuffer.deleteCharAt(0)
+            }
+        }
+
+        if (chunk.isNotEmpty()) {
+            mainHandler.post {
+                try {
+                    val chunkId = "${activeSessionId}_chunk_${chunkCounter.incrementAndGet()}"
+                    if (!firstChunkSent) {
+                        ttsManager.speak(chunk, TextToSpeech.QUEUE_FLUSH, utteranceId = chunkId)
+                        firstChunkSent = true
+                    } else {
+                        ttsManager.speak(chunk, TextToSpeech.QUEUE_ADD, utteranceId = chunkId)
+                    }
+                    CrashLogFile.log(TAG, "Sentence flush (id=$chunkId): ${chunk.take(60)}...")
+                } catch (e: Throwable) {
+                    Log.w(TAG, "TTS flush error: ${e.message}")
+                }
+            }
+        }
+    }
+
+    /**
+     * Force-flush ALL remaining text in the sentence buffer.
+     * Called from onComplete when inference finishes.
+     *
+     * This method:
+     * - Bypasses minFlushChars (no minimum threshold)
+     * - Bypasses SENTENCE_TERMINATORS check (flushes even without trailing period)
+     * - Sanitizes text for TTS prosody
+     * - Posts to mainHandler for sequential QUEUE_ADD
+     *
+     * Idempotent: safe to call multiple times (clears buffer on first call).
+     */
+    private fun flushRemainingSentenceBuffer() {
+        val remaining: String
+        synchronized(bufferLock) {
+            if (sentenceBuffer.isEmpty()) return
+            remaining = sanitizeForTts(sentenceBuffer.toString().trim())
+            sentenceBuffer.setLength(0)  // force-clear, not just clear()
+        }
+
+        if (remaining.isNotEmpty()) {
+            mainHandler.post {
+                try {
+                    val finalChunkId = "${activeSessionId}_final_${chunkCounter.incrementAndGet()}"
+                    ttsManager.speak(remaining, TextToSpeech.QUEUE_ADD, utteranceId = finalChunkId)
+                    CrashLogFile.log(TAG, "Final flush (id=$finalChunkId): ${remaining.take(80)}...")
+
+                    // Queue a silent tail utterance to keep hasPendingSpeech() true
+                    // while the hardware AudioTrack drains the final audible text.
+                    // onDone fires when encoding finishes, NOT when speaker finishes.
+                    ttsManager.playSilentUtterance(350, TextToSpeech.QUEUE_ADD)
+                } catch (e: Throwable) {
+                    Log.w(TAG, "TTS final flush error: ${e.message}")
+                }
+            }
+        }
+    }
+
+    private fun resetSentenceBuffer() {
+        synchronized(bufferLock) {
+            sentenceBuffer.clear()
+        }
+        firstChunkSent = false
+    }
+
+    // ── Full Pipeline Reset ────────────────────────────────────────
+
+    /**
+     * Full pipeline reset before a new capture. This ensures:
+     * 1. Active TTS is stopped (no stale audio from previous capture)
+     * 2. Sentence buffer is cleared (no stale tokens)
+     * 3. Session ID is incremented (stale callbacks are dropped)
+     * 4. Streaming state is reset
+     *
+     * Must be called BEFORE [triggerSnapshot] to guarantee isolation.
+     */
+    fun resetForNewCapture() {
+        // 1. Stop any active TTS — cancel lingering audio
+        ttsManager.stop()
+
+        // 2. Cancel any in-flight inference from previous capture
+        cancelInference()
+
+        // 3. Generate new session ID — stale callbacks will be dropped
+        val newSessionId = UUID.randomUUID().toString()
+        activeSessionId = newSessionId
+        chunkCounter.set(0)
+        Log.d(TAG, "resetForNewCapture: new session=$newSessionId")
+
+        // 4. Clear all buffers and state
+        resetSentenceBuffer()
+        lastDescribedObject = ""
+        lastDescribedTime = 0L
+    }
+
     // ── Snapshot Trigger ───────────────────────────────────────────
 
     fun triggerSnapshot(bitmap: Bitmap, query: String? = null) {
@@ -241,76 +390,97 @@ class VyzeCoreController(
             return
         }
 
+        // Ensure session is fresh — resetForNewCapture() should have
+        // been called, but guard against missed calls
+        val sessionId = activeSessionId
+        if (sessionId.isEmpty()) {
+            activeSessionId = UUID.randomUUID().toString()
+        }
+        val currentSessionId = activeSessionId
+
+        resetSentenceBuffer()
+
         onStatusUpdate("Analyzing snapshot...")
 
         inferenceJob = scope.launch {
             try {
-                CrashLogFile.log(TAG, "=== TRIGGER SNAPSHOT ===")
+                CrashLogFile.log(TAG, "=== TRIGGER SNAPSHOT (session=$currentSessionId) ===")
                 CrashLogFile.log(TAG, "Bitmap: ${bitmap.width}x${bitmap.height}")
 
-                // 1. Find visually similar past interactions (runs on IO thread)
-                CrashLogFile.log(TAG, "Querying similar interactions...")
-                val similarInteractions = memoryRepository.findSimilar(
-                    bitmap = bitmap,
-                    topK = 5,
-                    minSim = 0.3f
-                )
-                CrashLogFile.log(TAG, "Found ${similarInteractions.size} similar interactions")
+                CrashLogFile.log(TAG, "Querying similar interactions (async)...")
+                val similarInteractionsDeferred = async(Dispatchers.IO) {
+                    try {
+                        memoryRepository.findSimilar(
+                            bitmap = bitmap,
+                            topK = 5,
+                            minSim = 0.3f
+                        )
+                    } catch (e: Throwable) {
+                        CrashLogFile.logError(TAG, "Similar search failed: ${e.message}", e)
+                        emptyList()
+                    }
+                }
 
-                // 2. Build prompt with similar interaction context
                 CrashLogFile.log(TAG, "Building prompt...")
-                val prompt = promptBuilder.buildPrompt(
+                val basePrompt = promptBuilder.buildPrompt(
                     snapshotDescription = query ?: "User triggered a camera snapshot.",
                     queryOverride = query,
-                    similarInteractions = similarInteractions
+                    similarInteractions = emptyList()
                 )
-                CrashLogFile.log(TAG, "Prompt built: ${prompt.length} chars")
+                CrashLogFile.log(TAG, "Base prompt built: ${basePrompt.length} chars")
 
-                // 3. Run VLM inference (VlmEngineManager handles bitmap preprocessing)
-                pendingResponse.clear()
                 CrashLogFile.log(TAG, "Calling vlmEngine.analyzeImage()...")
-
                 val response = vlmEngine.analyzeImage(
                     bitmap = bitmap,
-                    prompt = prompt,
+                    prompt = basePrompt,
                     memoryContext = null,
-                    similarInteractions = similarInteractions
+                    similarInteractions = emptyList(),
+                    sessionId = currentSessionId
                 )
                 CrashLogFile.log(TAG, "analyzeImage() returned: ${response?.length ?: 0} chars")
 
+                val similarInteractions = try {
+                    similarInteractionsDeferred.await()
+                } catch (e: Throwable) {
+                    emptyList()
+                }
+                CrashLogFile.log(TAG, "Similar interactions resolved: ${similarInteractions.size} found")
+
                 if (response == null) {
-                    isInferring.set(false)
-                    mainHandler.post {
-                        onStatusUpdate?.invoke("Inference failed")
+                    // Only update state if this is still the active session
+                    if (currentSessionId == activeSessionId) {
+                        isInferring.set(false)
+                        mainHandler.post {
+                            onStatusUpdate?.invoke("Inference failed")
+                        }
                     }
                 } else {
-                    // 4. Store interaction for future similarity search
                     CrashLogFile.log(TAG, "Storing interaction for adaptive intelligence...")
                     memoryRepository.storeInteraction(
                         bitmap = bitmap,
-                        prompt = prompt,
+                        prompt = basePrompt,
                         output = response
                     )
 
-                    // 5. Update debounce cache with the described object
-                    val normalized = response.trim().lowercase()
-                    if (normalized.isNotBlank()) {
-                        lastDescribedObject = normalized
-                        lastDescribedTime = System.currentTimeMillis()
+                    if (currentSessionId == activeSessionId) {
+                        val normalized = response.trim().lowercase()
+                        if (normalized.isNotBlank()) {
+                            lastDescribedObject = normalized
+                            lastDescribedTime = System.currentTimeMillis()
+                        }
                     }
                 }
 
             } catch (e: Throwable) {
-                // Catch Throwable (not Exception) to handle OOM, UnsatisfiedLinkError, etc.
                 CrashLogFile.logError(TAG, "Snapshot trigger FAILED: ${e.javaClass.simpleName}: ${e.message}", e)
-                isInferring.set(false)
-                mainHandler.post {
-                    // TTS handled by CameraFragment.onError to avoid duplication
-                    onStatusUpdate?.invoke("Error: ${e.message}")
+                if (currentSessionId == activeSessionId) {
+                    isInferring.set(false)
+                    mainHandler.post {
+                        onStatusUpdate?.invoke("Error: ${e.message}")
+                    }
                 }
             } finally {
                 CrashLogFile.log(TAG, "finally block — recycling bitmap")
-                // Recycle the original bitmap (VlmEngineManager handles its own scaled copy)
                 try {
                     if (!bitmap.isRecycled) {
                         bitmap.recycle()
@@ -330,10 +500,6 @@ class VyzeCoreController(
         triggerSnapshot(bitmap, query)
     }
 
-    /**
-     * Cancel any in-flight VLM inference job. Called on barge-in when the user
-     * taps during ANALYZING state to immediately reset to IDLE.
-     */
     fun cancelInference() {
         inferenceJob?.let { job ->
             if (job.isActive) {
@@ -345,21 +511,15 @@ class VyzeCoreController(
         inferenceJob = null
     }
 
-    /**
-     * Cancel any in-flight inference AND clear the debounce cache.
-     * Called on barge-in to fully reset the analysis pipeline.
-     */
     fun cancelAndReset() {
         cancelInference()
         lastDescribedObject = ""
         lastDescribedTime = 0L
-        pendingResponse.clear()
+        resetSentenceBuffer()
         Log.d(TAG, "cancelAndReset: pipeline fully reset")
     }
 
     // ── State ──────────────────────────────────────────────────────
-
-    private val pendingResponse = StringBuilder()
 
     fun setPreference(key: String, value: String) {
         scope.launch { promptBuilder.setPreference(key, value) }
@@ -370,12 +530,10 @@ class VyzeCoreController(
     fun isEngineReady(): Boolean = engineReady
     fun isCurrentlyInferring(): Boolean = isInferring.get()
     fun getEngineBackend(): String = vlmEngine.getActiveBackend()
+    fun getActiveSessionId(): String = activeSessionId
 
-    /**
-     * Check if this response is a duplicate of the last described object.
-     * Returns true if the normalized response matches [lastDescribedObject]
-     * and was spoken within [DEBOUNCE_GAP_MS].
-     */
+    fun isStreamingActive(): Boolean = firstChunkSent
+
     fun isDuplicateDescription(response: String): Boolean {
         val normalized = response.trim().lowercase()
         if (normalized.isBlank()) return false
@@ -391,6 +549,14 @@ class VyzeCoreController(
 
     // ── Lifecycle ──────────────────────────────────────────────────
 
+    fun resetSessionState() {
+        Log.d(TAG, "resetSessionState: clearing debounce + pending + engine session")
+        lastDescribedObject = ""
+        lastDescribedTime = 0L
+        resetSentenceBuffer()
+        vlmEngine.resetSession()
+    }
+
     fun destroy() {
         vlmEngine.close()
         scope.cancel()
@@ -399,6 +565,5 @@ class VyzeCoreController(
 
     companion object {
         private const val TAG = "VyzeCoreController"
-        // Bitmap preprocessing is now handled by VlmEngineManager.analyzeImage()
     }
 }
