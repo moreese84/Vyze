@@ -390,6 +390,21 @@ class CameraFragment : Fragment() {
         cameraSetup.takeSnapshot(
             onBitmap = { bitmap ->
                 try {
+                    // Validate bitmap BEFORE setting ANALYZING state — prevents
+                    // indefinite ANALYZING if frame capture returned null/damaged bitmap
+                    if (bitmap.isRecycled) {
+                        CrashLogFile.log(TAG, "Bitmap already recycled — skipping")
+                        activity?.runOnUiThread {
+                            if (isAdded && _fragmentCameraBinding != null) {
+                                appState = AppState.IDLE
+                                ttsManager.speakImmediate("Failed to capture a valid image.")
+                                updateStatus("Capture failed")
+                                mainHandler.postDelayed({ startVoiceListening() }, 1000L)
+                            }
+                        }
+                        return@takeSnapshot
+                    }
+
                     CrashLogFile.log(TAG, "onBitmap callback: ${bitmap.width}x${bitmap.height}")
 
                     if (coreController.isCurrentlyInferring()) {
@@ -415,6 +430,14 @@ class CameraFragment : Fragment() {
                 } catch (e: Throwable) {
                     CrashLogFile.logError(TAG, "onBitmap callback error: ${e.javaClass.simpleName}: ${e.message}", e)
                     try { bitmap.recycle() } catch (_: Throwable) {}
+                    // Reset ANALYZING state on bitmap processing failure
+                    activity?.runOnUiThread {
+                        if (isAdded && _fragmentCameraBinding != null) {
+                            appState = AppState.IDLE
+                            updateStatus("Error: ${e.message}")
+                            mainHandler.postDelayed({ startVoiceListening() }, 1000L)
+                        }
+                    }
                 }
             },
             onError = { error ->

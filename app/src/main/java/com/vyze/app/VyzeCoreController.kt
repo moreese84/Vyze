@@ -131,8 +131,11 @@ class VyzeCoreController(
         // Drops tokens from any session that doesn't match activeSessionId.
         vlmEngine.onError = { error, sessionId ->
             if (sessionId != activeSessionId && sessionId.isNotEmpty()) {
-                Log.d(TAG, "onError: stale session $sessionId (active=$activeSessionId) — dropping")
+                Log.d(TAG, "onError: stale session $sessionId (active=$activeSessionId) — dropping callback")
+                // STILL reset isInferring — the old coroutine may be holding it true
+                isInferring.set(false)
             } else {
+                Log.e(TAG, "onError: session=$sessionId error=$error")
                 isInferring.set(false)
                 mainHandler.post {
                     onStatusUpdate?.invoke("Error: $error")
@@ -400,7 +403,24 @@ class VyzeCoreController(
 
         resetSentenceBuffer()
 
-        onStatusUpdate("Analyzing snapshot...")
+        onStatusUpdate("Analyzing snapshot...")        // ── Watchdog Timer ───────────────────────────────────────
+        // If neither onComplete nor onError fires within WATCHDOG_TIMEOUT_MS,
+        // force-reset the pipeline and notify the user. Prevents indefinite
+        // ANALYZING state when the VLM hangs on GPU execution.
+        val watchdogRunnable = Runnable {
+            if (isInferring.get() && activeSessionId == currentSessionId) {
+                Log.e(TAG, "Watchdog: inference hung for ${WATCHDOG_TIMEOUT_MS}ms — force resetting")
+                CrashLogFile.log(TAG, "WATCHDOG FIRED — forcing pipeline reset")
+                isInferring.set(false)
+                cancelInference()
+                resetSentenceBuffer()
+                mainHandler.post {
+                    onStatusUpdate?.invoke("Inference timed out")
+                    onError?.invoke("Inference timed out. Please try again.")
+                }
+            }
+        }
+        mainHandler.postDelayed(watchdogRunnable, WATCHDOG_TIMEOUT_MS)
 
         inferenceJob = scope.launch {
             try {
@@ -408,6 +428,7 @@ class VyzeCoreController(
                 CrashLogFile.log(TAG, "Bitmap: ${bitmap.width}x${bitmap.height}")
 
                 CrashLogFile.log(TAG, "Querying similar interactions (async)...")
+
                 val similarInteractionsDeferred = async(Dispatchers.IO) {
                     try {
                         memoryRepository.findSimilar(
@@ -447,11 +468,12 @@ class VyzeCoreController(
                 CrashLogFile.log(TAG, "Similar interactions resolved: ${similarInteractions.size} found")
 
                 if (response == null) {
-                    // Only update state if this is still the active session
+                    // ALWAYS reset state — even if session was superseded
+                    isInferring.set(false)
                     if (currentSessionId == activeSessionId) {
-                        isInferring.set(false)
                         mainHandler.post {
-                            onStatusUpdate?.invoke("Inference failed")
+                            onStatusUpdate?.invoke("Inference returned empty response")
+                            onError?.invoke("No response from model")
                         }
                     }
                 } else {
@@ -473,13 +495,18 @@ class VyzeCoreController(
 
             } catch (e: Throwable) {
                 CrashLogFile.logError(TAG, "Snapshot trigger FAILED: ${e.javaClass.simpleName}: ${e.message}", e)
+                // ALWAYS reset isInferring — prevents indefinite ANALYZING state
+                isInferring.set(false)
                 if (currentSessionId == activeSessionId) {
-                    isInferring.set(false)
                     mainHandler.post {
                         onStatusUpdate?.invoke("Error: ${e.message}")
+                        onError?.invoke("Inference crashed: ${e.message}")
                     }
                 }
             } finally {
+                // Cancel watchdog — inference completed (success, error, or cancel)
+                mainHandler.removeCallbacks(watchdogRunnable)
+
                 CrashLogFile.log(TAG, "finally block — recycling bitmap")
                 try {
                     if (!bitmap.isRecycled) {
@@ -505,10 +532,10 @@ class VyzeCoreController(
             if (job.isActive) {
                 Log.d(TAG, "Cancelling in-flight inference job")
                 job.cancel()
-                isInferring.set(false)
             }
         }
         inferenceJob = null
+        isInferring.set(false)
     }
 
     fun cancelAndReset() {
@@ -565,5 +592,12 @@ class VyzeCoreController(
 
     companion object {
         private const val TAG = "VyzeCoreController"
+
+        /**
+         * Safety watchdog timeout (ms). If neither onComplete nor onError
+         * fires within this window, the pipeline is force-reset to prevent
+         * indefinite ANALYZING state.
+         */
+        private const val WATCHDOG_TIMEOUT_MS = 15_000L
     }
 }
