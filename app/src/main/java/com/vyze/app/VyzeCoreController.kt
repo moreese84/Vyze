@@ -485,6 +485,17 @@ class VyzeCoreController(
 
         resetSentenceBuffer()
 
+        // ── Dynamic Resolution Scaling ──────────────────────────
+        // Text-extraction queries ("read", "label", etc.) benefit from higher
+        // resolution (384x384) to capture fine-grained text details.
+        // Standard scene queries use 256x256 for faster inference.
+        val targetDimension = if (isTextExtractionQuery(query)) {
+            TEXT_EXTRACTION_DIMENSION
+        } else {
+            SCENE_QUERY_DIMENSION
+        }
+        CrashLogFile.log(TAG, "Target dimension: $targetDimension (query=\"${query?.take(40)}\")")
+
         onStatusUpdate("Analyzing snapshot...")        // ── Watchdog Timer ───────────────────────────────────────
         // If neither onComplete nor onError fires within WATCHDOG_TIMEOUT_MS,
         // force-reset the pipeline and notify the user. Prevents indefinite
@@ -576,7 +587,8 @@ class VyzeCoreController(
                     prompt = basePrompt,
                     memoryContext = null,
                     similarInteractions = emptyList(),
-                    sessionId = currentSessionId
+                    sessionId = currentSessionId,
+                    targetDimension = targetDimension
                 )
 
                 // ── CANCELLATION CHECK: bail out after VLM call if cancelled ──
@@ -741,6 +753,22 @@ class VyzeCoreController(
         Log.d(TAG, "VyzeCoreController destroyed")
     }
 
+    // ── Dynamic Resolution Scaling ──────────────────────────────
+
+    /**
+     * Detect text-extraction queries that benefit from higher resolution.
+     * Returns true if the query contains keywords indicating the user wants
+     * to read text, labels, signs, or documents.
+     *
+     * When true, the bitmap is scaled to 384x384 (vs 256x256 for scene queries)
+     * to capture finer text details for the VLM's OCR capabilities.
+     */
+    private fun isTextExtractionQuery(query: String?): Boolean {
+        if (query.isNullOrBlank()) return false
+        val lower = query.lowercase()
+        return TEXT_KEYWORDS.any { keyword -> lower.contains(keyword) }
+    }
+
     companion object {
         private const val TAG = "VyzeCoreController"
 
@@ -756,5 +784,23 @@ class VyzeCoreController(
         private const val MIN_EARLY_FLUSH_CHARS = 12
         private const val FIRST_CHUNK_MIN_WORDS = 1
         private const val FIRST_CHUNK_MIN_CHARS = 3
+
+        // ── Dynamic Resolution Constants ──────────────────────────
+
+        /** Higher resolution for text extraction (384x384 captures fine text details). */
+        private const val TEXT_EXTRACTION_DIMENSION = 384
+
+        /** Standard resolution for scene queries (256x256 for fast inference). */
+        private const val SCENE_QUERY_DIMENSION = 256
+
+        /** Keywords that trigger higher-resolution text extraction. */
+        private val TEXT_KEYWORDS = listOf(
+            "read", "label", "text", "sign", "document",
+            "ingredient", "word", "writing", "print",
+            "prescription", "medicine", "dosage", "instructions",
+            "menu", "book", "paper", "note", "letter",
+            "number", "phone", "address", "name",
+            "price", "tag", "caption", "title", "heading"
+        )
     }
 }

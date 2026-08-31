@@ -153,13 +153,33 @@ class VlmEngineManager(
             Log.i(TAG, "Model resolved: ${modelFile.absolutePath} (${modelFile.length()} bytes)")
             CrashLogFile.log(TAG, "Model: ${modelFile.absolutePath} (${modelFile.length() / (1024 * 1024)}MB)")
 
-            // Step 2: GPU-only backend — enforced for LiteRT-LM int4 model
+            // Step 2: Multi-backend fallback — NPU first, then GPU
+            // NPU (Neural Processing Unit) is preferred for lower power draw and
+            // faster inference on devices with dedicated AI accelerators.
+            // GPU (OpenCL/Vulkan) is the universal fallback for all ARM64 devices.
+            onStepProgress?.invoke(50, "Initializing NPU backend...")
+            CrashLogFile.log(TAG, "Step 2: Attempting NPU backend...")
+
+            val npuSuccess = tryInitializeWithBackend(modelFile, Backend.NPU(), "NPU")
+            if (npuSuccess) {
+                onStepProgress?.invoke(85, "Warming up NPU kernels...")
+                CrashLogFile.log(TAG, "Step 3: NPU warm-up (dummy inference)...")
+                warmUp()
+
+                onStepProgress?.invoke(95, "Finalizing...")
+                CrashLogFile.log(TAG, "=== INIT SUCCESS [NPU] ===")
+                Log.i(TAG, "Gemma 3n E2B loaded successfully [backend=NPU]")
+                return@withContext true
+            }
+
+            // NPU unavailable or failed — fall back to GPU
+            Log.w(TAG, "NPU backend unavailable, falling back to GPU")
+            CrashLogFile.log(TAG, "NPU failed — falling back to GPU backend")
             onStepProgress?.invoke(50, "Initializing GPU backend...")
-            CrashLogFile.log(TAG, "Step 2: Initializing GPU backend (enforced)...")
 
             val gpuSuccess = tryInitializeWithBackend(modelFile, Backend.GPU(), "GPU")
             if (gpuSuccess) {
-                // Step 3: GPU warm-up — pre-compile OpenCL/Vulkan kernels
+                // GPU warm-up — pre-compile OpenCL/Vulkan kernels
                 onStepProgress?.invoke(85, "Warming up GPU kernels...")
                 CrashLogFile.log(TAG, "Step 3: GPU warm-up (dummy inference)...")
                 warmUp()
@@ -170,8 +190,8 @@ class VlmEngineManager(
                 return@withContext true
             }
 
-            // GPU failed — no fallback to CPU for this model
-            val errorMsg = "VLM init failed: GPU backend required but initialization failed. " +
+            // Both NPU and GPU failed — no CPU fallback for this model size
+            val errorMsg = "VLM init failed: NPU and GPU backends both unavailable. " +
                 "CPU fallback is disabled for Gemma 3n E2B int4 model."
             Log.e(TAG, errorMsg)
             CrashLogFile.logError(TAG, errorMsg)
@@ -271,9 +291,10 @@ class VlmEngineManager(
      * `<start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n`
      * Image patch tokens are bound natively by the engine via Content.ImageBytes.
      *
-     * @param bitmap        Camera frame — will be downscaled to max 256×256 before inference
-     * @param prompt        User query describing what to analyze
-     * @param memoryContext Optional context string injected below the baseline instruction
+     * @param bitmap          Camera frame — will be downscaled to [targetDimension] before inference
+     * @param prompt          User query describing what to analyze
+     * @param memoryContext   Optional context string injected below the baseline instruction
+     * @param targetDimension Target bitmap dimension (256 for scene, 384 for text extraction)
      * @return The complete model response, or null on error
      */
     suspend fun analyzeImage(
@@ -281,7 +302,8 @@ class VlmEngineManager(
         prompt: String,
         memoryContext: String? = null,
         similarInteractions: List<SimilarInteraction> = emptyList(),
-        sessionId: String = ""
+        sessionId: String = "",
+        targetDimension: Int = MAX_INPUT_DIMENSION
     ): String? = withContext(Dispatchers.Default) {
         val eng = engine
         if (eng == null || !isInitialized) {
@@ -296,9 +318,9 @@ class VlmEngineManager(
             CrashLogFile.log(TAG, "=== ANALYZE IMAGE ===")
             CrashLogFile.log(TAG, "Input bitmap: ${bitmap.width}x${bitmap.height}")
 
-            // 1. Preprocess bitmap — downscale to max 256×256 to prevent OOM
-            scaledBitmap = preprocessBitmap(bitmap)
-            CrashLogFile.log(TAG, "Preprocessed: ${scaledBitmap.width}x${scaledBitmap.height}")
+            // 1. Preprocess bitmap — center-crop to square + scale to targetDimension
+            scaledBitmap = preprocessBitmap(bitmap, targetDimension)
+            CrashLogFile.log(TAG, "Preprocessed: ${scaledBitmap.width}x${scaledBitmap.height} (target=$targetDimension)")
 
             // 2. Encode image to JPEG bytes
             val imageBytes = bitmapToJpegBytes(scaledBitmap)
@@ -554,15 +576,17 @@ class VlmEngineManager(
      * Preprocess a camera bitmap for VLM input.
      *
      * 1. Center-crop to a 1:1 square aspect ratio (preserves spatial alignment)
-     * 2. Scale the square to MAX_INPUT_DIMENSION × MAX_INPUT_DIMENSION
+     * 2. Scale the square to [targetDimension] x [targetDimension]
      *
      * Center-cropping instead of squishing ensures that objects on the left
      * side of the camera frame remain on the left in the VLM input — no
      * spatial coordinate distortion.
      *
-     * @return A NEW 256×256 square bitmap (caller must recycle)
+     * @param source         Raw camera bitmap
+     * @param targetDimension 256 for standard scene queries, 384 for text extraction
+     * @return A NEW square bitmap (caller must recycle)
      */
-    private fun preprocessBitmap(source: Bitmap): Bitmap {
+    private fun preprocessBitmap(source: Bitmap, targetDimension: Int = MAX_INPUT_DIMENSION): Bitmap {
         val w = source.width
         val h = source.height
 
@@ -573,8 +597,8 @@ class VlmEngineManager(
         val cropped = Bitmap.createBitmap(source, x, y, size, size)
 
         // Step 2: Scale square to target dimension
-        return if (size > MAX_INPUT_DIMENSION) {
-            val scaled = Bitmap.createScaledBitmap(cropped, MAX_INPUT_DIMENSION, MAX_INPUT_DIMENSION, true)
+        return if (size > targetDimension) {
+            val scaled = Bitmap.createScaledBitmap(cropped, targetDimension, targetDimension, true)
             if (scaled !== cropped) cropped.recycle()
             scaled
         } else {
