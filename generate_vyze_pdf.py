@@ -8,7 +8,7 @@ class VyzePDF(FPDF):
     def header(self):
         self.set_font("Helvetica", "B", 10)
         self.set_text_color(100, 100, 100)
-        self.cell(0, 8, "Vyze - On-Device Visual Accessibility Assistant", align="R")
+        self.cell(0, 8, "Vyze - Offline AI Vision Assistant", align="R")
         self.ln(10)
 
     def footer(self):
@@ -79,7 +79,7 @@ def main():
     pdf.ln(18)
     pdf.set_font("Helvetica", "", 14)
     pdf.set_text_color(80, 80, 80)
-    pdf.cell(0, 10, "On-Device Visual Accessibility Assistant", align="C")
+    pdf.cell(0, 10, "Offline AI Vision Assistant", align="C")
     pdf.ln(12)
     pdf.set_font("Helvetica", "", 11)
     pdf.cell(0, 8, "Technical Summary & Architecture Overview", align="C")
@@ -88,7 +88,7 @@ def main():
     pdf.set_text_color(120, 120, 120)
     pdf.cell(0, 6, "Version 1.0  |  Android (arm64-v8a)  |  minSdk 26  |  targetSdk 34", align="C")
     pdf.ln(6)
-    pdf.cell(0, 6, "Kotlin 2.3.0  |  LiteRT-LM 0.16.1  |  Gemma 3n E2B int4", align="C")
+    pdf.cell(0, 6, "Kotlin 2.3.0  |  LiteRT-LM 0.16.1  |  Gemma 3n E2B int4  |  ML Kit OCR", align="C")
     pdf.ln(30)
 
     # -- Table of Contents --
@@ -102,13 +102,14 @@ def main():
         "3. Solution Architecture",
         "4. Core Components",
         "5. VLM Engine (Gemma 3n E2B)",
-        "6. Camera Pipeline",
-        "7. Speech Recognition & TTS",
-        "8. Adaptive Memory System",
-        "9. Performance Optimizations",
-        "10. Safety & Stability",
-        "11. Tech Stack",
-        "12. File Structure",
+        "6. ML Kit OCR Pipeline",
+        "7. Camera Pipeline",
+        "8. Speech Recognition & TTS",
+        "9. Adaptive Memory System",
+        "10. Performance Optimizations",
+        "11. Safety & Stability",
+        "12. Tech Stack",
+        "13. File Structure",
     ]
     for item in toc_items:
         pdf.set_font("Helvetica", "", 11)
@@ -120,25 +121,24 @@ def main():
     pdf.add_page()
     pdf.section_title("1. Executive Summary")
     pdf.body_text(
-        "Vyze is an offline, on-device visual accessibility assistant for Android that helps "
-        "blind and visually impaired users understand their surroundings in real time. The app "
-        "uses a local Gemma 3n E2B (Edge 2 Billion) multimodal vision-language model running "
-        "entirely on-device via Google's LiteRT-LM GPU backend to describe camera scenes, "
-        "read text, identify objects, and provide spatial navigation cues  --  all without any "
-        "internet connection or cloud dependency."
+        "Vyze is a fully offline AI vision assistant for Android that helps blind and "
+        "visually impaired users understand their surroundings in real time. Powered by "
+        "Gemma 3n E2B (2B parameter multimodal model) running on-device via Google's "
+        "LiteRT-LM framework with NPU/GPU acceleration."
     )
     pdf.body_text(
-        "Users interact hands-free through continuous speech recognition: they speak a question "
-        "like \"What is in front of me?\" or \"Read this label\", and Vyze captures a camera "
-        "frame, runs VLM inference, and speaks the result aloud via text-to-speech. The app "
-        "supports a continuous \"point-and-describe\" scanning mode similar to Gemini Live."
+        "Users interact hands-free through continuous speech recognition: they speak a "
+        "question like \"What is in front of me?\" or \"Read this label\", and Vyze captures "
+        "a camera frame, runs VLM inference (or fast ML Kit OCR for text queries), and "
+        "speaks the result aloud via sentence-buffered TTS streaming."
     )
     pdf.body_text(
-        "Key differentiators: (1) 100% offline  --  no data leaves the device, (2) real-time "
-        "voice-first UX with barge-in interruption, (3) adaptive memory that learns from past "
-        "interactions, (4) sub-second time-to-first-token via streaming sentence-buffered TTS, "
-        "and (5) aggressive latency optimizations including 256px image clamping, greedy "
-        "decoding, and GPU kernel pre-warming."
+        "Key differentiators: (1) 100% offline -- no data leaves the device, (2) real-time "
+        "voice-first UX with barge-in interruption, (3) adaptive memory that learns from "
+        "past interactions, (4) hybrid OCR pipeline (ML Kit + Gemma) for 300ms text "
+        "extraction, (5) user-driven language mirroring (auto-detect + respond in user's "
+        "language), and (6) aggressive latency optimizations achieving sub-2-second "
+        "time-to-first-audio."
     )
 
     # -- 2. Problem Statement --
@@ -153,20 +153,20 @@ def main():
     pdf.body_text(
         "Vyze addresses these gaps by running the entire vision-language pipeline locally on "
         "the user's phone. The Gemma 3n E2B model (3.66 GB int4 quantized) fits within mobile "
-        "GPU memory constraints while providing high-quality scene understanding and text "
-        "extraction capabilities."
+        "GPU memory constraints while providing high-quality scene understanding, text "
+        "extraction, and multi-language support."
     )
 
     # -- 3. Solution Architecture --
     pdf.section_title("3. Solution Architecture")
-    pdf.body_text(
-        "Vyze follows a modular architecture with clear separation of concerns:"
-    )
+    pdf.body_text("Vyze follows a modular architecture with clear separation of concerns:")
+
     pdf.bullet("Camera Layer: CameraX ImageAnalysis delivers frames to an in-memory buffer (zero disk I/O)")
-    pdf.bullet("VLM Engine: LiteRT-LM + Gemma 3n E2B performs multimodal inference on GPU")
-    pdf.bullet("Prompt Builder: Dynamic prompt system with navigation, direct-query, and continuous-mode rules")
-    pdf.bullet("TTS Manager: Neural voice synthesis with sentence-buffered streaming for instant audio")
-    pdf.bullet("Speech Recognizer: Android SpeechRecognizer with aggressive silence endpoints")
+    pdf.bullet("ML Kit OCR: Fast on-device text extraction (80-150ms) for text queries")
+    pdf.bullet("VLM Engine: LiteRT-LM + Gemma 3n E2B with NPU/GPU fallback")
+    pdf.bullet("Prompt Builder: Dynamic prompt system with navigation, direct-query, continuous-mode, and language mirror rules")
+    pdf.bullet("TTS Manager: Google neural TTS with sentence-buffered streaming and language-aware voice switching")
+    pdf.bullet("Speech Recognizer: Android SpeechRecognizer with aggressive silence endpoints + language detection")
     pdf.bullet("Adaptive Memory: Room database with vector similarity search for contextual recall")
     pdf.bullet("Core Controller: Orchestrates the full pipeline with session isolation and state management")
 
@@ -174,15 +174,17 @@ def main():
     pdf.sub_title("Data Flow")
     pdf.code_block(
         "User speaks \"What is this?\"\n"
-        "  -> SpeechRecognizer.onResults() extracts text\n"
-        "  -> CameraFragment.bargeInAndCapture() stops TTS + captures frame\n"
-        "  -> CameraSetupDelegate.takeSnapshot() copies fresh Bitmap from ImageAnalysis\n"
-        "  -> VyzeCoreController.triggerSnapshot() builds prompt + starts VLM inference\n"
-        "  -> VlmEngineManager.analyzeImage() sends Bitmap + prompt to Gemma 3n E2B\n"
+        "  -> SpeechRecognizer.onResults() extracts text + detected language\n"
+        "  -> CameraFragment updates TTS voice to match detected language\n"
+        "  -> VyzeCoreController.setUserLocale() switches TTS + prompt language\n"
+        "  -> CameraSetupDelegate.takeSnapshot() copies fresh Bitmap\n"
+        "  -> VyzeCoreController.triggerSnapshot() routes through OCR or VLM:\n"
+        "       TEXT QUERY: ML Kit OCR (80-150ms) -> Gemma interprets\n"
+        "       SCENE QUERY: Gemma 3n E2B direct inference\n"
         "  -> onTokenGenerated() streams tokens into sentenceBuffer\n"
-        "  -> flushSentenceBufferIfReady() sends clause-level chunks to TTSManager\n"
-        "  -> TTSManager.speak() plays audio with pendingUtteranceIds tracking\n"
-        "  -> onDone() resets to IDLE + restarts SpeechRecognizer for next query"
+        "  -> flushSentenceBufferIfReady() sends clause-level chunks to TTS\n"
+        "  -> TTS speaks in user's detected language with matching voice\n"
+        "  -> onDone() resets to IDLE + restarts SpeechRecognizer"
     )
 
     # -- 4. Core Components --
@@ -190,118 +192,161 @@ def main():
 
     pdf.sub_title("4.1 VyzeCoreController")
     pdf.body_text(
-        "The central orchestrator that manages the full capture-to-speech pipeline. Holds "
-        "references to VlmEngineManager, TTSManager, DynamicPromptBuilder, and MemoryRepository. "
-        "Key responsibilities:"
+        "The central orchestrator that manages the full capture-to-speech pipeline. "
+        "Routes text queries through ML Kit OCR first, then feeds clean text to Gemma "
+        "for interpretation. Manages session isolation, sentence streaming, and language mirroring."
     )
     pdf.bullet("Session isolation via UUID-based activeSessionId (prevents stale response leakage)")
+    pdf.bullet("OCR-first routing: ML Kit for text queries, Gemma for scene queries")
+    pdf.bullet("Language mirroring: stores activeUserLocale, passes to prompt builder + TTS")
     pdf.bullet("Coroutine-based inference with Job cancellation on new queries")
     pdf.bullet("Sentence-buffered TTS streaming with clause-boundary flushing")
-    pdf.bullet("Duplicate detection via lastDescribedObject cache with 3s debounce")
-    pdf.bullet("Bitmap center-cropping + downscaling for VLM input normalization")
+    pdf.bullet("Duplicate detection via lastDescribedObject cache with 4s debounce")
     pdf.bullet("15-second watchdog timer to prevent indefinite ANALYZING state")
 
     pdf.sub_title("4.2 VlmEngineManager")
     pdf.body_text(
-        "Wrapper around Google's LiteRT-LM framework that manages the Gemma 3n E2B engine lifecycle. "
-        "Provides the analyzeImage() API for multimodal inference."
+        "Wrapper around Google's LiteRT-LM framework that manages the Gemma 3n E2B "
+        "engine lifecycle. Provides NPU/GPU multi-backend fallback and the analyzeImage() API."
     )
-    pdf.bullet("GPU-only execution via Backend.GPU() with OpenCL/Vulkan acceleration")
+    pdf.bullet("Multi-backend fallback: NPU (preferred) -> GPU (fallback) -> Error")
     pdf.bullet("Model resolution from /storage/emulated/0/Download/ or getExternalFilesDir(null)")
-    pdf.bullet("Bitmap preprocessing: center-crop to 1:1 square + scale to 256x256 pixels")
-    pdf.bullet("Gemma turn-format prompting: <start_of_turn>user\\n...<end_of_turn>\\n<start_of_turn>model\\n")
-    pdf.bullet("Greedy decoding: maxTokens=35, temperature=0.1, topK=1 for fast mobile inference")
-    pdf.bullet("GPU warm-up: dummy 1x1 image pre-compiles OpenCL/Vulkan kernels on init")
+    pdf.bullet("Dynamic bitmap preprocessing: 256px (scene) or 384px (text) center-cropped squares")
+    pdf.bullet("Gemma turn-format prompting with compact system directives")
+    pdf.bullet("Greedy decoding: maxTokens=35, temperature=0.1, topK=1")
+    pdf.bullet("JPEG quality 75 with pre-allocated 8KB ByteArrayOutputStream")
+    pdf.bullet("GPU warm-up: dummy 1x1 image pre-compiles OpenCL/Vulkan kernels")
     pdf.bullet("Non-destructive interrupt: latch.countDown() without engine.close()")
 
-    pdf.sub_title("4.3 CameraSetupDelegate")
+    pdf.sub_title("4.3 OcrHelper")
     pdf.body_text(
-        "Manages CameraX use cases (Preview + ImageAnalysis) and provides zero-disk-I/O "
-        "frame extraction via in-memory Bitmap buffer."
+        "ML Kit on-device OCR wrapper supporting Latin and Chinese scripts. "
+        "Runs 10-30x faster than full VLM inference for text extraction."
     )
-    pdf.bullet("ImageAnalysis.Analyzer decodes YUV_888 to ARGB_8888 Bitmap at camera framerate")
-    pdf.bullet("Atomic frame swap with frameLock prevents recycling during snapshot extraction")
+    pdf.bullet("Latin script: English, Malay, Indonesian, Vietnamese, European languages (~5MB)")
+    pdf.bullet("Chinese script: Simplified + Traditional Chinese (~20MB)")
+    pdf.bullet("Auto-detects script in image, no manual routing needed")
+    pdf.bullet("Confidence scoring for fallback decisions")
+    pdf.bullet("Falls back to Gemma for handwriting and complex layouts")
+
+    pdf.sub_title("4.4 CameraSetupDelegate")
+    pdf.body_text(
+        "Manages CameraX use cases and provides zero-disk-I/O frame extraction."
+    )
+    pdf.bullet("ImageAnalysis.Analyzer decodes YUV_888 to ARGB_8888 at camera framerate")
+    pdf.bullet("Atomic frame swap with frameLock prevents recycling during extraction")
     pdf.bullet("Frame counter guarantees fresh frames on voice-triggered snapshots")
-    pdf.bullet("takeSnapshot() polls for post-query frame with 300ms timeout + PreviewView fallback")
+    pdf.bullet("takeSnapshot() polls for post-query frame with 300ms timeout + fallback")
 
     # -- 5. VLM Engine --
     pdf.add_page()
-    pdf.section_title("5. VLM Engine  --  Gemma 3n E2B")
+    pdf.section_title("5. VLM Engine -- Gemma 3n E2B")
     pdf.body_text(
         "The vision-language model is Google's Gemma 3n E2B (Edge 2 Billion parameters), "
         "int4 quantized to 3.66 GB. It runs entirely on-device via the LiteRT-LM framework "
-        "with GPU acceleration."
+        "with NPU/GPU acceleration."
     )
 
     pdf.sub_title("Model Specifications")
     pdf.kv_row("Model:", "gemma-3n-E2B-it-int4.litertlm")
     pdf.kv_row("Size:", "3.66 GB (int4 quantized)")
     pdf.kv_row("Parameters:", "~2 billion")
-    pdf.kv_row("Backend:", "GPU (OpenCL/Vulkan)")
+    pdf.kv_row("Backend:", "NPU (preferred) -> GPU (fallback)")
     pdf.kv_row("Framework:", "LiteRT-LM 0.16.1")
     pdf.kv_row("Max Output Tokens:", "35 (greedy)")
     pdf.kv_row("Temperature:", "0.1")
     pdf.kv_row("Top-K:", "1")
-    pdf.kv_row("Image Input:", "256x256 center-cropped square")
+    pdf.kv_row("Image Input:", "256x256 or 384x384 center-cropped square")
     pdf.kv_row("Prompt Format:", "Gemma turn system (<start_of_turn>)")
 
     pdf.sub_title("Inference Pipeline")
     pdf.code_block(
-        "1. Bitmap center-crop to 1:1 square (preserves spatial alignment)\n"
-        "2. Scale to 256x256 pixels (minimizes prefill time)\n"
-        "3. JPEG encode to byte array (avoids raw Bitmap overhead)\n"
-        "4. Build Gemma turn-format prompt with system directive + query\n"
-        "5. Create Conversation with ConversationConfig(samplerConfig)\n"
-        "6. Engine.sendMessageAsync(contents, callback)\n"
-        "7. Stream tokens via onTokenGenerated callback\n"
-        "8. CountDownLatch.await() blocks until onDone fires\n"
-        "9. Return full response string to VyzeCoreController"
+        "1. Detect query type (text vs scene)\n"
+        "2. If text query: run ML Kit OCR first (80-150ms)\n"
+        "3. Center-crop bitmap to 1:1 square (preserves spatial alignment)\n"
+        "4. Scale to 256px (scene) or 384px (text extraction)\n"
+        "5. JPEG encode at quality=75 (pre-allocated 8KB buffer)\n"
+        "6. Build compact prompt with language mirror directive\n"
+        "7. Inject OCR text if available (skips character-level reading)\n"
+        "8. Create Conversation with SamplerConfig(topK=1, temp=0.1)\n"
+        "9. Engine.sendMessageAsync(contents, callback)\n"
+        "10. Stream tokens via onTokenGenerated callback\n"
+        "11. Sentence-buffered flush to TTS at clause boundaries"
     )
 
-    # -- 6. Camera Pipeline --
-    pdf.section_title("6. Camera Pipeline")
+    # -- 6. ML Kit OCR Pipeline --
+    pdf.section_title("6. ML Kit OCR Pipeline")
     pdf.body_text(
-        "Vyze uses CameraX with two use cases: Preview (for the user to see what they're "
-        "pointing at) and ImageAnalysis (for frame extraction). The pipeline is optimized "
-        "for zero-disk-I/O and minimal latency."
+        "Vyze uses a hybrid OCR approach: ML Kit for fast text extraction, Gemma for "
+        "intelligent interpretation. This achieves 10-30x faster text recognition compared "
+        "to using the VLM alone."
+    )
+
+    pdf.sub_title("How It Works")
+    pdf.code_block(
+        "Text query arrives (\"Read this label\")\n"
+        "  -> isTextExtractionQuery() detects keyword\n"
+        "  -> ML Kit OCR runs on bitmap (80-150ms)\n"
+        "     Latin script first, then Chinese if nothing found\n"
+        "  -> OCR text injected into prompt: \"OCR: Diclac Retard...\"\n"
+        "  -> Gemma receives clean text + image\n"
+        "  -> Interprets immediately (skips character-level reading)\n"
+        "  -> TTS speaks result (~300-500ms total)"
+    )
+
+    pdf.sub_title("Supported Scripts")
+    pdf.kv_row("Latin:", "English, Malay, Indonesian, Vietnamese, Turkish, European (~5MB)")
+    pdf.kv_row("Chinese:", "Simplified + Traditional Chinese (~20MB)")
+    pdf.kv_row("Total overhead:", "~25MB added to APK")
+
+    pdf.sub_title("Fallback Behavior")
+    pdf.bullet("ML Kit returns good text -> Gemma interprets with context")
+    pdf.bullet("ML Kit returns nothing -> checks for handwriting -> falls back to Gemma")
+    pdf.bullet("Gemma handles handwriting, complex layouts, spatial context")
+
+    # -- 7. Camera Pipeline --
+    pdf.section_title("7. Camera Pipeline")
+    pdf.body_text(
+        "Vyze uses CameraX with ImageAnalysis for zero-disk-I/O frame extraction. "
+        "All processing happens in memory -- no takePicture, no JPEG decode from disk."
     )
 
     pdf.sub_title("Frame Extraction Flow")
-    pdf.bullet("ImageAnalysis.Analyzer runs on a single-thread ExecutorService (30fps)")
+    pdf.bullet("ImageAnalysis.Analyzer runs on single-thread ExecutorService")
     pdf.bullet("YUV_888 -> ARGB_8888 conversion with rotation correction")
-    pdf.bullet("New frame swapped into AtomicReference<Bitmap?> via getAndSet()")
-    pdf.bullet("Old frame recycled after acquiring frameLock (prevents use-after-free)")
+    pdf.bullet("New frame swapped into AtomicReference via getAndSet()")
     pdf.bullet("Frame counter incremented to signal fresh frame availability")
 
     pdf.sub_title("Snapshot Capture")
     pdf.bullet("takeSnapshot() records frameCounter at query time")
     pdf.bullet("Polls for frameCounter > counterAtQuery (guarantees fresh frame)")
-    pdf.bullet("300ms timeout with fallback to latestFrame.get() if no new frame arrives")
-    pdf.bullet("Deep copy via Bitmap.copy(ARGB_8888, true) on analysis thread")
-    pdf.bullet("Bitmap.isRecycled + getPixel(0,0) validation before VLM inference")
+    pdf.bullet("300ms timeout with fallback to latestFrame.get()")
+    pdf.bullet("Deep copy via Bitmap.copy(ARGB_8888, true) before VLM")
 
-    # -- 7. Speech Recognition & TTS --
+    # -- 8. Speech Recognition & TTS --
     pdf.add_page()
-    pdf.section_title("7. Speech Recognition & TTS")
+    pdf.section_title("8. Speech Recognition & TTS")
 
-    pdf.sub_title("7.1 Speech Recognition")
+    pdf.sub_title("8.1 Speech Recognition")
     pdf.body_text(
-        "Uses Android's SpeechRecognizer with aggressive silence endpoints for fast "
-        "response to short queries like \"What is this?\""
+        "Uses Android's SpeechRecognizer with aggressive silence endpoints and "
+        "automatic language detection for fast, hands-free interaction."
     )
     pdf.bullet("COMPLETE_SILENCE_LENGTH: 400ms (was 1500ms)")
     pdf.bullet("POSSIBLY_COMPLETE_SILENCE_LENGTH: 300ms (was 1500ms)")
-    pdf.bullet("MINIMUM_LENGTH: 1000ms (new)")
+    pdf.bullet("MINIMUM_LENGTH: 1000ms")
     pdf.bullet("PARTIAL_RESULTS: true (enables early intent parsing)")
+    pdf.bullet("Language detection: EXTRA_LANGUAGE from speech results")
     pdf.bullet("Auto-restart after TTS completes (continuous hands-free loop)")
-    pdf.bullet("200ms settle delay after TTS stop to prevent mic hearing barge-in tap")
 
-    pdf.sub_title("7.2 Text-to-Speech")
+    pdf.sub_title("8.2 Text-to-Speech")
     pdf.body_text(
-        "Neural voice synthesis via Google TTS engine with deterministic completion tracking."
+        "Neural voice synthesis via Google TTS engine with language-aware voice switching "
+        "and deterministic completion tracking."
     )
     pdf.bullet("Engine: Google TTS (com.google.android.tts) for neural voice quality")
     pdf.bullet("Voice selection: Highest QUALITY_HIGH/QUALITY_VERY_HIGH voice for locale")
+    pdf.bullet("Language mirroring: Auto-switches TTS voice to match detected spoken language")
     pdf.bullet("Pitch: 0.96f (-2%) for warmer, non-metallic tone")
     pdf.bullet("Rate: 0.98f (-2%) for conversational cadence")
     pdf.bullet("Audio: USAGE_ASSISTANCE_ACCESSIBILITY (non-duckable)")
@@ -309,19 +354,30 @@ def main():
     pdf.bullet("Audio Focus: AUDIOFOCUS_GAIN_TRANSIENT")
     pdf.bullet("Cadence: Punctuation-aware spacing for natural pauses")
 
-    pdf.sub_title("7.3 Sentence-Buffered Streaming")
+    pdf.sub_title("8.3 Language Mirroring")
+    pdf.body_text(
+        "Vyze automatically detects the user's spoken language and mirrors it to both "
+        "Gemma's output and the TTS voice. No hardcoded language lists."
+    )
+    pdf.bullet("SpeechRecognizer extracts EXTRA_LANGUAGE from results Bundle")
+    pdf.bullet("Locale.forLanguageTag() converts BCP-47 tag to java.util.Locale")
+    pdf.bullet("DynamicPromptBuilder adds: \"Respond strictly in {language}.\"")
+    pdf.bullet("TTSManager.switchToLocale() selects best neural voice for language")
+    pdf.bullet("Falls back to Locale.US if no voice pack installed")
+
+    pdf.sub_title("8.4 Sentence-Buffered Streaming")
     pdf.body_text(
         "Tokens from VLM inference are buffered and flushed at natural clause boundaries "
         "for minimal time-to-first-audio."
     )
     pdf.bullet("First chunk: flush at >=1 word or >=3 characters (instant feedback)")
-    pdf.bullet("Subsequent chunks: flush at commas/colons (12+ chars) or sentence terminators (20+ chars)")
-    pdf.bullet("Final flush: force-flush all remaining text on onComplete (no minimum)")
+    pdf.bullet("Subsequent chunks: flush at commas/colons (12+ chars) or terminators (10+ chars)")
+    pdf.bullet("Final flush: force-flush all remaining text on onComplete")
     pdf.bullet("Utterance ID tracking via pendingUtteranceIds (deterministic, no polling)")
     pdf.bullet("400ms post-drain grace period for AudioTrack hardware buffer")
 
-    # -- 8. Adaptive Memory --
-    pdf.section_title("8. Adaptive Memory System")
+    # -- 9. Adaptive Memory --
+    pdf.section_title("9. Adaptive Memory System")
     pdf.body_text(
         "Vyze maintains a local Room database that records interactions, user preferences, "
         "and environment context to provide increasingly personalized assistance."
@@ -329,49 +385,54 @@ def main():
 
     pdf.sub_title("Data Schema")
     pdf.code_block(
+        "VyzeMemoryEntity:\n"
+        "  - category: String (preference/environment/interaction)\n"
+        "  - key: String\n"
+        "  - value: String\n"
+        "  - metadata: String (query text for interactions)\n"
+        "  - timestamp: Long\n"
+        "\n"
         "InteractionRecord:\n"
         "  - id: Long (auto-generated)\n"
         "  - timestamp: Long\n"
-        "  - imageEmbedding: FloatArray (MediaPipe Vision Embedder)\n"
+        "  - imageEmbedding: FloatArray (vector similarity)\n"
         "  - rawPrompt: String\n"
         "  - generatedOutput: String\n"
-        "  - userFeedback: String (edited text or preference tags)\n"
-        "\n"
-        "MemoryDao:\n"
-        "  - getAllPreferences(): List<Preference>\n"
-        "  - getRecentEnvironment(limit): List<EnvironmentMemory>\n"
-        "  - findSimilar(embedding, k): List<SimilarInteraction>"
+        "  - userFeedback: String"
     )
 
     pdf.sub_title("Contextual Prompt Injection")
     pdf.bullet("Similar past interactions retrieved via vector similarity search")
-    pdf.bullet("User preferences injected as section in prompt payload")
-    pdf.bullet("Environment context (room layouts, frequent objects) included")
+    pdf.bullet("User preferences injected as compact section in prompt")
+    pdf.bullet("Environment context included for spatial continuity")
     pdf.bullet("All queries execute off-main-thread via Dispatchers.IO")
 
-    # -- 9. Performance Optimizations --
+    # -- 10. Performance Optimizations --
     pdf.add_page()
-    pdf.section_title("9. Performance Optimizations")
+    pdf.section_title("10. Performance Optimizations")
 
     optimizations = [
-        ("Image Preprocessing", "Center-crop to 1:1 square + scale to 256x256 (4x fewer pixels than 512x512)"),
-        ("Greedy Decoding", "maxTokens=35, temperature=0.1, topK=1 for fastest token generation"),
-        ("Minimal Prompts", "CONTINUOUS_MODE_RULES: 72 chars vs 289 chars (75% fewer prefill tokens)"),
-        ("First-Chunk Flush", "1 word / 3 chars triggers first TTS audio (~200ms after first tokens)"),
-        ("GPU Warm-up", "Dummy 1x1 image pre-compiles OpenCL/Vulkan kernels on app launch"),
-        ("Zero Disk I/O", "In-memory Bitmap buffer from ImageAnalysis (no takePicture + JPEG decode)"),
-        ("Frame Counter", "Guarantees fresh frame on every voice query (no stale frame reuse)"),
-        ("Speech Rate", "1.15x TTS playback speed reduces total utterance duration"),
-        ("Barge-In", "Instant TTS stop on touch/speech input (200ms settle before mic restart)"),
-        ("Engine Interrupt", "latch.countDown() releases blocking await without destroying engine"),
+        ("Prompt Trimming", "Compact system directives: ~80 tokens prefill (was ~875 tokens)"),
+        ("ML Kit OCR Pre-pass", "Text queries: 300-500ms (was 4-6s with VLM only)"),
+        ("Dynamic Resolution", "256px for scenes, 384px for text (auto-detected by keywords)"),
+        ("Greedy Decoding", "maxTokens=35, temperature=0.1, topK=1 for fastest generation"),
+        ("First-Chunk Flush", "1 word / 3 chars triggers first TTS audio (~200ms)"),
+        ("GPU Warm-up", "Dummy 1x1 image pre-compiles OpenCL/Vulkan kernels on init"),
+        ("JPEG Optimization", "Quality 75 + pre-allocated 8KB buffer (15-30ms faster)"),
+        ("Zero Disk I/O", "In-memory Bitmap buffer from ImageAnalysis"),
+        ("Frame Counter", "Guarantees fresh frame on every voice query"),
+        ("Engine Interrupt", "latch.countDown() releases await without destroying engine"),
         ("Session Isolation", "UUID-based activeSessionId prevents stale callback leakage"),
-        ("Center-Crop", "Preserves spatial alignment (left/right positioning) for VLM input"),
+        ("NPU/GPU Fallback", "Auto-tries NPU first, falls back to GPU"),
+        ("Language Mirroring", "Auto-detect + respond in user's language"),
+        ("Barge-In", "Instant TTS stop on touch/speech input"),
+        ("Watchdog Timer", "15s timeout prevents indefinite ANALYZING state"),
     ]
     for title, desc in optimizations:
         pdf.bullet(f"{title}: {desc}")
 
-    # -- 10. Safety & Stability --
-    pdf.section_title("10. Safety & Stability")
+    # -- 11. Safety & Stability --
+    pdf.section_title("11. Safety & Stability")
 
     pdf.sub_title("State Machine")
     pdf.code_block(
@@ -382,23 +443,20 @@ def main():
 
     pdf.sub_title("Crash Prevention")
     pdf.bullet("15-second watchdog timer forces ANALYZING -> IDLE if inference hangs")
-    pdf.bullet("Bitmap.isRecycled + getPixel(0,0) corruption check before VLM inference")
+    pdf.bullet("Bitmap.isRecycled + getPixel(0,0) corruption check before VLM")
     pdf.bullet("Session ID gating on all callbacks (onTokenGenerated, onComplete, onError)")
-    pdf.bullet("Coroutine Job cancellation with isActive checks at 3 points in inference")
+    pdf.bullet("Coroutine Job cancellation with isActive checks at 3 points")
     pdf.bullet("Non-destructive interrupt: engine stays alive for next query")
-    pdf.bullet("FrameLock prevents bitmap recycling during snapshot extraction")
-    pdf.bullet("isCapturing AtomicBoolean prevents concurrent frame extractions")
     pdf.bullet("1-second debounce on trigger events prevents double-fire")
 
     pdf.sub_title("Memory Management")
-    pdf.bullet("Bitmap.recycle() in finally blocks for both original and scaled bitmaps")
-    pdf.bullet("CameraSetupDelegate recycles old frames after frameLock acquisition")
-    pdf.bullet("Error log pruning: 7-day retention window on cold start")
+    pdf.bullet("Bitmap.recycle() in finally blocks for original and scaled bitmaps")
     pdf.bullet("Conversation lifecycle: manual close() (not use{}) to prevent SIGSEGV")
+    pdf.bullet("Coroutines 1.10.1 (fixed SendChannel.close$default crash with Kotlin 2.3.0)")
 
-    # -- 11. Tech Stack --
+    # -- 12. Tech Stack --
     pdf.add_page()
-    pdf.section_title("11. Technology Stack")
+    pdf.section_title("12. Technology Stack")
 
     pdf.sub_title("Languages & Frameworks")
     pdf.kv_row("Language:", "Kotlin 2.3.0")
@@ -410,8 +468,9 @@ def main():
     pdf.sub_title("AI & ML")
     pdf.kv_row("VLM Model:", "Gemma 3n E2B int4 (3.66 GB)")
     pdf.kv_row("Inference:", "LiteRT-LM 0.16.1 (Google)")
-    pdf.kv_row("GPU Backend:", "OpenCL/Vulkan via Backend.GPU()")
-    pdf.kv_row("Embeddings:", "MediaPipe Vision Embedder")
+    pdf.kv_row("Backend:", "NPU -> GPU fallback chain")
+    pdf.kv_row("OCR:", "ML Kit Text Recognition (Latin + Chinese)")
+    pdf.kv_row("OCR Size:", "~25MB total (5MB Latin + 20MB Chinese)")
 
     pdf.sub_title("Android Libraries")
     pdf.kv_row("Camera:", "CameraX 1.3.1")
@@ -424,20 +483,21 @@ def main():
     pdf.sub_title("Build & Release")
     pdf.kv_row("Release Build:", "R8 minification + resource shrinking")
     pdf.kv_row("JNI Packaging:", "useLegacyPackaging = true (uncompressed .so)")
-    pdf.kv_row("Model Assets:", "noCompress += \"litertlm\" (uncompressed in APK)")
+    pdf.kv_row("NDK Filters:", "arm64-v8a only")
 
-    # -- 12. File Structure --
-    pdf.section_title("12. Key File Structure")
+    # -- 13. File Structure --
+    pdf.section_title("13. Key File Structure")
 
     files = [
         ("VyzeApplication.kt", "App singleton, dependency injection, global error handler"),
-        ("MainActivity.kt", "Speech recognition, TTS integration, lifecycle management"),
-        ("VyzeCoreController.kt", "Pipeline orchestrator, session management, sentence buffering"),
-        ("VlmEngineManager.kt", "LiteRT-LM wrapper, Gemma 3n E2B engine lifecycle"),
+        ("MainActivity.kt", "Speech recognition, language detection, TTS orchestration"),
+        ("VyzeCoreController.kt", "Pipeline orchestrator, OCR routing, session management"),
+        ("VlmEngineManager.kt", "LiteRT-LM wrapper, NPU/GPU fallback, Gemma engine lifecycle"),
+        ("DynamicPromptBuilder.kt", "Prompt assembly with language mirror + intent-based rules"),
+        ("OcrHelper.kt", "ML Kit OCR wrapper (Latin + Chinese scripts)"),
         ("CameraSetupDelegate.kt", "CameraX setup, frame buffer, bitmap extraction"),
         ("CameraFragment.kt", "Camera UI, voice triggers, continuous mode, state machine"),
-        ("DynamicPromptBuilder.kt", "Prompt assembly with navigation/direct/continuous rules"),
-        ("TTSManager.kt", "Neural TTS, voice selection, utterance tracking, audio focus"),
+        ("TTSManager.kt", "Neural TTS, voice switching, utterance tracking, audio focus"),
         ("MemoryRepository.kt", "Adaptive memory, vector search, interaction records"),
         ("VyzeDatabase.kt", "Room database, DAOs, entities"),
     ]
