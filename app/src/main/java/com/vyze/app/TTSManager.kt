@@ -9,6 +9,7 @@ import android.os.Handler
 import android.os.Looper
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
+import android.speech.tts.Voice
 import android.util.Log
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
@@ -158,7 +159,14 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
     init {
         Log.i(TAG, "TTSManager created — locked stream volume=$lockedStreamVolume " +
             "(max=$streamMaxVolume, stream=ACCESSIBILITY)")
-        tts = TextToSpeech(appContext, this)
+        // Force Google TTS engine for consistent neural voice quality.
+        // System OEM engines (Samsung, Huawei) often produce robotic output.
+        tts = try {
+            TextToSpeech(appContext, this, GOOGLE_TTS_ENGINE)
+        } catch (e: Throwable) {
+            Log.w(TAG, "Google TTS engine not available, falling back to system: ${e.message}")
+            TextToSpeech(appContext, this)
+        }
         Log.d(TAG, "TTS constructor called, waiting for onInit callback")
     }
 
@@ -191,15 +199,23 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
 
             tts?.setAudioAttributes(ttsAudioAttributes)
 
-            // Accelerated speech rate — 15% faster than default for lower latency.
-            // Preserves clarity while reducing total utterance duration.
-            tts?.setSpeechRate(1.15f)
+            // ── Voice Quality Selection ──────────────────────────────
+            // Iterate available voices and select the highest-quality neural
+            // voice for the active locale. Avoids KEY_FEATURE_NOT_INSTALLED
+            // (missing voice data) and prefers QUALITY_VERY_HIGH / QUALITY_HIGH.
+            selectBestVoice(currentLocale)
+
+            // ── Prosody Tuning ───────────────────────────────────────
+            // Slightly warmer pitch (-2%) and conversational rate (-2%)
+            // eliminate flat, metallic synth tones while staying natural.
+            tts?.setPitch(WARM_PITCH)
+            tts?.setSpeechRate(WARM_RATE)
 
             // Set the GLOBAL utterance progress listener — tracks ALL utterances
             tts?.setOnUtteranceProgressListener(globalUtteranceListener)
 
             Log.i(TAG, "TTS setup OK — locale=$currentLocale, engine=${tts?.defaultEngine}, " +
-                "lockedVolume=$lockedStreamVolume, speechRate=1.15")
+                "lockedVolume=$lockedStreamVolume, pitch=$WARM_PITCH, rate=$WARM_RATE")
 
             mainHandler.postDelayed({
                 isInitialized = true
@@ -316,11 +332,14 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
         lastSpeechTime = now
         lastSpokenText = text
 
+        // Enhance text with natural prosody pauses before synthesis
+        val enhancedText = enhanceForNaturalProsody(text)
+
         requestAudioFocus()
 
         val id = utteranceId ?: nextUtteranceId()
         val params = buildSpeakParams()
-        val result = tts?.speak(text, queueMode, params, id) ?: TextToSpeech.ERROR
+        val result = tts?.speak(enhancedText, queueMode, params, id) ?: TextToSpeech.ERROR
 
         if (result != TextToSpeech.SUCCESS) {
             Log.e(TAG, "speak() FAILED code=$result, text=\"${text.take(60)}\", id=$id")
@@ -358,6 +377,9 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
         lastSpeechTime = now
         lastSpokenText = text
 
+        // Enhance text with natural prosody pauses before synthesis
+        val enhancedText = enhanceForNaturalProsody(text)
+
         tts?.stop()
         pendingUtteranceIds.clear()
 
@@ -365,7 +387,7 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
 
         val id = nextUtteranceId()
         val params = buildSpeakParams()
-        val result = tts?.speak(text, TextToSpeech.QUEUE_FLUSH, params, id) ?: TextToSpeech.ERROR
+        val result = tts?.speak(enhancedText, TextToSpeech.QUEUE_FLUSH, params, id) ?: TextToSpeech.ERROR
 
         if (result != TextToSpeech.SUCCESS) {
             Log.e(TAG, "speakImmediate() FAILED code=$result, text=\"${text.take(60)}\", id=$id")
@@ -518,6 +540,86 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
         }
     }
 
+    // ── Voice Quality Selection ──────────────────────────────────
+
+    /**
+     * Scan available voices and select the highest-quality neural voice
+     * for the given locale. Avoids voices with KEY_FEATURE_NOT_INSTALLED
+     * (missing voice data that causes silent failures).
+     *
+     * Quality priority: VERY_HIGH > HIGH > NORMAL > LOW
+     * Within the same quality tier, prefer neural/network voices.
+     */
+    private fun selectBestVoice(locale: Locale) {
+        val engine = tts ?: return
+        val voices = engine.voices
+        if (voices.isNullOrEmpty()) {
+            Log.w(TAG, "selectBestVoice: no voices available")
+            return
+        }
+
+        val localeVoices = voices.filter { voice ->
+            voice.locale.language == locale.language &&
+                !voice.features.contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED)
+        }
+
+        if (localeVoices.isEmpty()) {
+            Log.d(TAG, "selectBestVoice: no voices for $locale, using engine default")
+            return
+        }
+
+        // Sort: highest quality first, then prefer neural/network voices
+        val best = localeVoices.sortedWith(
+            compareByDescending<Voice> { it.quality }
+                .thenByDescending { it.isNetworkConnectionRequired }
+        ).first()
+
+        engine.voice = best
+        Log.i(TAG, "selectBestVoice: chose '${best.name}' quality=${best.quality} " +
+            "locale=${best.locale} network=${best.isNetworkConnectionRequired}")
+    }
+
+    // ── Natural Prosody Enhancement ───────────────────────────────
+
+    /**
+     * Inject subtle cadence micro-pauses into text before TTS synthesis.
+     *
+     * Android's TextToSpeech does NOT process SSML tags — they are read
+     * aloud as literal text. Instead, this method uses native punctuation
+     * cues that all TTS engines interpret as prosody signals:
+     *
+     * - Periods / question marks / exclamation marks: already cause natural
+     *   sentence-level pauses (~200-300ms). We ensure they are followed by
+     *   a space so the engine doesn't clip the trailing phoneme.
+     * - Commas: cause ~90-120ms clause breaks. We ensure trailing space.
+     * - Colons / semicolons: cause ~100-150ms breaks.
+     *
+     * This method is idempotent — double-wrapping is safe.
+     */
+    private fun enhanceForNaturalProsody(text: String): String {
+        if (text.isBlank()) return text
+
+        var enhanced = text.trim()
+
+        // Ensure sentence terminators are followed by a space (prevents phoneme clipping)
+        enhanced = enhanced.replace(Regex("([.!?])([A-Za-z0-9])"), "$1 $2")
+
+        // Ensure commas are followed by a space (triggers ~100ms clause break)
+        enhanced = enhanced.replace(Regex("(,)([A-Za-z0-9])"), "$1 $2")
+
+        // Ensure colons/semicolons are followed by a space
+        enhanced = enhanced.replace(Regex("([:;])([A-Za-z0-9])"), "$1 $2")
+
+        // Add trailing period if missing — prevents the TTS engine from
+        // clipping the final phoneme of the last word.
+        if (enhanced.isNotEmpty() && !enhanced.last().isWhitespace() &&
+            enhanced.last() !in charArrayOf('.', '!', '?')) {
+            enhanced = "$enhanced."
+        }
+
+        return enhanced
+    }
+
     // ── Locale Switching ──────────────────────────────────────────
 
     fun setLanguage(languageKey: String, context: Context) {
@@ -632,5 +734,24 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
         const val ENGINE_SETTLE_DELAY_MS = 200L
         const val DRAIN_RETRY_INTERVAL_MS = 200L
         const val DRAIN_RETRY_MS = 5000L
+
+        // ── Voice Quality & Prosody Constants ───────────────────────
+
+        /** Force Google TTS engine for consistent neural voice quality. */
+        private const val GOOGLE_TTS_ENGINE = "com.google.android.tts"
+
+        /**
+         * Warmer pitch (-2%): eliminates flat, metallic synth tones.
+         * Default 1.0f → 0.96f gives a subtly warmer, more human tone
+         * without sounding unnatural or pitch-shifted.
+         */
+        private const val WARM_PITCH = 0.96f
+
+        /**
+         * Conversational rate (-2%): slightly slower than default to
+         * allow natural cadence and emphasis. Combined with the pitch
+         * adjustment, produces a warmer, more human-sounding voice.
+         */
+        private const val WARM_RATE = 0.98f
     }
 }
