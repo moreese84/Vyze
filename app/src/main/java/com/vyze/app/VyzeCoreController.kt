@@ -18,6 +18,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
+import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -49,6 +50,7 @@ class VyzeCoreController(
     private val memoryRepository = MemoryRepository(interactionDao)
     private val vlmEngine = VlmEngineManager(context, memoryRepository)
     private val promptBuilder = DynamicPromptBuilder(memoryDao)
+    private val ocrHelper = OcrHelper()
 
     private val isInferring = AtomicBoolean(false)
 
@@ -73,6 +75,12 @@ class VyzeCoreController(
 
     private val DEBOUNCE_GAP_MS = 4000L
 
+    // ── Language Mirroring ────────────────────────────────────────
+    // Detected from SpeechRecognizer. Passed to DynamicPromptBuilder
+    // for language mirror directive and to TTSManager for voice switching.
+    @Volatile
+    private var activeUserLocale: Locale = Locale.US
+
     // ── Sentence Buffer (Token Streaming) ─────────────────────────
 
     private val sentenceBuffer = StringBuilder()
@@ -86,7 +94,7 @@ class VyzeCoreController(
     /** Early flush at commas/colons for faster TTFT — no min char threshold. */
     private val EARLY_FLUSH_TERMINATORS = charArrayOf(',', ':')
 
-    private val minFlushChars = 20
+    private val minFlushChars = 10
 
     /** Monotonically increasing counter for unique utterance IDs per session. */
     private val chunkCounter = java.util.concurrent.atomic.AtomicInteger(0)
@@ -566,16 +574,37 @@ class VyzeCoreController(
                     }
                 } else bitmap
 
+                // ── OCR PRE-PASS (text queries only) ──────────────
+                // ML Kit OCR is 10-30x faster than full VLM inference.
+                // For text queries, run OCR first, then feed clean text
+                // to Gemma for interpretation — skips character-level reading.
+                var ocrText: String? = null
+                val isTextQuery = isTextExtractionQuery(query)
+
+                if (isTextQuery) {
+                    CrashLogFile.log(TAG, "Text query detected — running ML Kit OCR first...")
+                    ocrText = ocrHelper.extractText(inferenceBitmap)
+                    CrashLogFile.log(TAG, "OCR result: ${ocrText?.take(100) ?: "(none)"}")
+                }
+
+                // ── CANCELLATION CHECK: bail out before prompt build ──
+                if (!isActive) {
+                    Log.d(TAG, "Job cancelled before prompt build — aborting")
+                    return@launch
+                }
+
                 CrashLogFile.log(TAG, "Building prompt...")
                 val basePrompt = promptBuilder.buildPrompt(
                     snapshotDescription = query ?: "User triggered a camera snapshot.",
                     queryOverride = query,
                     similarInteractions = emptyList(),
-                    continuousMode = continuousMode
+                    continuousMode = continuousMode,
+                    userLocale = activeUserLocale,
+                    ocrText = ocrText
                 )
                 CrashLogFile.log(TAG, "Base prompt built: ${basePrompt.length} chars")
 
-                // ── CANCELLATION CHECK: bail out before expensive VLM call ──
+                // ── CANCELLATION CHECK: bail out before VLM call ──
                 if (!isActive) {
                     Log.d(TAG, "Job cancelled before VLM call — aborting")
                     return@launch
@@ -709,6 +738,29 @@ class VyzeCoreController(
         Log.d(TAG, "cancelAndReset: pipeline fully reset")
     }
 
+    // ── Language Mirroring ────────────────────────────────────────
+
+    /**
+     * Lock TTS voice + prompt language to the user's detected spoken language.
+     * Called from CameraFragment when SpeechRecognizer returns results.
+     *
+     * @param detectedLocale Language detected by SpeechRecognizer, or null
+     *                       (falls back to Locale.US if null or unsupported)
+     */
+    fun setUserLocale(detectedLocale: Locale?) {
+        val locale = detectedLocale?.takeIf {
+            it.language.isNotBlank() && it != Locale("und")
+        } ?: Locale.US
+
+        activeUserLocale = locale
+        Log.i(TAG, "setUserLocale: $locale (language=${locale.language})")
+
+        // Switch TTS voice to match detected language
+        mainHandler.post {
+            ttsManager.switchToLocale(locale)
+        }
+    }
+
     // ── State ──────────────────────────────────────────────────────
 
     fun setPreference(key: String, value: String) {
@@ -749,6 +801,7 @@ class VyzeCoreController(
 
     fun destroy() {
         vlmEngine.close()
+        ocrHelper.close()
         scope.cancel()
         Log.d(TAG, "VyzeCoreController destroyed")
     }

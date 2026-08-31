@@ -5,6 +5,7 @@ import com.vyze.app.data.MemoryDao
 import com.vyze.app.memory.SimilarInteraction
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.util.Locale
 
 /**
  * Constructs dynamic system prompts for the on-device VLM (Gemma 3n E2B).
@@ -25,7 +26,9 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
         snapshotDescription: String = "",
         queryOverride: String? = null,
         similarInteractions: List<SimilarInteraction> = emptyList(),
-        continuousMode: Boolean = false
+        continuousMode: Boolean = false,
+        userLocale: Locale = Locale.US,
+        ocrText: String? = null
     ): String = withContext(Dispatchers.IO) {
         try {
             val sb = StringBuilder()
@@ -63,7 +66,12 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
                 sb.appendLine()
             }
 
-            // 6. Task specification
+            // 6. OCR pre-extracted text (if available — feeds clean text to model)
+            if (!ocrText.isNullOrBlank()) {
+                sb.appendLine("OCR: $ocrText")
+            }
+
+            // 7. Task specification
             sb.appendLine("--- TASK ---")
             if (isDirectQuery) {
                 sb.appendLine("Answer this user question directly based on the image: \"$queryOverride\"")
@@ -72,7 +80,10 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
             }
             sb.appendLine()
 
-            // 7. Output constraints
+            // 7. Language mirror directive — respond in user's language
+            sb.appendLine(LANGUAGE_MIRROR_DIRECTIVE.replace("{lang}", languageNameForLocale(userLocale)))
+
+            // 9. Output constraints
             sb.appendLine(OUTPUT_CONSTRAINTS)
 
             val prompt = sb.toString()
@@ -133,95 +144,54 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
     private fun formatSimilarInteractionsSection(
         similarInteractions: List<SimilarInteraction>
     ): String {
+        // Cap to top 2 most relevant interactions, 80 chars each
+        val capped = similarInteractions.take(2)
+        if (capped.isEmpty()) return ""
+
         val sb = StringBuilder()
-        sb.appendLine("--- SIMILAR PAST INTERACTIONS ---")
-        sb.appendLine("These are visually similar scenes from this user's history:")
-        sb.appendLine()
-
-        for ((index, similar) in similarInteractions.withIndex()) {
-            val record = similar.record
-            val score = String.format("%.2f", similar.similarityScore)
-            val timeAgo = formatTimestamp(record.timestamp)
-
-            sb.appendLine("[${index + 1}] (similarity: $score, $timeAgo)")
-            sb.appendLine("  Previous query: ${record.prompt.take(100)}")
-            sb.appendLine("  Previous output: ${record.output.take(200)}")
-            if (record.feedback.isNotBlank()) {
-                sb.appendLine("  User feedback: ${record.feedback.take(100)}")
-            }
-            sb.appendLine()
-        }
-
-        sb.appendLine("Use this history to:")
-        sb.appendLine("- Provide spatial continuity (what changed or remained the same)")
-        sb.appendLine("- Reference known objects from past observations")
-        sb.appendLine("- Avoid repeating information already given")
-        sb.appendLine("- Learn from any user feedback to improve this response")
-        sb.appendLine()
+        sb.appendLine("Similar: ${capped.joinToString("; ") { s ->
+            "${s.record.output.take(80)} (${formatTimestamp(s.record.timestamp)})"
+        }}")
         return sb.toString()
     }
 
     private fun formatPreferencesSection(
         preferences: List<com.vyze.app.data.VyzeMemoryEntity>
     ): String {
+        if (preferences.isEmpty()) return ""
         val sb = StringBuilder()
-        sb.appendLine("--- USER PREFERENCES ---")
-
         val brevity = preferences.find { it.key == "brevity" }?.value
         val textPriority = preferences.find { it.key == "text_priority" }?.value
         val knownItems = preferences.find { it.key == "known_items" }?.value
-        val preferredZones = preferences.find { it.key == "preferred_zones" }?.value
 
-        when (brevity) {
-            "short" -> sb.appendLine("Output length: 1 sentence max. Be extremely terse.")
-            "detailed" -> sb.appendLine("Output length: up to 3 sentences. Include spatial detail, colors, and navigation hazards.")
-            "normal" -> sb.appendLine("Output length: 1-2 sentences.")
-            else -> { /* use default from base rules */ }
-        }
-
-        when (textPriority) {
-            "high" -> sb.appendLine("Text priority: HIGH. Always read any visible text, signs, labels, or numbers aloud, even if brief.")
-            "low" -> sb.appendLine("Text priority: LOW. Only mention text if it is the primary subject of the scene.")
-            else -> { /* normal text priority */ }
-        }
-
-        if (!knownItems.isNullOrBlank()) {
-            sb.appendLine("Known items in this user's environment: $knownItems")
-            sb.appendLine("If any of these are visible, name them explicitly and give their position.")
-        }
-
-        if (!preferredZones.isNullOrBlank()) {
-            sb.appendLine("Emphasize objects in these zones: $preferredZones")
-        }
-
-        val typedKeys = setOf("brevity", "text_priority", "known_items", "preferred_zones")
-        for (pref in preferences) {
-            if (pref.key !in typedKeys) {
-                sb.appendLine("${pref.key}: ${pref.value}")
-            }
-        }
-
-        sb.appendLine()
+        if (brevity == "short") sb.append("Brevity: 1 sentence. ")
+        else if (brevity == "detailed") sb.append("Brevity: 2-3 sentences. ")
+        if (textPriority == "high") sb.append("Read all text aloud. ")
+        else if (textPriority == "low") sb.append("Skip minor text. ")
+        if (!knownItems.isNullOrBlank()) sb.append("Known: $knownItems. ")
+        if (sb.isNotEmpty()) sb.appendLine()
         return sb.toString()
     }
 
     private fun formatRoomMemorySection(
         envMemories: List<com.vyze.app.data.VyzeMemoryEntity>
     ): String {
-        val sb = StringBuilder()
-        sb.appendLine("--- ROOM MEMORY ---")
-        sb.appendLine("Recent observations from this environment:")
-
-        for (env in envMemories) {
-            sb.appendLine("[${formatTimestamp(env.timestamp)}] ${env.value}")
-        }
-
-        sb.appendLine("Use this history for spatial continuity. If the current view is similar to a recent observation, mention what changed or remained the same.")
-        sb.appendLine()
-        return sb.toString()
+        val capped = envMemories.take(2)
+        if (capped.isEmpty()) return ""
+        return "Recent: ${capped.joinToString("; ") { env ->
+            env.value.take(60)
+        }}"
     }
 
     // ── Helpers ────────────────────────────────────────────────────
+
+    /**
+     * Map a Locale to a human-readable language name for the prompt directive.
+     * Uses Locale.getDisplayLanguage() for dynamic resolution — no hardcoded list.
+     */
+    private fun languageNameForLocale(locale: Locale): String {
+        return locale.getDisplayLanguage(Locale.US).ifBlank { locale.language }
+    }
 
     private fun formatTimestamp(timestampMs: Long): String {
         val diff = System.currentTimeMillis() - timestampMs
@@ -241,59 +211,23 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
         /**
          * NAVIGATION MODE — used for generic taps and automatic spatial descriptions.
          */
-        private const val BASE_RULES_NAVIGATION = """You are Vyze, an accessible vision engine. Describe spatial layouts and obstacles directly. Do NOT use filler words like 'I see' or 'This photo shows'. Keep answers under 2 sentences.
+        private const val BASE_RULES_NAVIGATION =
+            "Describe scene directly. No filler (I see, this shows). " +
+            "Use left/center/right + distance. " +
+            "Read visible text. No hallucination. No hedging. " +
+            "Objects outside frame excluded. Mirror=glass described."
 
-Output rules:
-- Start with the most important spatial information (obstacle, door, person).
-- Use clock-face or left/center/right positioning.
-- Estimate distance when possible ("about 2 steps ahead").
-- Name visible text or signs directly without preamble.
-- If no objects are detected, say "Clear path ahead" or "No obstacles detected."
-- Never say "I notice", "It appears", "Looking at the image", or similar hedging.
+        private const val BASE_RULES_DIRECT_QUERY =
+            "Answer the question directly in first sentence. " +
+            "Read printed + handwritten text verbatim. No filler. " +
+            "Unreadable text -> say 'Text is unreadable'. " +
+            "No hallucination. Mirror/screen=device only. Factual."
 
-Critical accuracy rules:
-- ONLY describe objects directly in the physical space in front of the camera.
-- If the image shows a MIRROR or reflective surface, describe the mirror/glass itself.
-- Do NOT hallucinate or guess objects that are not clearly visible.
-- Do not describe objects outside the camera frame."""
+        private const val DEFAULT_NAVIGATION_QUERY =
+            "Describe environment: obstacles, doors, people, text."
 
-        /**
-         * DIRECT QUERY MODE — used when the user asks a specific question.
-         * Includes full anti-hallucination guardrails and low-confidence fallbacks.
-         */
-        private const val BASE_RULES_DIRECT_QUERY = """You are Vyze, a concise audio assistant for visually impaired users.
-
-Critical direct-answer rules:
-- Answer the user's specific question directly in the very first sentence.
-- Prioritize reading and extracting both PRINTED and HANDWRITTEN text on labels, documents, packages, or medication bags.
-- Read handwritten fields verbatim (e.g., drug names, dosage instructions, indications).
-- Do NOT describe visual packaging, background colors, card textures, or layout unless explicitly asked.
-- Do NOT use filler words like "I see", "The image shows", or "This package contains".
-- Keep responses concise, factual, and optimized for immediate text-to-speech reading.
-
-Anti-hallucination rules (MANDATORY):
-- ONLY report text and objects you can clearly see in the image.
-- Do NOT guess, fabricate, or invent any text, words, numbers, or details.
-- If text is blurry, partially obscured, low-resolution, or unreadable, say exactly: "Text is unreadable due to image quality."
-- If handwriting is ambiguous or illegible, say exactly: "Handwriting is unclear."
-- If you are not confident about a word, do NOT include it — omit it rather than guess.
-- If the image shows a MIRROR or reflective surface, describe the mirror itself — do NOT describe reflected text as if it is in the room.
-- If the image shows a SCREEN or TV, describe the device — do NOT describe displayed content as physical text.
-- Do NOT hallucinate objects, labels, or text that are not clearly visible in the frame."""
-
-        /** Default navigation query — used when no user query is provided. */
-        private const val DEFAULT_NAVIGATION_QUERY = """Describe the immediate environment for navigation. Focus on:
-- Obstacles, furniture, or hazards in the path
-- Doors, stairs, or transitions between rooms
-- People and their approximate position
-- Any visible text or signage"""
-
-        /** Output constraints — appended after the task to reinforce formatting. */
-        private const val OUTPUT_CONSTRAINTS = """Output format:
-- 1-2 spoken sentences only.
-- Spatial language: "on your left", "directly ahead", "about 3 feet away".
-- No bullet points, no markdown, no lists, no formatting.
-- No conversational filler. Start with the data, not a preamble."""
+        private const val OUTPUT_CONSTRAINTS =
+            "1-2 sentences. Spatial. No bullet/markdown. Start with data."
 
         /** Fallback prompt — used if dynamic prompt construction fails. */
         private const val FALLBACK_PROMPT = """You are Vyze, an accessible vision engine. Describe spatial layouts and obstacles directly. Do NOT use filler words like 'I see' or 'This photo shows'. Keep answers under 2 sentences.
@@ -302,11 +236,15 @@ Describe the immediate environment for navigation. Focus on obstacles, doors, pe
 
 Output 1-2 spoken sentences with spatial positioning. No filler, no formatting."""
 
-        /**
-         * CONTINUOUS MODE — ultra-concise for the auto-snapshot loop.
-         * Optimized for streaming: 25 words max, no filler, instant data.
-         */
         private const val CONTINUOUS_MODE_RULES =
-            "Instant visual assistant. Describe key objects and spatial arrangement directly in 15 words or less. No filler."
+            "Instant assistant. Key objects + position. 15 words max."
+
+        /**
+         * Language mirror directive — forces Gemma to respond in the same
+         * language as the user's spoken query. {lang} is replaced dynamically
+         * with the detected language name (e.g., "Malay", "Chinese").
+         */
+        private const val LANGUAGE_MIRROR_DIRECTIVE =
+            "Respond strictly in {lang}. Do not translate or switch languages."
     }
 }

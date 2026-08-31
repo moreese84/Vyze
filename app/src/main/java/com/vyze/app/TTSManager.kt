@@ -622,6 +622,48 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
 
     // ── Locale Switching ──────────────────────────────────────────
 
+    /**
+     * Switch TTS voice to match the user's detected spoken language.
+     * Called dynamically by VyzeCoreController when SpeechRecognizer
+     * returns a new language.
+     *
+     * 1. Queries tts.setLanguage(locale) to verify support
+     * 2. Scans available voices for the best neural voice matching locale.language
+     * 3. Falls back to Locale.US if no matching voice pack is installed
+     */
+    fun switchToLocale(locale: Locale) {
+        if (!isInitialized) {
+            Log.d(TAG, "switchToLocale($locale) — TTS not ready, will apply on next init")
+            currentLocale = locale
+            return
+        }
+
+        val engine = tts ?: return
+
+        // Step 1: Try setting the language directly
+        val result = engine.setLanguage(locale)
+        if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
+            Log.w(TAG, "switchToLocale($locale) — language not supported, trying locale.language only")
+            // Try with just the language code (e.g., "ms" without country)
+            val langOnly = Locale(locale.language)
+            val result2 = engine.setLanguage(langOnly)
+            if (result2 == TextToSpeech.LANG_MISSING_DATA || result2 == TextToSpeech.LANG_NOT_SUPPORTED) {
+                Log.w(TAG, "switchToLocale($locale) — no voice pack installed, falling back to English")
+                engine.setLanguage(Locale.US)
+                currentLocale = Locale.US
+                return
+            }
+            currentLocale = langOnly
+        } else {
+            currentLocale = locale
+        }
+
+        // Step 2: Select the best neural voice for this locale
+        selectBestVoice(currentLocale)
+
+        Log.i(TAG, "switchToLocale: locked to $currentLocale")
+    }
+
     fun setLanguage(languageKey: String, context: Context) {
         val locale = localeFromKey(languageKey)
         currentLocale = locale

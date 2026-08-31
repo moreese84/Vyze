@@ -570,14 +570,16 @@ class CameraFragment : Fragment() {
     private fun wireSpeechCallbacks() {
         val activity = requireActivity() as? MainActivity ?: return
 
-        activity.onSpeechResult = { spokenText ->
+        activity.onSpeechResult = { spokenText, detectedLocale ->
             if (spokenText.isNotBlank()) {
-                Log.i(TAG, "Speech result: \"$spokenText\"")
+                Log.i(TAG, "Speech result: \"$spokenText\" lang=$detectedLocale")
                 activity.interruptTts()
                 // ── FULL PIPELINE RESET for speech-triggered captures ──
                 // Reset state + increment session before triggering.
                 // Must happen synchronously before triggerVlmSnapshot.
                 coreController.resetForNewCapture()
+                // Lock TTS + prompt language to detected user language
+                coreController.setUserLocale(detectedLocale)
                 appState = AppState.IDLE
                 updateStatus("Heard: \"$spokenText\"")
                 triggerVlmSnapshot(spokenText)

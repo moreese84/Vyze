@@ -151,6 +151,14 @@ dependencies {
     implementation("androidx.room:room-ktx:$room_version")
     ksp("androidx.room:room-compiler:$room_version")
 
+    // ML Kit Text Recognition — fast on-device OCR (~25MB total)
+    // Latin script: English, Malay, Indonesian, Vietnamese, European languages
+    implementation("com.google.mlkit:text-recognition:16.0.1")
+    // Chinese script: Simplified + Traditional Chinese
+    implementation("com.google.mlkit:text-recognition-chinese:16.0.1")
+    // Coroutines adapter for ML Kit Task API (provides .await())
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.7.3")
+
     // SavedStateHandle
     implementation("androidx.lifecycle:lifecycle-viewmodel-savedstate:2.7.0")
 

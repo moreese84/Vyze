@@ -54,8 +54,8 @@ class MainActivity : AppCompatActivity() {
     /** Cached intent for speech recognition sessions. */
     private var speechIntent: Intent? = null
 
-    /** Callback invoked when speech recognition completes with final text. */
-    var onSpeechResult: ((String) -> Unit)? = null
+    /** Callback invoked when speech recognition completes with final text + detected language. */
+    var onSpeechResult: ((String, java.util.Locale?) -> Unit)? = null
 
     /** Callback invoked with partial (live) transcription text for UI feedback. */
     var onPartialSpeechResult: ((String) -> Unit)? = null
@@ -549,10 +549,21 @@ class MainActivity : AppCompatActivity() {
                 val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                 val bestMatch = matches?.firstOrNull()
 
+                // Extract detected language from SpeechRecognizer
+                val detectedLang = results?.getString(RecognizerIntent.EXTRA_LANGUAGE)
+                val detectedLocale: java.util.Locale? = if (!detectedLang.isNullOrBlank()) {
+                    try {
+                        java.util.Locale.forLanguageTag(detectedLang)
+                    } catch (e: Throwable) {
+                        Log.w(TAG, "Failed to parse locale '$detectedLang': ${e.message}")
+                        null
+                    }
+                } else null
+
                 if (!bestMatch.isNullOrBlank()) {
-                    Log.i(TAG, "onResults: \"$bestMatch\"")
-                    CrashLogFile.log(TAG, "Speech result: \"$bestMatch\"")
-                    onSpeechResult?.invoke(bestMatch)
+                    Log.i(TAG, "onResults: \"$bestMatch\" lang=$detectedLocale")
+                    CrashLogFile.log(TAG, "Speech result: \"$bestMatch\" lang=$detectedLocale")
+                    onSpeechResult?.invoke(bestMatch, detectedLocale)
                 } else {
                     Log.d(TAG, "onResults: empty — no speech recognized, silently restarting mic")
                     onPartialSpeechResult?.invoke("")

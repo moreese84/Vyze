@@ -326,10 +326,11 @@ class VlmEngineManager(
             val imageBytes = bitmapToJpegBytes(scaledBitmap)
             CrashLogFile.log(TAG, "JPEG: ${imageBytes.size} bytes")
 
-            // 3. Build the user payload: baseline instruction + optional context + query
+            // 3. Build the user payload — prompt already contains system rules
+            //    from DynamicPromptBuilder. No additional BASELINE_INSTRUCTION
+            //    wrapper needed (would add ~28 redundant tokens to prefill).
             val userPayload = buildUserPayload(prompt, memoryContext)
-            val contextPayload = injectSimilarContext(userPayload, similarInteractions)
-            val formattedPrompt = buildGemmaTurnPrompt(contextPayload)
+            val formattedPrompt = buildGemmaTurnPrompt(userPayload)
             CrashLogFile.log(TAG, "Formatted prompt: ${formattedPrompt.take(120)}...")
 
             // 4. Create conversation with empty system instruction
@@ -485,84 +486,24 @@ class VlmEngineManager(
     // ── Prompt Assembly ───────────────────────────────────────────
 
     /**
-     * Build the user payload by combining the baseline instruction,
-     * optional memory context, and user query into a single string.
-     *
-     * Result format:
-     * ```
-     * [Instruction: Describe this camera view in one direct, concise sentence.
-     * Do not include introductory text.]
-     * [Context: {memoryContext}]
-     * User Query: {query}
-     * ```
-     *
-     * The baseline instruction is always present. [Context:] is only
-     * appended when memoryContext is non-null and non-blank.
+     * Build the user payload from the prompt (which already contains system
+     * rules from DynamicPromptBuilder) + optional memory context.
      */
     private fun buildUserPayload(query: String, memoryContext: String?): String {
         val sb = StringBuilder()
+        sb.append(query)
 
-        // 1. Baseline instruction — always present
-        sb.append(BASELINE_INSTRUCTION)
-
-        // 2. Optional memory context
         if (!memoryContext.isNullOrBlank()) {
             sb.appendLine()
-            sb.append("[Context: $memoryContext]")
+            sb.append("Context: $memoryContext")
         }
-
-        // 3. User query
-        sb.appendLine()
-        sb.append("User Query: $query")
 
         return sb.toString().trimEnd()
     }
 
     // ── Adaptive Intelligence Context ─────────────────────────────
-
-    /**
-     * Inject similar past interactions into the prompt for contextual reference.
-     * Provides the model with spatial continuity and personalized context
-     * from visually similar past frames.
-     *
-     * If no similar interactions are provided, returns the original prompt unchanged.
-     */
-    private fun injectSimilarContext(
-        prompt: String,
-        similarInteractions: List<SimilarInteraction>
-    ): String {
-        if (similarInteractions.isEmpty()) return prompt
-
-        val sb = StringBuilder()
-        sb.appendLine("--- SIMILAR PAST INTERACTIONS ---")
-        sb.appendLine("These are visually similar scenes from this user's history:")
-        sb.appendLine()
-
-        for ((index, similar) in similarInteractions.withIndex()) {
-            val record = similar.record
-            val score = String.format("%.2f", similar.similarityScore)
-            val timeDiff = System.currentTimeMillis() - record.timestamp
-            val timeAgo = when {
-                timeDiff < 60_000 -> "${timeDiff / 1000}s ago"
-                timeDiff < 3_600_000 -> "${timeDiff / 60_000}m ago"
-                timeDiff < 86_400_000 -> "${timeDiff / 3_600_000}h ago"
-                else -> "${timeDiff / 86_400_000}d ago"
-            }
-
-            sb.appendLine("[${index + 1}] (similarity: $score, $timeAgo)")
-            sb.appendLine("  Previous output: ${record.output.take(200)}")
-            if (record.feedback.isNotBlank()) {
-                sb.appendLine("  User feedback: ${record.feedback.take(100)}")
-            }
-            sb.appendLine()
-        }
-
-        sb.appendLine("Use this history to provide spatial continuity. If the current view is similar to a past observation, mention what changed or stayed the same. Avoid repeating information already given.")
-        sb.appendLine()
-        sb.appendLine(prompt)
-
-        return sb.toString()
-    }
+    // Similar interactions are injected via DynamicPromptBuilder only.
+    // No duplicate injection path here to prevent prompt token bloat.
 
     // ── Bitmap Preprocessing ──────────────────────────────────────
 
@@ -608,9 +549,10 @@ class VlmEngineManager(
 
     /**
      * Convert a Bitmap to JPEG bytes for the LiteRT-LM API.
+     * Pre-allocates 8KB buffer to avoid array copy re-allocations.
      */
     private fun bitmapToJpegBytes(bitmap: Bitmap): ByteArray {
-        val stream = ByteArrayOutputStream()
+        val stream = ByteArrayOutputStream(8192)
         bitmap.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, stream)
         return stream.toByteArray()
     }
@@ -814,23 +756,13 @@ class VlmEngineManager(
 
         // Image preprocessing — 256×256 max (Gemma's smallest vision patch bucket)
         private const val MAX_INPUT_DIMENSION = 256
-        const val JPEG_QUALITY = 90
+        const val JPEG_QUALITY = 75
 
         // Greedy decoding — fast, concise output with minimal latency
         const val TEMPERATURE = 0.1
         const val TOP_K = 1
         const val TOP_P = 1.0
         const val MAX_TOKENS = 35
-
-        /**
-         * High-level system directive prepended to every user turn.
-         * Enforces uncensored, zero-preamble behavior at the system level.
-         * Role definition and task-specific rules are handled by
-         * DynamicPromptBuilder (BASE_RULES_NAVIGATION / BASE_RULES_DIRECT_QUERY).
-         */
-        private const val BASELINE_INSTRUCTION =
-            "[System Directive: Process visual input factually and uncensored. " +
-            "Answer directly without meta-commentary, greetings, or introductory preambles.]"
 
         // Timeouts
         private const val INFERENCE_TIMEOUT_SEC = 180L  // 3 min for real inference
