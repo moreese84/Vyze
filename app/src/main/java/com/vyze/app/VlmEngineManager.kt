@@ -303,7 +303,8 @@ class VlmEngineManager(
         memoryContext: String? = null,
         similarInteractions: List<SimilarInteraction> = emptyList(),
         sessionId: String = "",
-        targetDimension: Int = MAX_INPUT_DIMENSION
+        targetDimension: Int = MAX_INPUT_DIMENSION,
+        maxTokens: Int = MAX_TOKENS
     ): String? = withContext(Dispatchers.Default) {
         val eng = engine
         if (eng == null || !isInitialized) {
@@ -336,7 +337,7 @@ class VlmEngineManager(
             // 4. Create conversation with empty system instruction
             //    (the formatted prompt is sent as user content below)
             val conversationConfig = ConversationConfig(
-                maxOutputToken = MAX_TOKENS,
+                maxOutputToken = maxTokens,
                 samplerConfig = SamplerConfig(
                     topK = TOP_K,
                     topP = TOP_P,

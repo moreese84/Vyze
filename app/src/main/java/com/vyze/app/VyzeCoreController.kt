@@ -611,13 +611,17 @@ class VyzeCoreController(
                 }
 
                 CrashLogFile.log(TAG, "Calling vlmEngine.analyzeImage()...")
+                // Text queries need more tokens (medicine labels, documents)
+                // Scene queries are concise (25 words max)
+                val inferenceMaxTokens = if (isTextQuery) TEXT_QUERY_MAX_TOKENS else SCENE_QUERY_MAX_TOKENS
                 val response = vlmEngine.analyzeImage(
                     bitmap = inferenceBitmap,
                     prompt = basePrompt,
                     memoryContext = null,
                     similarInteractions = emptyList(),
                     sessionId = currentSessionId,
-                    targetDimension = targetDimension
+                    targetDimension = targetDimension,
+                    maxTokens = inferenceMaxTokens
                 )
 
                 // ── CANCELLATION CHECK: bail out after VLM call if cancelled ──
@@ -845,6 +849,12 @@ class VyzeCoreController(
 
         /** Standard resolution for scene queries (256x256 for fast inference). */
         private const val SCENE_QUERY_DIMENSION = 256
+
+        // ── Dynamic Token Limits ────────────────────────────────
+        /** Scene queries: concise descriptions (25 words, ~35 tokens). */
+        private const val SCENE_QUERY_MAX_TOKENS = 35
+        /** Text queries: full label/document reading (96 tokens = ~70 words). */
+        private const val TEXT_QUERY_MAX_TOKENS = 96
 
         /** Keywords that trigger higher-resolution text extraction. */
         private val TEXT_KEYWORDS = listOf(
