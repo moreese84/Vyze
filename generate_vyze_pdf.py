@@ -143,18 +143,56 @@ def main():
 
     # -- 2. Problem Statement --
     pdf.section_title("2. Problem Statement")
+    pdf.sub_title("Global Scale")
     pdf.body_text(
-        "Over 2.2 billion people globally have vision impairments (WHO, 2023). Existing "
-        "assistive technology relies heavily on cloud-based AI services that require internet "
-        "connectivity, introduce latency (1-3 seconds per query), raise privacy concerns by "
-        "uploading camera images, and fail in offline environments (rural areas, subways, "
-        "international travel)."
+        "At least 2.2 billion people worldwide have a near or distance vision impairment "
+        "(WHO, updated Feb 2026). Of these, at least 1 billion could have been prevented or "
+        "have yet to be addressed. Blindness cases rose from 33.4 million in 2000 to 43.3 "
+        "million in 2020, and moderate to severe vision impairment (MSVI) surged from 189.8 "
+        "million to 295.1 million over the same period (Lancet Global Health, 2024). Vision "
+        "loss is projected to increase 55% by 2050, impacting 600 million additional people."
+    )
+    pdf.body_text(
+        "The global annual productivity loss due to sight loss is estimated at $410.7 billion, "
+        "comprising $43.6 billion from blindness and $367.1 billion from MSVI (IAPB Vision "
+        "Atlas, 2024). In Southeast Asia alone, visual impairment accounts for approximately "
+        "0.5% of GDP loss and $40 billion in annual productivity loss."
+    )
+
+    pdf.sub_title("Malaysia-Specific Data")
+    pdf.body_text(
+        "Malaysia faces a significant but under-addressed visual impairment burden. According "
+        "to the Department of Social Welfare (2024), there are 61,112 registered visually "
+        "impaired individuals in Malaysia. However, this is likely a significant undercount "
+        "-- a 2024 cross-sectional study at University of Malaya Medical Centre found that "
+        "32.63% of ophthalmology outpatients had visual impairment, and 0.9% were blind "
+        "(Kevin-Tang et al., 2024)."
+    )
+    pdf.body_text(
+        "The prevalence of bilateral blindness across all ages is estimated at 2% (WHO/IAPB "
+        "Vision Atlas). Critically, 17 out of 20 cases of bilateral blindness are avoidable, "
+        "and almost 60% are treatable. Among adults aged 50+, the prevalence of visual "
+        "impairment rises to 24.5%, with elderly Malaysians showing 27.8% prevalence (National "
+        "Eye Survey, 2024). Cataracts remain the leading cause of blindness (58.6%), followed "
+        "by diabetic retinopathy (10.4%), other posterior-segment diseases (8.4%), and glaucoma "
+        "(6.6%)."
+    )
+
+    pdf.sub_title("The Technology Gap")
+    pdf.body_text(
+        "Existing assistive technology relies heavily on cloud-based AI services that require "
+        "internet connectivity, introduce latency (1-3 seconds per query), raise privacy "
+        "concerns by uploading camera images, and fail in offline environments (rural areas, "
+        "subways, international travel). For Malaysia's 61,000+ registered visually impaired "
+        "individuals -- many in areas with limited connectivity -- these cloud dependencies "
+        "create a real barrier to daily independence."
     )
     pdf.body_text(
         "Vyze addresses these gaps by running the entire vision-language pipeline locally on "
         "the user's phone. The Gemma 3n E2B model (3.66 GB int4 quantized) fits within mobile "
         "GPU memory constraints while providing high-quality scene understanding, text "
-        "extraction, and multi-language support."
+        "extraction, and multi-language support -- including Malay and Chinese for Malaysia's "
+        "multilingual population."
     )
 
     # -- 3. Solution Architecture --
