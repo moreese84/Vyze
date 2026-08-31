@@ -24,17 +24,18 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
     suspend fun buildPrompt(
         snapshotDescription: String = "",
         queryOverride: String? = null,
-        similarInteractions: List<SimilarInteraction> = emptyList()
+        similarInteractions: List<SimilarInteraction> = emptyList(),
+        continuousMode: Boolean = false
     ): String = withContext(Dispatchers.IO) {
         try {
             val sb = StringBuilder()
             val isDirectQuery = !queryOverride.isNullOrBlank()
 
             // 1. Inject appropriate rules based on query intent
-            if (isDirectQuery) {
-                sb.appendLine(BASE_RULES_DIRECT_QUERY)
-            } else {
-                sb.appendLine(BASE_RULES_NAVIGATION)
+            when {
+                continuousMode -> sb.appendLine(CONTINUOUS_MODE_RULES)
+                isDirectQuery -> sb.appendLine(BASE_RULES_DIRECT_QUERY)
+                else -> sb.appendLine(BASE_RULES_NAVIGATION)
             }
             sb.appendLine()
 
@@ -300,5 +301,12 @@ Anti-hallucination rules (MANDATORY):
 Describe the immediate environment for navigation. Focus on obstacles, doors, people, and visible text.
 
 Output 1-2 spoken sentences with spatial positioning. No filler, no formatting."""
+
+        /**
+         * CONTINUOUS MODE — ultra-concise for the auto-snapshot loop.
+         * Optimized for streaming: 25 words max, no filler, instant data.
+         */
+        private const val CONTINUOUS_MODE_RULES =
+            "Instant visual assistant. Describe key objects and spatial arrangement directly in 15 words or less. No filler."
     }
 }

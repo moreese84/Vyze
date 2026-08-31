@@ -1,10 +1,14 @@
 package com.vyze.app.fragments
 
 import android.annotation.SuppressLint
+import android.content.Context
 import android.content.res.Configuration
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import android.util.Log
 import android.view.LayoutInflater
 import android.view.View
@@ -54,6 +58,7 @@ class CameraFragment : Fragment() {
 
     private lateinit var ttsManager: TTSManager
     private lateinit var hapticManager: HapticManager
+    private var systemVibrator: Vibrator? = null
     private lateinit var flashlightManager: FlashlightManager
 
     private lateinit var backgroundExecutor: ExecutorService
@@ -69,6 +74,49 @@ class CameraFragment : Fragment() {
 
     @Volatile
     private var onboardingSpoken = false
+
+    /** Debounce: prevents duplicate triggers from gesture + click overlap or speech re-trigger. */
+    private var lastTriggerTime = 0L
+    private val TRIGGER_DEBOUNCE_MS = 1000L
+
+    /**
+     * Atomic capture lock — prevents re-entry during the async window
+     * between takeSnapshot() start and onBitmap/onError callback.
+     * Independent of appState which legitimately transitions during the flow.
+     */
+    private val isCapturing = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    // ── Continuous Auto-Snapshot Mode ────────────────────────────
+    // When enabled, automatically captures and describes the scene
+    // every AUTO_SNAPSHOT_INTERVAL_MS — similar to Gemini Live.
+
+    @Volatile
+    private var isContinuousMode = false
+
+    private val autoSnapshotRunnable = object : Runnable {
+        override fun run() {
+            if (!isContinuousMode || !isAdded) return
+
+            // ── SAFETY GUARDS ──────────────────────────────────
+            // Only trigger if ALL conditions are met:
+            if (appState == AppState.IDLE
+                && !coreController.isCurrentlyInferring()
+                && !ttsManager.hasPendingSpeech()
+                && !isCapturing.get()
+                && isCameraActive
+            ) {
+                Log.d(TAG, "Auto-snapshot: triggering continuous capture")
+                triggerContinuousSnapshot()
+            } else {
+                Log.d(TAG, "Auto-snapshot: skipped (state=$appState, inferring=${coreController.isCurrentlyInferring()}, pending=${ttsManager.hasPendingSpeech()})")
+            }
+
+            // Schedule next tick if still in continuous mode
+            if (isContinuousMode) {
+                mainHandler.postDelayed(this, AUTO_SNAPSHOT_INTERVAL_MS)
+            }
+        }
+    }
 
     // ══════════════════════════════════════════════════════════════════
     // Lifecycle
@@ -87,6 +135,15 @@ class CameraFragment : Fragment() {
 
         ttsManager = ttsViewModel.ttsManager
         hapticManager = HapticManager(requireContext().applicationContext)
+
+        // System vibrator for instant capture acknowledgement (~5ms latency)
+        systemVibrator = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+            val vm = requireContext().getSystemService(VibratorManager::class.java)
+            vm?.defaultVibrator
+        } else {
+            @Suppress("DEPRECATION")
+            requireContext().getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+        }
         flashlightManager = FlashlightManager()
 
         val app = requireActivity().applicationContext as VyzeApplication
@@ -113,19 +170,26 @@ class CameraFragment : Fragment() {
                             if (coreController.isDuplicateDescription(response)) {
                                 Log.d(TAG, "Duplicate description — skipping TTS, returning to IDLE")
                                 appState = AppState.IDLE
-                                mainHandler.postDelayed({ startVoiceListening() }, 300L)
+                                // In continuous mode, the auto-loop handles the next capture
+                                if (!isContinuousMode) {
+                                    mainHandler.postDelayed({ startVoiceListening() }, 300L)
+                                }
                             } else if (coreController.isStreamingActive()) {
                                 Log.d(TAG, "Streaming active — waiting for TTS queue to drain")
                                 waitForTtsDrain {
                                     appState = AppState.IDLE
-                                    Log.d(TAG, "TTS drain complete — returning to IDLE, restarting mic")
-                                    mainHandler.postDelayed({ startVoiceListening() }, 300L)
+                                    Log.d(TAG, "TTS drain complete — returning to IDLE")
+                                    if (!isContinuousMode) {
+                                        mainHandler.postDelayed({ startVoiceListening() }, 300L)
+                                    }
                                 }
                             } else {
                                 mainActivity.speakThenCallback(response) {
                                     appState = AppState.IDLE
-                                    Log.d(TAG, "Response spoken — returning to IDLE, restarting mic")
-                                    mainHandler.postDelayed({ startVoiceListening() }, 300L)
+                                    Log.d(TAG, "Response spoken — returning to IDLE")
+                                    if (!isContinuousMode) {
+                                        mainHandler.postDelayed({ startVoiceListening() }, 300L)
+                                    }
                                 }
                             }
                         } else {
@@ -150,9 +214,18 @@ class CameraFragment : Fragment() {
         coreController.onError = { error ->
             activity?.runOnUiThread {
                 if (isAdded && _fragmentCameraBinding != null) {
+                    // ── SILENT DROP: if state has moved past ANALYZING/SPEAKING,
+                    //    this error is from a stale session — don't interrupt the
+                    //    current flow with error speech or state changes.
+                    if (appState != AppState.ANALYZING && appState != AppState.SPEAKING) {
+                        Log.d(TAG, "onError arrived in state=$appState — stale error, dropping")
+                        return@runOnUiThread
+                    }
                     appState = AppState.IDLE
                     updateStatus("Error: $error")
-                    (activity as? MainActivity)?.announceStatus("Error: $error")
+                    // Don't speak the error — just log it. Speaking errors during
+                    // rapid tapping causes "Failed to capture" double-speak.
+                    Log.e(TAG, "VLM error (not spoken to user): $error")
                     mainHandler.postDelayed({ startVoiceListening() }, 1000L)
                 }
             }
@@ -278,6 +351,7 @@ class CameraFragment : Fragment() {
         if (coreController.isEngineReady() && onboardingSpoken) {
             appState = AppState.IDLE
             startVoiceListening()
+            startContinuousLoop()
         } else {
             appState = AppState.LOADING
         }
@@ -286,6 +360,7 @@ class CameraFragment : Fragment() {
     override fun onPause() {
         super.onPause()
         isCameraActive = false
+        stopContinuousLoop()
         stopVoiceListening()
         cameraSetup.releaseCamera()
     }
@@ -335,15 +410,35 @@ class CameraFragment : Fragment() {
     // ══════════════════════════════════════════════════════════════════
 
     private fun bargeInAndCapture(query: String) {
+        // ── DEBOUNCE: reject if triggered too recently ───────────
+        // Prevents double-fire from gesture+click overlap or speech re-trigger.
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - lastTriggerTime < TRIGGER_DEBOUNCE_MS) {
+            Log.d(TAG, "Barge-in debounced (${now - lastTriggerTime}ms < ${TRIGGER_DEBOUNCE_MS}ms)")
+            return
+        }
+        lastTriggerTime = now
+
+        // ── ATOMIC STATE CLAIM: lock before any async work ────────
+        // Must happen synchronously on the main thread BEFORE calling
+        // interruptTtsWithMicPause() (which may restart speech recognition).
+        // This prevents a secondary speech callback from re-entering.
+        if (appState == AppState.ANALYZING || appState == AppState.SPEAKING) {
+            Log.d(TAG, "Barge-in: state=$appState — cancelling active work")
+            coreController.resetForNewCapture()
+        } else {
+            coreController.resetForNewCapture()
+        }
+        // Immediately set ANALYZING — blocks any concurrent triggers
+        // (speech callbacks, second taps) from passing the guard.
+        appState = AppState.ANALYZING
+
         val mainActivity = activity as? MainActivity
         mainActivity?.stopListening()
-
-        Log.d(TAG, "Barge-in: full pipeline reset before new capture")
-        coreController.resetForNewCapture()
-        appState = AppState.IDLE
-
         mainActivity?.interruptTtsWithMicPause()
 
+        // Now safe to extract frame — isInferring lock + ANALYZING state
+        // will reject any duplicate triggerVlmSnapshot calls.
         triggerVlmSnapshot(query)
     }
 
@@ -352,34 +447,36 @@ class CameraFragment : Fragment() {
     // ══════════════════════════════════════════════════════════════════
 
     private fun triggerVlmSnapshot(query: String) {
-        CrashLogFile.log(TAG, "triggerVlmSnapshot: state=$appState, engineReady=${coreController.isEngineReady()}, inferring=${coreController.isCurrentlyInferring()}")
+        CrashLogFile.log(TAG, "triggerVlmSnapshot: state=$appState, engineReady=${coreController.isEngineReady()}, inferring=${coreController.isCurrentlyInferring()}, capturing=${isCapturing.get()}")
 
-        if (ttsManager.hasPendingSpeech()) {
-            Log.d(TAG, "TTS still has pending utterances — forcing full reset before new capture")
-            coreController.resetForNewCapture()
-        }
-
-        if (ttsManager.hasPendingSpeech()) {
-            Log.d(TAG, "TTS still has pending utterances — dropping snapshot trigger")
-            updateStatus("Speaking...")
+        // ── CAPTURE LOCK: reject during async frame extraction ────
+        if (!isCapturing.compareAndSet(false, true)) {
+            Log.d(TAG, "Capture already in progress — silently dropping duplicate trigger")
             return
         }
 
-        if (appState != AppState.IDLE && appState != AppState.LISTENING) {
+        // ── STATE GUARD ──────────────────────────────────────────
+        // bargeInAndCapture already sets appState = ANALYZING, so we
+        // also allow ANALYZING to pass (it means bargeIn claimed it).
+        // Speech callbacks set appState = IDLE before calling us.
+        if (appState != AppState.IDLE && appState != AppState.LISTENING && appState != AppState.ANALYZING) {
             Log.d(TAG, "State=$appState — rejecting snapshot trigger")
+            isCapturing.set(false)
             updateStatus("Busy...")
             return
         }
 
         if (!coreController.isEngineReady()) {
-            updateStatus("Model still loading...")
             Log.d(TAG, "VLM not ready yet")
+            isCapturing.set(false)
+            updateStatus("Model still loading...")
             return
         }
 
         if (coreController.isCurrentlyInferring()) {
-            updateStatus("Already analyzing...")
             Log.d(TAG, "Engine busy — ignoring")
+            isCapturing.set(false)
+            updateStatus("Already analyzing...")
             return
         }
 
@@ -389,17 +486,18 @@ class CameraFragment : Fragment() {
 
         cameraSetup.takeSnapshot(
             onBitmap = { bitmap ->
+                // ── SINGLE EXIT: guarantee isCapturing is cleared ──
                 try {
-                    // Validate bitmap BEFORE setting ANALYZING state — prevents
-                    // indefinite ANALYZING if frame capture returned null/damaged bitmap
+                    // Validate bitmap — if recycled or corrupted, abort silently
                     if (bitmap.isRecycled) {
-                        CrashLogFile.log(TAG, "Bitmap already recycled — skipping")
+                        CrashLogFile.log(TAG, "Bitmap recycled — silently dropping")
+                        // Do NOT speak error here — a newer trigger may have
+                        // already started. Just reset state quietly.
                         activity?.runOnUiThread {
-                            if (isAdded && _fragmentCameraBinding != null) {
+                            if (isAdded && _fragmentCameraBinding != null && appState == AppState.ANALYZING) {
                                 appState = AppState.IDLE
-                                ttsManager.speakImmediate("Failed to capture a valid image.")
-                                updateStatus("Capture failed")
-                                mainHandler.postDelayed({ startVoiceListening() }, 1000L)
+                                updateStatus("Ready")
+                                mainHandler.postDelayed({ startVoiceListening() }, 500L)
                             }
                         }
                         return@takeSnapshot
@@ -407,48 +505,58 @@ class CameraFragment : Fragment() {
 
                     CrashLogFile.log(TAG, "onBitmap callback: ${bitmap.width}x${bitmap.height}")
 
+                    // Double-check engine isn't already running a different inference
                     if (coreController.isCurrentlyInferring()) {
                         CrashLogFile.log(TAG, "Engine busy — recycling bitmap")
                         bitmap.recycle()
-                        activity?.runOnUiThread {
-                            if (isAdded && _fragmentCameraBinding != null) {
-                                updateStatus("Already analyzing...")
-                            }
-                        }
                         return@takeSnapshot
                     }
 
+                    // ── INSTANT HAPTIC: acknowledge frame capture immediately ──
+                    // This fires BEFORE VLM inference starts, giving the user
+                    // tactile feedback that their input was registered (~5ms).
+                    systemVibrator?.vibrate(
+                        VibrationEffect.createPredefined(VibrationEffect.EFFECT_CLICK)
+                    )
+
+                    // State already ANALYZING from bargeInAndCapture — just update UI
                     activity?.runOnUiThread {
                         if (isAdded && _fragmentCameraBinding != null) {
-                            appState = AppState.ANALYZING
+                            if (appState != AppState.ANALYZING) appState = AppState.ANALYZING
                             updateStatus("Analyzing...")
                             (activity as? MainActivity)?.announceStatus("Analyzing scene...")
                         }
                     }
+
                     CrashLogFile.log(TAG, "Calling coreController.triggerSnapshot()")
                     coreController.triggerSnapshot(bitmap, query)
                 } catch (e: Throwable) {
-                    CrashLogFile.logError(TAG, "onBitmap callback error: ${e.javaClass.simpleName}: ${e.message}", e)
+                    CrashLogFile.logError(TAG, "onBitmap error: ${e.javaClass.simpleName}: ${e.message}", e)
                     try { bitmap.recycle() } catch (_: Throwable) {}
-                    // Reset ANALYZING state on bitmap processing failure
                     activity?.runOnUiThread {
-                        if (isAdded && _fragmentCameraBinding != null) {
+                        if (isAdded && _fragmentCameraBinding != null && appState == AppState.ANALYZING) {
                             appState = AppState.IDLE
                             updateStatus("Error: ${e.message}")
                             mainHandler.postDelayed({ startVoiceListening() }, 1000L)
                         }
                     }
+                } finally {
+                    // ALWAYS release capture lock — even if bitmap was recycled
+                    isCapturing.set(false)
                 }
             },
             onError = { error ->
                 CrashLogFile.logError(TAG, "Snapshot failed: $error")
                 Log.e(TAG, "Snapshot failed: $error")
+                isCapturing.set(false)
+                // ── ALWAYS recover: reset state + speak error + restart mic.
+                //    Never leave the user stuck on 'Capturing...' screen.
                 activity?.runOnUiThread {
                     if (isAdded && _fragmentCameraBinding != null) {
                         appState = AppState.IDLE
-                        ttsManager.speakImmediate("Failed to capture image. $error")
                         updateStatus("Capture failed")
-                        mainHandler.postDelayed({ startVoiceListening() }, 1000L)
+                        ttsManager.speakImmediate("Camera frame unavailable. Please try again.")
+                        mainHandler.postDelayed({ startVoiceListening() }, 1500L)
                     }
                 }
             }
@@ -466,6 +574,10 @@ class CameraFragment : Fragment() {
             if (spokenText.isNotBlank()) {
                 Log.i(TAG, "Speech result: \"$spokenText\"")
                 activity.interruptTts()
+                // ── FULL PIPELINE RESET for speech-triggered captures ──
+                // Reset state + increment session before triggering.
+                // Must happen synchronously before triggerVlmSnapshot.
+                coreController.resetForNewCapture()
                 appState = AppState.IDLE
                 updateStatus("Heard: \"$spokenText\"")
                 triggerVlmSnapshot(spokenText)
@@ -535,6 +647,83 @@ class CameraFragment : Fragment() {
         mainHandler.postDelayed(checkRunnable, 300L)
     }
 
+    // ══════════════════════════════════════════════════════════════════
+    // Continuous Auto-Snapshot Mode
+    // ══════════════════════════════════════════════════════════════════
+
+    /**
+     * Trigger a continuous-mode snapshot. Unlike [triggerVlmSnapshot],
+     * this does NOT acquire the debounce or isCapturing locks — the
+     * loop's own state guards prevent concurrent calls.
+     */
+    private fun triggerContinuousSnapshot() {
+        if (!coreController.isEngineReady()) return
+        if (coreController.isCurrentlyInferring()) return
+        if (isCapturing.get()) return
+
+        if (!isCapturing.compareAndSet(false, true)) return
+
+        appState = AppState.ANALYZING
+        updateStatus("Scanning...")
+
+        cameraSetup.takeSnapshot(
+            onBitmap = { bitmap ->
+                try {
+                    if (bitmap.isRecycled) {
+                        isCapturing.set(false)
+                        appState = AppState.IDLE
+                        return@takeSnapshot
+                    }
+
+                    if (coreController.isCurrentlyInferring()) {
+                        bitmap.recycle()
+                        isCapturing.set(false)
+                        return@takeSnapshot
+                    }
+
+                    coreController.triggerSnapshot(bitmap, null, continuousMode = true)
+                } catch (e: Throwable) {
+                    try { bitmap.recycle() } catch (_: Throwable) {}
+                    appState = AppState.IDLE
+                } finally {
+                    isCapturing.set(false)
+                }
+            },
+            onError = { _ ->
+                isCapturing.set(false)
+                if (appState == AppState.ANALYZING) appState = AppState.IDLE
+            }
+        )
+    }
+
+    /**
+     * Toggle continuous auto-snapshot mode on/off.
+     * When ON: captures and describes the scene every 4 seconds.
+     * When OFF: returns to manual tap/voice triggers only.
+     */
+    fun toggleContinuousMode() {
+        isContinuousMode = !isContinuousMode
+        if (isContinuousMode) {
+            Log.d(TAG, "Continuous mode ON — auto-snapshot every ${AUTO_SNAPSHOT_INTERVAL_MS}ms")
+            updateStatus("Continuous mode ON")
+            mainHandler.postDelayed(autoSnapshotRunnable, AUTO_SNAPSHOT_INTERVAL_MS)
+        } else {
+            Log.d(TAG, "Continuous mode OFF")
+            mainHandler.removeCallbacks(autoSnapshotRunnable)
+            updateStatus("Continuous mode OFF")
+        }
+    }
+
+    private fun startContinuousLoop() {
+        if (isContinuousMode && !mainHandler.hasCallbacks(autoSnapshotRunnable)) {
+            mainHandler.postDelayed(autoSnapshotRunnable, AUTO_SNAPSHOT_INTERVAL_MS)
+        }
+    }
+
+    private fun stopContinuousLoop() {
+        mainHandler.removeCallbacks(autoSnapshotRunnable)
+    }
+
     private fun startVoiceListening() {
         if (!isAdded) return
         try {
@@ -573,5 +762,8 @@ class CameraFragment : Fragment() {
          * hardware drain latency after onDone() fires.
          */
         private const val AUDIO_DRAIN_GRACE_MS = 400L
+
+        /** Interval (ms) between auto-snapshot captures in continuous mode. */
+        private const val AUTO_SNAPSHOT_INTERVAL_MS = 4000L
     }
 }

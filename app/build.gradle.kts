@@ -111,10 +111,13 @@ dependencies {
     // Kotlin
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("org.jetbrains.kotlin:kotlin-stdlib:${rootProject.extra["kotlin_version"]}")
-    // kotlinx-coroutines MUST be 1.9.0+ to match litertlm-android:0.16.1
-    // (SendChannel.close$default signature changed in 1.9.0)
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
+    // kotlinx-coroutines 1.10.1 — built with Kotlin 2.1.20.
+    // Required: litertlm-android:0.16.1 internally calls SendChannel.close(Throwable?)
+    // via a synthetic close$default method. Kotlin 2.3.0 + coroutines 1.9.0 have a
+    // binary incompatibility where this synthetic is missing at runtime → NoSuchMethodError.
+    // 1.10.1 generates the correct synthetic signature for Kotlin 2.x runtimes.
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.1")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.1")
 
     // AppCompat and UI
     implementation("androidx.appcompat:appcompat:1.6.1")

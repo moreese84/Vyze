@@ -65,6 +65,27 @@ class CameraSetupDelegate {
     /** Main handler for posting callbacks. */
     private val mainHandler = Handler(Looper.getMainLooper())
 
+    /** Reference to PreviewView for fallback frame extraction. */
+    private var previewViewRef: PreviewView? = null
+
+    /** Whether a frame has been consumed by takeSnapshot since the last analyzer delivery. */
+    private val frameConsumed = AtomicBoolean(false)
+
+    /**
+     * Monotonically increasing frame counter. Incremented every time the analyzer
+     * delivers a new frame. takeSnapshot() uses this to guarantee it reads a frame
+     * that arrived AFTER the voice query was triggered — preventing stale frame reuse.
+     */
+    @Volatile
+    private var frameCounter = 0L
+
+    companion object {
+        /** How long to poll for a fresh frame before giving up (ms). */
+        private const val FRAME_WAIT_TIMEOUT_MS = 300L
+        /** Polling interval when waiting for a frame (ms). */
+        private const val FRAME_POLL_INTERVAL_MS = 20L
+    }
+
     /**
      * Initializes the camera provider and binds use cases.
      */
@@ -121,15 +142,28 @@ class CameraSetupDelegate {
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
             .build()
 
+        // Store previewView reference for fallback bitmap extraction
+        previewViewRef = previewView
+
         imageAnalysis.setAnalyzer(analysisExecutor) { imageProxy ->
             try {
                 val bitmap = imageProxyToBitmap(imageProxy)
                 if (bitmap != null) {
-                    // Swap in the new frame — old one is recycled below
+                    // Swap in the new frame — old one is recycled below.
+                    // CRITICAL: Acquire frameLock before recycling so takeSnapshot()
+                    // doesn't end up with a reference to a recycled Bitmap.
                     val oldFrame = latestFrame.getAndSet(bitmap)
                     if (oldFrame != null && !oldFrame.isRecycled) {
-                        oldFrame.recycle()
+                        synchronized(frameLock) {
+                            if (!oldFrame.isRecycled) {
+                                oldFrame.recycle()
+                            }
+                        }
                     }
+                    // Mark frame as available for snapshot consumption.
+                    // takeSnapshot() will clear frameConsumed after copying.
+                    frameConsumed.set(false)
+                    frameCounter++  // Signal takeSnapshot() that a genuinely new frame arrived
                 }
             } catch (e: Throwable) {
                 Log.w(TAG, "Frame analysis error: ${e.message}")
@@ -162,27 +196,58 @@ class CameraSetupDelegate {
         onBitmap: (Bitmap) -> Unit,
         onError: (String) -> Unit
     ) {
-        val frame = latestFrame.get()
-        if (frame == null || frame.isRecycled) {
-            onError("No camera frame available yet")
-            return
+        val counterAtQuery = frameCounter
+        var foundFrame: Bitmap? = null
+        var waited = 0L
+        val pollInterval = 10L
+        val maxWait = 300L
+
+        while (waited < maxWait) {
+            val candidate = latestFrame.get()
+            if (candidate != null && !candidate.isRecycled) {
+                // Ideal condition: a new frame arrived post-query
+                if (frameCounter > counterAtQuery) {
+                    foundFrame = candidate
+                    break
+                }
+            }
+            Thread.sleep(pollInterval)
+            waited += pollInterval
         }
 
-        // Extract a copy on background thread to avoid blocking main thread
+        // FALLBACK: If no strictly newer frame arrived within 300ms, use the latest valid frame
+        if (foundFrame == null) {
+            foundFrame = latestFrame.get()?.takeIf { !it.isRecycled }
+        }
+
+        if (foundFrame != null) {
+            extractFrameCopy(foundFrame, onBitmap, onError)
+        } else {
+            onError("Camera frame unavailable")
+        }
+    }
+
+    /**
+     * Extract a deep copy of the frame on the analysis thread.
+     * Shared by both the instant-path and the polled-path.
+     */
+    private fun extractFrameCopy(
+        frame: Bitmap,
+        onBitmap: (Bitmap) -> Unit,
+        onError: (String) -> Unit
+    ) {
         analysisExecutor.execute {
             try {
-                // Acquire lock to prevent concurrent recycling
                 while (!frameLock.compareAndSet(false, true)) {
                     Thread.sleep(1)
                 }
                 try {
                     if (frame.isRecycled) {
-                        onError("Frame recycled before extraction")
+                        mainHandler.post { onError("Frame recycled before extraction") }
                         return@execute
                     }
-                    // Create a mutable copy — caller owns this bitmap
                     val copy = frame.copy(Bitmap.Config.ARGB_8888, true)
-                    if (copy != null) {
+                    if (copy != null && !copy.isRecycled) {
                         mainHandler.post { onBitmap(copy) }
                     } else {
                         mainHandler.post { onError("Failed to copy camera frame") }
@@ -270,6 +335,9 @@ class CameraSetupDelegate {
         cameraProvider?.unbindAll()
         camera = null
         flashlightManager.camera = null
+        previewViewRef = null
+        frameConsumed.set(false)
+        frameCounter = 0L
         // Recycle any held frame
         val oldFrame = latestFrame.getAndSet(null)
         if (oldFrame != null && !oldFrame.isRecycled) {

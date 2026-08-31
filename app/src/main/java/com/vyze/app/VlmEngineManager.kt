@@ -79,6 +79,25 @@ class VlmEngineManager(
     var onModelCopyProgress: ((copied: Long, total: Long) -> Unit)? = null
     var onStepProgress: ((Int, String) -> Unit)? = null
 
+    /**
+     * Latch for the currently active inference. Promoted to instance field
+     * so [interrupt] can signal it without destroying the engine.
+     *
+     * Set before [CountDownLatch.await] in [analyzeImage], cleared after
+     * the await returns. Only one inference runs at a time (blocking
+     * CountDownLatch), so a single reference is safe.
+     */
+    @Volatile
+    private var activeLatch: CountDownLatch? = null
+
+    /**
+     * Set to true by [interrupt] to signal that the current inference was
+     * cancelled externally. Checked after latch.await() to decide whether
+     * to close the Conversation and fire callbacks.
+     */
+    @Volatile
+    private var wasInterrupted = false
+
     // ── Storage Permission Check ──────────────────────────────────
 
     fun hasStoragePermission(): Boolean {
@@ -302,8 +321,14 @@ class VlmEngineManager(
                 )
             )
 
-            eng.createConversation(conversationConfig).use { conversation ->
-                // 5. Build multimodal contents — formatted prompt text + clamped bitmap.
+            // 5. Create conversation — managed manually (NOT via use{}) so we can
+            //    prevent Conversation.close() when interrupted. Closing while the
+            //    native thread is still running causes SIGSEGV in liblitertlm_jni.so.
+            val conversation = eng.createConversation(conversationConfig)
+            wasInterrupted = false  // Reset flag before starting new inference
+
+            try {
+                // 6. Build multimodal contents — formatted prompt text + clamped bitmap.
                 //    The native engine binds image patch tokens from Content.ImageBytes
                 //    directly; no literal [IMAGE_TOKEN] placeholder is needed or allowed.
                 val contents = Contents.of(
@@ -311,9 +336,10 @@ class VlmEngineManager(
                     Content.ImageBytes(imageBytes)
                 )
 
-                // 6. Send via callback-based API (avoids SendChannel crash)
+                // 7. Send via callback-based API (avoids SendChannel crash)
                 val responseBuilder = StringBuilder()
                 val latch = CountDownLatch(1)
+                activeLatch = latch  // Expose to interrupt() for cancellation
                 var inferenceError: String? = null
 
                 val callback = object : MessageCallback {
@@ -343,8 +369,18 @@ class VlmEngineManager(
 
                 conversation.sendMessageAsync(contents, callback)
 
-                // 7. Wait for completion (max 180s — Gemma 3n E2B int4 at 3.66GB)
+                // 8. Wait for completion (max 180s — Gemma 3n E2B int4 at 3.66GB)
                 val completed = latch.await(INFERENCE_TIMEOUT_SEC, TimeUnit.SECONDS)
+                activeLatch = null  // Clear — interrupt() can no longer signal this inference
+
+                // Check if interrupt() released the latch externally. If so, the native
+                // thread may still be running — do NOT close the Conversation (causes
+                // SIGSEGV) and do NOT fire callbacks (stale session).
+                if (wasInterrupted) {
+                    Log.i(TAG, "Inference interrupted externally — discarding stale result")
+                    return@withContext null
+                }
+
                 if (!completed) {
                     Log.w(TAG, "Inference timed out after ${INFERENCE_TIMEOUT_SEC}s")
                     inferenceError = "Inference timed out"
@@ -357,7 +393,7 @@ class VlmEngineManager(
                     Log.e(TAG, "Inference failed: $inferenceError")
                     CrashLogFile.logError(TAG, "Inference failed: $inferenceError")
                     onError?.invoke("Inference error: $inferenceError", sessionId)
-                    return@use null
+                    return@withContext null
                 }
 
                 Log.i(TAG, "Inference complete: ${fullResponse.length} chars in ${elapsed}ms [backend=$activeBackend]")
@@ -367,7 +403,23 @@ class VlmEngineManager(
                 CrashLogFile.exportToDownloads(context)
 
                 fullResponse
-            } ?: return@withContext null
+            } finally {
+                // CRITICAL: Only close the Conversation if it was NOT interrupted.
+                // When interrupted, the native thread is still running inside
+                // sendMessageAsync → onDone. Closing the Conversation here frees
+                // the JNI pointer while the native thread references it → SIGSEGV.
+                // The Conversation will be garbage-collected when the native thread
+                // finishes and releases its reference.
+                if (!wasInterrupted) {
+                    try {
+                        conversation.close()
+                    } catch (e: Throwable) {
+                        Log.w(TAG, "Conversation close error: ${e.message}")
+                    }
+                } else {
+                    Log.d(TAG, "Skipping conversation.close() — native thread still running")
+                }
+            }
 
         } catch (e: Throwable) {
             Log.e(TAG, "Inference failed: ${e.javaClass.simpleName}: ${e.message}", e)
@@ -498,25 +550,35 @@ class VlmEngineManager(
      *   vision patch bucket and minimize prefill time
      * - Returns a NEW bitmap (caller must recycle)
      */
+    /**
+     * Preprocess a camera bitmap for VLM input.
+     *
+     * 1. Center-crop to a 1:1 square aspect ratio (preserves spatial alignment)
+     * 2. Scale the square to MAX_INPUT_DIMENSION × MAX_INPUT_DIMENSION
+     *
+     * Center-cropping instead of squishing ensures that objects on the left
+     * side of the camera frame remain on the left in the VLM input — no
+     * spatial coordinate distortion.
+     *
+     * @return A NEW 256×256 square bitmap (caller must recycle)
+     */
     private fun preprocessBitmap(source: Bitmap): Bitmap {
         val w = source.width
         val h = source.height
 
-        // Calculate scale factor — enforce 256×256 max
-        val maxDim = maxOf(w, h)
-        val scale = if (maxDim > MAX_INPUT_DIMENSION) {
-            MAX_INPUT_DIMENSION.toFloat() / maxDim
-        } else {
-            1.0f
-        }
+        // Step 1: Center-crop to 1:1 square
+        val size = minOf(w, h)
+        val x = (w - size) / 2
+        val y = (h - size) / 2
+        val cropped = Bitmap.createBitmap(source, x, y, size, size)
 
-        return if (scale < 1.0f) {
-            val newW = (w * scale).toInt()
-            val newH = (h * scale).toInt()
-            Bitmap.createScaledBitmap(source, newW, newH, true)
+        // Step 2: Scale square to target dimension
+        return if (size > MAX_INPUT_DIMENSION) {
+            val scaled = Bitmap.createScaledBitmap(cropped, MAX_INPUT_DIMENSION, MAX_INPUT_DIMENSION, true)
+            if (scaled !== cropped) cropped.recycle()
+            scaled
         } else {
-            // Already small enough — return a copy so we own the memory
-            source.copy(source.config, false)
+            cropped
         }
     }
 
@@ -581,6 +643,32 @@ class VlmEngineManager(
 
     fun isReady(): Boolean = isInitialized && engine != null
     fun getActiveBackend(): String = activeBackend
+
+    // ── Native Interruption ──────────────────────────────────────
+
+    /**
+     * Immediately release the blocking [CountDownLatch.await] in [analyzeImage]
+     * so the calling coroutine resumes without waiting for the full inference.
+     *
+     * **Engine stays alive:** Unlike [resetSession], this does NOT close the
+     * underlying Engine. The next [analyzeImage] call executes immediately
+     * without model reload latency.
+     *
+     * **Stale response safety:** The caller (VyzeCoreController) gates callbacks
+     * via sessionId == activeSessionId — any tokens or onComplete from the
+     * interrupted inference are discarded by the caller.
+     */
+    fun interrupt() {
+        val latch = activeLatch
+        if (latch != null) {
+            Log.i(TAG, "interrupt: releasing active inference latch")
+            wasInterrupted = true   // Signal analyzeImage to skip close + callbacks
+            latch.countDown()       // Unblocks await() — coroutine resumes immediately
+            activeLatch = null
+        } else {
+            Log.d(TAG, "interrupt: no active latch (no inference running)")
+        }
+    }
 
     // ── Session Reset ────────────────────────────────────────────
 
@@ -705,10 +793,10 @@ class VlmEngineManager(
         const val JPEG_QUALITY = 90
 
         // Greedy decoding — fast, concise output with minimal latency
-        const val TEMPERATURE = 0.0
+        const val TEMPERATURE = 0.1
         const val TOP_K = 1
         const val TOP_P = 1.0
-        const val MAX_TOKENS = 64
+        const val MAX_TOKENS = 35
 
         /**
          * High-level system directive prepended to every user turn.

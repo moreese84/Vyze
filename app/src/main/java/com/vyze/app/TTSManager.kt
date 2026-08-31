@@ -191,11 +191,15 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
 
             tts?.setAudioAttributes(ttsAudioAttributes)
 
+            // Accelerated speech rate — 15% faster than default for lower latency.
+            // Preserves clarity while reducing total utterance duration.
+            tts?.setSpeechRate(1.15f)
+
             // Set the GLOBAL utterance progress listener — tracks ALL utterances
             tts?.setOnUtteranceProgressListener(globalUtteranceListener)
 
             Log.i(TAG, "TTS setup OK — locale=$currentLocale, engine=${tts?.defaultEngine}, " +
-                "lockedVolume=$lockedStreamVolume")
+                "lockedVolume=$lockedStreamVolume, speechRate=1.15")
 
             mainHandler.postDelayed({
                 isInitialized = true

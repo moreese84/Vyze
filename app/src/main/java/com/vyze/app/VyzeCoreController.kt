@@ -14,6 +14,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
@@ -81,6 +82,10 @@ class VyzeCoreController(
     private var firstChunkSent = false
 
     private val SENTENCE_TERMINATORS = charArrayOf('.', '!', '?', '\n')
+
+    /** Early flush at commas/colons for faster TTFT — no min char threshold. */
+    private val EARLY_FLUSH_TERMINATORS = charArrayOf(',', ':')
+
     private val minFlushChars = 20
 
     /** Monotonically increasing counter for unique utterance IDs per session. */
@@ -131,11 +136,11 @@ class VyzeCoreController(
         // Drops tokens from any session that doesn't match activeSessionId.
         vlmEngine.onError = { error, sessionId ->
             if (sessionId != activeSessionId && sessionId.isNotEmpty()) {
-                Log.d(TAG, "onError: stale session $sessionId (active=$activeSessionId) — dropping callback")
-                // STILL reset isInferring — the old coroutine may be holding it true
+                Log.d(TAG, "onError: STALE session $sessionId (active=$activeSessionId) — DISCARDING")
                 isInferring.set(false)
             } else {
                 Log.e(TAG, "onError: session=$sessionId error=$error")
+                flushRemainingSentenceBuffer()
                 isInferring.set(false)
                 mainHandler.post {
                     onStatusUpdate?.invoke("Error: $error")
@@ -145,7 +150,9 @@ class VyzeCoreController(
         }
 
         vlmEngine.onTokenGenerated = { token, sessionId ->
-            if (sessionId == activeSessionId) {
+            if (sessionId != activeSessionId && sessionId.isNotEmpty()) {
+                // Stale token — SILENTLY DROP
+            } else {
                 try {
                     synchronized(bufferLock) {
                         sentenceBuffer.append(token)
@@ -155,40 +162,39 @@ class VyzeCoreController(
                     Log.e(TAG, "onTokenGenerated error: ${e.javaClass.simpleName}: ${e.message}")
                 }
             }
-            // else: stale token from a cancelled/superseded inference — silently dropped
         }
 
         vlmEngine.onComplete = { fullResponse, sessionId ->
-            if (sessionId != activeSessionId) {
-                Log.d(TAG, "onComplete: stale session $sessionId (active=$activeSessionId) — dropping")
-            } else try {
-                CrashLogFile.log(TAG, "onComplete fired: ${fullResponse.length} chars")
-
-                flushRemainingSentenceBuffer()
-
-                scope.launch {
-                    try {
-                        promptBuilder.storeEnvironmentObservation(fullResponse)
-                        CrashLogFile.log(TAG, "Memory store OK")
-                    } catch (e: Throwable) {
-                        CrashLogFile.logError(TAG, "Memory store failed: ${e.javaClass.simpleName}: ${e.message}", e)
-                    }
-                }
-
+            if (sessionId != activeSessionId && sessionId.isNotEmpty()) {
+                Log.d(TAG, "onComplete: STALE session $sessionId (active=$activeSessionId) — DISCARDING")
                 isInferring.set(false)
-                CrashLogFile.log(TAG, "isInferring set to false")
-                mainHandler.post {
-                    try {
-                        onInferenceComplete?.invoke(fullResponse)
-                        onStatusUpdate?.invoke("Ready")
-                        CrashLogFile.log(TAG, "onComplete UI callbacks done")
-                    } catch (e: Throwable) {
-                        CrashLogFile.logError(TAG, "onComplete callback error: ${e.javaClass.simpleName}: ${e.message}", e)
+            } else {
+                CrashLogFile.log(TAG, "onComplete fired: session=$sessionId, ${fullResponse.length} chars")
+                try {
+                    flushRemainingSentenceBuffer()
+                    scope.launch {
+                        try {
+                            promptBuilder.storeEnvironmentObservation(fullResponse)
+                            CrashLogFile.log(TAG, "Memory store OK")
+                        } catch (e: Throwable) {
+                            CrashLogFile.logError(TAG, "Memory store failed: ${e.javaClass.simpleName}: ${e.message}", e)
+                        }
                     }
+                    isInferring.set(false)
+                    CrashLogFile.log(TAG, "isInferring set to false")
+                    mainHandler.post {
+                        try {
+                            onInferenceComplete?.invoke(fullResponse)
+                            onStatusUpdate?.invoke("Ready")
+                            CrashLogFile.log(TAG, "onComplete UI callbacks done (session=$sessionId)")
+                        } catch (e: Throwable) {
+                            CrashLogFile.logError(TAG, "onComplete callback error: ${e.javaClass.simpleName}: ${e.message}", e)
+                        }
+                    }
+                } catch (e: Throwable) {
+                    CrashLogFile.logError(TAG, "onComplete error: ${e.javaClass.simpleName}: ${e.message}", e)
+                    isInferring.set(false)
                 }
-            } catch (e: Throwable) {
-                CrashLogFile.logError(TAG, "onComplete error: ${e.javaClass.simpleName}: ${e.message}", e)
-                isInferring.set(false)
             }
         }
 
@@ -263,10 +269,65 @@ class VyzeCoreController(
     // ── Sentence Buffer Flush Logic ────────────────────────────────
 
     private fun flushSentenceBufferIfReady() {
-        val chunk: String
+        var chunk: String = ""
         synchronized(bufferLock) {
             val text = sentenceBuffer.toString()
+            if (text.isEmpty()) return
 
+            // ── Ultra-fast path: first chunk of response ─────────
+            // Flush as soon as 1+ word (≥3 chars) — minimizes
+            // Time-To-First-Token for immediate audio feedback.
+            if (!firstChunkSent) {
+                val wordCount = text.trim().split(Regex("\\s+")).size
+                if (wordCount >= FIRST_CHUNK_MIN_WORDS || text.trim().length >= FIRST_CHUNK_MIN_CHARS) {
+                    chunk = sanitizeForTts(text.trim())
+                    sentenceBuffer.setLength(0)
+                    if (chunk.isNotEmpty()) {
+                        mainHandler.post {
+                            try {
+                                val chunkId = "${activeSessionId}_chunk_${chunkCounter.incrementAndGet()}"
+                                ttsManager.speak(chunk, TextToSpeech.QUEUE_FLUSH, utteranceId = chunkId)
+                                firstChunkSent = true
+                                CrashLogFile.log(TAG, "First-chunk flush (id=$chunkId): ${chunk.take(60)}...")
+                            } catch (e: Throwable) {
+                                Log.w(TAG, "TTS first-chunk error: ${e.message}")
+                            }
+                        }
+                        return
+                    }
+                }
+            }
+
+            // ── Fast path: early punctuation flush (commas, colons) ──
+            var earlyTerminator = -1
+            for (i in text.length - 1 downTo 0) {
+                if (text[i] in EARLY_FLUSH_TERMINATORS) {
+                    earlyTerminator = i
+                    break
+                }
+            }
+            if (earlyTerminator >= 0 && earlyTerminator + 1 >= MIN_EARLY_FLUSH_CHARS) {
+                val raw = text.substring(0, earlyTerminator + 1)
+                chunk = sanitizeForTts(raw)
+                sentenceBuffer.delete(0, earlyTerminator + 1)
+                while (sentenceBuffer.isNotEmpty() && sentenceBuffer[0] == ' ') {
+                    sentenceBuffer.deleteCharAt(0)
+                }
+                if (chunk.isNotEmpty()) {
+                    mainHandler.post {
+                        try {
+                            val chunkId = "${activeSessionId}_chunk_${chunkCounter.incrementAndGet()}"
+                            ttsManager.speak(chunk, TextToSpeech.QUEUE_ADD, utteranceId = chunkId)
+                            CrashLogFile.log(TAG, "Early flush (id=$chunkId): ${chunk.take(60)}...")
+                        } catch (e: Throwable) {
+                            Log.w(TAG, "TTS flush error: ${e.message}")
+                        }
+                    }
+                    return
+                }
+            }
+
+            // ── Slow path: full sentence terminator check ──────────
             var lastTerminator = -1
             for (i in text.length - 1 downTo 0) {
                 if (text[i] in SENTENCE_TERMINATORS) {
@@ -382,9 +443,30 @@ class VyzeCoreController(
 
     // ── Snapshot Trigger ───────────────────────────────────────────
 
-    fun triggerSnapshot(bitmap: Bitmap, query: String? = null) {
+    fun triggerSnapshot(bitmap: Bitmap, query: String? = null, continuousMode: Boolean = false) {
         if (!engineReady) {
             Log.w(TAG, "triggerSnapshot called but engine not ready")
+            return
+        }
+
+        // Defensive bitmap validation — prevents crashes from recycled/damaged frames
+        if (bitmap.isRecycled) {
+            Log.e(TAG, "triggerSnapshot: bitmap is recycled — aborting")
+            mainHandler.post {
+                onStatusUpdate?.invoke("Error: captured frame was recycled")
+                onError?.invoke("Captured frame was recycled before inference")
+            }
+            return
+        }
+
+        try {
+            bitmap.getPixel(0, 0) // pixel access test — catches hardware corruption
+        } catch (e: Throwable) {
+            Log.e(TAG, "triggerSnapshot: bitmap is corrupted — aborting")
+            mainHandler.post {
+                onStatusUpdate?.invoke("Error: captured frame is corrupted")
+                onError?.invoke("Captured frame is corrupted: ${e.message}")
+            }
             return
         }
 
@@ -423,7 +505,14 @@ class VyzeCoreController(
         mainHandler.postDelayed(watchdogRunnable, WATCHDOG_TIMEOUT_MS)
 
         inferenceJob = scope.launch {
+            var inferenceBitmap: Bitmap = bitmap
             try {
+                // ── CANCELLATION CHECK: bail out immediately if job was cancelled ──
+                if (!isActive) {
+                    Log.d(TAG, "Job cancelled before inference start — aborting")
+                    return@launch
+                }
+
                 CrashLogFile.log(TAG, "=== TRIGGER SNAPSHOT (session=$currentSessionId) ===")
                 CrashLogFile.log(TAG, "Bitmap: ${bitmap.width}x${bitmap.height}")
 
@@ -442,22 +531,60 @@ class VyzeCoreController(
                     }
                 }
 
+                // Downsample bitmap for continuous mode to reduce memory + latency.
+                // Center-crop to 1:1 first to preserve spatial alignment, then scale.
+                inferenceBitmap = if (continuousMode &&
+                    (bitmap.width > CONTINUOUS_MAX_DIM || bitmap.height > CONTINUOUS_MAX_DIM)
+                ) {
+                    CrashLogFile.log(TAG, "Downsampling bitmap for continuous mode: ${bitmap.width}x${bitmap.height} -> ${CONTINUOUS_MAX_DIM}x${CONTINUOUS_MAX_DIM}")
+                    try {
+                        // Center-crop to square
+                        val size = minOf(bitmap.width, bitmap.height)
+                        val cx = (bitmap.width - size) / 2
+                        val cy = (bitmap.height - size) / 2
+                        val cropped = android.graphics.Bitmap.createBitmap(bitmap, cx, cy, size, size)
+                        // Scale to target
+                        val scaled = android.graphics.Bitmap.createScaledBitmap(
+                            cropped, CONTINUOUS_MAX_DIM, CONTINUOUS_MAX_DIM, true
+                        )
+                        if (scaled !== cropped) cropped.recycle()
+                        scaled
+                    } catch (e: Throwable) {
+                        CrashLogFile.logError(TAG, "Downsample failed: ${e.message}", e)
+                        bitmap
+                    }
+                } else bitmap
+
                 CrashLogFile.log(TAG, "Building prompt...")
                 val basePrompt = promptBuilder.buildPrompt(
                     snapshotDescription = query ?: "User triggered a camera snapshot.",
                     queryOverride = query,
-                    similarInteractions = emptyList()
+                    similarInteractions = emptyList(),
+                    continuousMode = continuousMode
                 )
                 CrashLogFile.log(TAG, "Base prompt built: ${basePrompt.length} chars")
 
+                // ── CANCELLATION CHECK: bail out before expensive VLM call ──
+                if (!isActive) {
+                    Log.d(TAG, "Job cancelled before VLM call — aborting")
+                    return@launch
+                }
+
                 CrashLogFile.log(TAG, "Calling vlmEngine.analyzeImage()...")
                 val response = vlmEngine.analyzeImage(
-                    bitmap = bitmap,
+                    bitmap = inferenceBitmap,
                     prompt = basePrompt,
                     memoryContext = null,
                     similarInteractions = emptyList(),
                     sessionId = currentSessionId
                 )
+
+                // ── CANCELLATION CHECK: bail out after VLM call if cancelled ──
+                if (!isActive) {
+                    Log.d(TAG, "Job cancelled after VLM call — discarding response")
+                    return@launch
+                }
+
                 CrashLogFile.log(TAG, "analyzeImage() returned: ${response?.length ?: 0} chars")
 
                 val similarInteractions = try {
@@ -468,8 +595,9 @@ class VyzeCoreController(
                 CrashLogFile.log(TAG, "Similar interactions resolved: ${similarInteractions.size} found")
 
                 if (response == null) {
-                    // ALWAYS reset state — even if session was superseded
+                    // ALWAYS reset isInferring — prevents stuck ANALYZING state
                     isInferring.set(false)
+                    flushRemainingSentenceBuffer()
                     if (currentSessionId == activeSessionId) {
                         mainHandler.post {
                             onStatusUpdate?.invoke("Inference returned empty response")
@@ -495,8 +623,9 @@ class VyzeCoreController(
 
             } catch (e: Throwable) {
                 CrashLogFile.logError(TAG, "Snapshot trigger FAILED: ${e.javaClass.simpleName}: ${e.message}", e)
-                // ALWAYS reset isInferring — prevents indefinite ANALYZING state
+                // ALWAYS reset isInferring + flush buffer — prevents stuck ANALYZING
                 isInferring.set(false)
+                flushRemainingSentenceBuffer()
                 if (currentSessionId == activeSessionId) {
                     mainHandler.post {
                         onStatusUpdate?.invoke("Error: ${e.message}")
@@ -504,10 +633,22 @@ class VyzeCoreController(
                     }
                 }
             } finally {
+                // DEFENSIVE: guarantee isInferring is never left true
+                isInferring.set(false)
                 // Cancel watchdog — inference completed (success, error, or cancel)
                 mainHandler.removeCallbacks(watchdogRunnable)
 
-                CrashLogFile.log(TAG, "finally block — recycling bitmap")
+                // Recycle downsampled bitmap if it's a different instance
+                if (inferenceBitmap !== bitmap) {
+                    try {
+                        if (!inferenceBitmap.isRecycled) {
+                            inferenceBitmap.recycle()
+                            CrashLogFile.log(TAG, "Downsampled bitmap recycled")
+                        }
+                    } catch (_: Throwable) {}
+                }
+
+                CrashLogFile.log(TAG, "finally block — recycling original bitmap")
                 try {
                     if (!bitmap.isRecycled) {
                         bitmap.recycle()
@@ -536,6 +677,16 @@ class VyzeCoreController(
         }
         inferenceJob = null
         isInferring.set(false)
+
+        // Release the active inference latch so the blocking await() resumes
+        // immediately. The engine stays alive — no model reload on next query.
+        // Stale callbacks from the interrupted inference are dropped via
+        // sessionId gating in onTokenGenerated / onComplete / onError.
+        try {
+            vlmEngine.interrupt()
+        } catch (e: Throwable) {
+            Log.w(TAG, "interrupt() error: ${e.message}")
+        }
     }
 
     fun cancelAndReset() {
@@ -599,5 +750,11 @@ class VyzeCoreController(
          * indefinite ANALYZING state.
          */
         private const val WATCHDOG_TIMEOUT_MS = 15_000L
+
+        /** Max dimension for continuous mode bitmap downsampling. */
+        private const val CONTINUOUS_MAX_DIM = 256
+        private const val MIN_EARLY_FLUSH_CHARS = 12
+        private const val FIRST_CHUNK_MIN_WORDS = 1
+        private const val FIRST_CHUNK_MIN_CHARS = 3
     }
 }
