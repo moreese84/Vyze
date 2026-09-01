@@ -579,12 +579,33 @@ class VyzeCoreController(
                 // For text queries, run OCR first, then feed clean text
                 // to Gemma for interpretation — skips character-level reading.
                 var ocrText: String? = null
+                var ocrConfidence = 0f
                 val isTextQuery = isTextExtractionQuery(query)
 
                 if (isTextQuery) {
-                    CrashLogFile.log(TAG, "Text query detected — running ML Kit OCR first...")
-                    ocrText = ocrHelper.extractText(inferenceBitmap)
-                    CrashLogFile.log(TAG, "OCR result: ${ocrText?.take(100) ?: "(none)"}")
+                    CrashLogFile.log(TAG, "Text query detected — running ML Kit OCR...")
+                    val ocrResult = ocrHelper.extractTextWithConfidence(inferenceBitmap)
+                    ocrText = ocrResult.first
+                    ocrConfidence = ocrResult.second
+                    CrashLogFile.log(TAG, "OCR result: ${ocrText?.take(100) ?: "(none)"} confidence=$ocrConfidence")
+                }
+
+                // ── OCR FAST-PATH: skip Gemma if confidence is high ──
+                // If ML Kit returned clean, high-confidence text, there's no
+                // need to invoke the 3.66GB Gemma model. TTS reads OCR text
+                // directly — saves battery and reduces latency from ~5s to ~150ms.
+                if (isTextQuery && !ocrText.isNullOrBlank() && ocrConfidence >= OCR_FAST_PATH_CONFIDENCE) {
+                    CrashLogFile.log(TAG, "OCR FAST-PATH: confidence=$ocrConfidence >= $OCR_FAST_PATH_CONFIDENCE — skipping Gemma")
+                    isInferring.set(false)
+                    mainHandler.removeCallbacks(watchdogRunnable)
+                    val ocrResponse = ocrText
+                    if (currentSessionId == activeSessionId) {
+                        mainHandler.post {
+                            onInferenceComplete?.invoke(ocrResponse)
+                            onStatusUpdate?.invoke("Ready [OCR fast-path]")
+                        }
+                    }
+                    return@launch
                 }
 
                 // ── CANCELLATION CHECK: bail out before prompt build ──
@@ -597,7 +618,6 @@ class VyzeCoreController(
                 val basePrompt = promptBuilder.buildPrompt(
                     snapshotDescription = query ?: "User triggered a camera snapshot.",
                     queryOverride = query,
-                    similarInteractions = emptyList(),
                     continuousMode = continuousMode,
                     userLocale = activeUserLocale,
                     ocrText = ocrText
@@ -852,18 +872,27 @@ class VyzeCoreController(
 
         // ── Dynamic Token Limits ────────────────────────────────
         /** Scene queries: concise descriptions (25 words, ~35 tokens). */
-        private const val SCENE_QUERY_MAX_TOKENS = 35
+        private const val SCENE_QUERY_MAX_TOKENS = 48
         /** Text queries: full label/document reading (96 tokens = ~70 words). */
         private const val TEXT_QUERY_MAX_TOKENS = 96
 
-        /** Keywords that trigger higher-resolution text extraction. */
+        // ── OCR Fast-Path ──────────────────────────────────────
+        /** ML Kit confidence threshold to skip Gemma and read OCR text directly. */
+        private const val OCR_FAST_PATH_CONFIDENCE = 0.85f
+
+        /** Keywords that trigger higher-resolution text extraction + OCR pre-pass. */
         private val TEXT_KEYWORDS = listOf(
+            // English
             "read", "label", "text", "sign", "document",
             "ingredient", "word", "writing", "print",
             "prescription", "medicine", "dosage", "instructions",
             "menu", "book", "paper", "note", "letter",
             "number", "phone", "address", "name",
-            "price", "tag", "caption", "title", "heading"
+            "price", "tag", "caption", "title", "heading",
+            // Malay / Bahasa Melayu
+            "baca", "harga", "ramuan", "resipi", "ubat",
+            "dos", "arahan", "alamat", "telefon", "nota",
+            "menu", "surat", "tulisan", "nombor", "nama"
         )
     }
 }

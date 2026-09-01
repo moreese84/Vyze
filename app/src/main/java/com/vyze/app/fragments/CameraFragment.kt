@@ -94,9 +94,24 @@ class CameraFragment : Fragment() {
     @Volatile
     private var isContinuousMode = false
 
+    /** Timestamp when continuous mode was last activated. Used for thermal throttling. */
+    @Volatile
+    private var continuousModeStartTime = 0L
+
     private val autoSnapshotRunnable = object : Runnable {
         override fun run() {
             if (!isContinuousMode || !isAdded) return
+
+            // ── THERMAL SAFETY: throttle after CONTINUOUS_MODE_THROTTLE_AFTER_MS ──
+            // After extended use, force a minimum interval between captures
+            // to prevent SoC thermal throttling on mid-tier chipsets.
+            val elapsed = System.currentTimeMillis() - continuousModeStartTime
+            val effectiveInterval = if (elapsed > CONTINUOUS_MODE_THROTTLE_AFTER_MS) {
+                Log.d(TAG, "Continuous mode: thermal throttle active (${elapsed / 1000}s elapsed)")
+                THERMALTHROTTLE_INTERVAL_MS
+            } else {
+                AUTO_SNAPSHOT_INTERVAL_MS
+            }
 
             // ── SAFETY GUARDS ──────────────────────────────────
             // Only trigger if ALL conditions are met:
@@ -114,7 +129,7 @@ class CameraFragment : Fragment() {
 
             // Schedule next tick if still in continuous mode
             if (isContinuousMode) {
-                mainHandler.postDelayed(this, AUTO_SNAPSHOT_INTERVAL_MS)
+                mainHandler.postDelayed(this, effectiveInterval)
             }
         }
     }
@@ -172,7 +187,6 @@ class CameraFragment : Fragment() {
                             if (coreController.isDuplicateDescription(response)) {
                                 Log.d(TAG, "Duplicate description — skipping TTS, returning to IDLE")
                                 appState = AppState.IDLE
-                                // In continuous mode, the auto-loop handles the next capture
                                 if (!isContinuousMode) {
                                     mainHandler.postDelayed({ startVoiceListening() }, 300L)
                                 }
@@ -197,6 +211,20 @@ class CameraFragment : Fragment() {
                         } else {
                             appState = AppState.IDLE
                         }
+
+                        // SAFETY TIMEOUT: If TTS doesn't finish within 10 seconds,
+                        // force-reset to IDLE. Prevents indefinite ANALYZING/SPEAKING
+                        // state when speakThenCallback's onDone doesn't fire.
+                        mainHandler.postDelayed({
+                            if (appState == AppState.SPEAKING) {
+                                Log.w(TAG, "SPEAKING timeout — forcing IDLE")
+                                appState = AppState.IDLE
+                                updateStatus("Ready")
+                                if (!isContinuousMode) {
+                                    startVoiceListening()
+                                }
+                            }
+                        }, SPEAKING_TIMEOUT_MS)
                     }
                 } catch (e: Exception) {
                     Log.w(TAG, "onInferenceComplete UI error: ${e.message}")
@@ -797,7 +825,8 @@ class CameraFragment : Fragment() {
     fun toggleContinuousMode() {
         isContinuousMode = !isContinuousMode
         if (isContinuousMode) {
-            Log.d(TAG, "Continuous mode ON — auto-snapshot every ${AUTO_SNAPSHOT_INTERVAL_MS}ms")
+            continuousModeStartTime = System.currentTimeMillis()
+            Log.d(TAG, "Continuous mode ON — auto-snapshot every ${AUTO_SNAPSHOT_INTERVAL_MS}ms (throttle after ${CONTINUOUS_MODE_THROTTLE_AFTER_MS / 1000}s)")
             updateStatus("Continuous mode ON")
             mainHandler.postDelayed(autoSnapshotRunnable, AUTO_SNAPSHOT_INTERVAL_MS)
         } else {
@@ -858,5 +887,20 @@ class CameraFragment : Fragment() {
 
         /** Interval (ms) between auto-snapshot captures in continuous mode. */
         private const val AUTO_SNAPSHOT_INTERVAL_MS = 4000L
+
+        /** Safety timeout (ms) — force IDLE if TTS doesn't finish in time. */
+        private const val SPEAKING_TIMEOUT_MS = 10_000L
+
+        /**
+         * After continuous mode runs for this long, throttle the capture interval
+         * to prevent SoC thermal throttling on mid-tier chipsets.
+         */
+        private const val CONTINUOUS_MODE_THROTTLE_AFTER_MS = 180_000L  // 3 minutes
+
+        /**
+         * Throttled capture interval (ms) after CONTINUOUS_MODE_THROTTLE_AFTER_MS.
+         * Doubles the interval to reduce sustained GPU load.
+         */
+        private const val THERMALTHROTTLE_INTERVAL_MS = 8000L
     }
 }

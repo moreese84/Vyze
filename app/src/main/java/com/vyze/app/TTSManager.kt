@@ -159,9 +159,7 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
 
     init {
         Log.i(TAG, "TTSManager created — locked stream volume=$lockedStreamVolume " +
-            "(max=$streamMaxVolume, stream=ACCESSIBILITY)")
-        // Force Google TTS engine for consistent neural voice quality.
-        // System OEM engines (Samsung, Huawei) often produce robotic output.
+            "max=$streamMaxVolume, stream=ACCESSIBILITY")
         tts = try {
             TextToSpeech(appContext, this, GOOGLE_TTS_ENGINE)
         } catch (e: Throwable) {
@@ -201,14 +199,9 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
             tts?.setAudioAttributes(ttsAudioAttributes)
 
             // ── Voice Quality Selection ──────────────────────────────
-            // Iterate available voices and select the highest-quality neural
-            // voice for the active locale. Avoids KEY_FEATURE_NOT_INSTALLED
-            // (missing voice data) and prefers QUALITY_VERY_HIGH / QUALITY_HIGH.
             selectBestVoice(currentLocale)
 
             // ── Prosody Tuning ───────────────────────────────────────
-            // Slightly warmer pitch (-2%) and conversational rate (-2%)
-            // eliminate flat, metallic synth tones while staying natural.
             tts?.setPitch(WARM_PITCH)
             tts?.setSpeechRate(WARM_RATE)
 
@@ -336,9 +329,6 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
         // Enhance text with natural prosody pauses before synthesis
         val enhancedText = enhanceForNaturalProsody(text)
 
-        // Audio focus is held for the entire session (holdSessionFocus)
-        // — no per-utterance request needed.
-
         val id = utteranceId ?: nextUtteranceId()
         val params = buildSpeakParams()
         val result = tts?.speak(enhancedText, queueMode, params, id) ?: TextToSpeech.ERROR
@@ -384,9 +374,6 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
 
         tts?.stop()
         pendingUtteranceIds.clear()
-
-        // Audio focus is held for the entire session (holdSessionFocus)
-        // — no per-utterance request needed.
 
         val id = nextUtteranceId()
         val params = buildSpeakParams()
@@ -435,18 +422,18 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
     fun stop() {
         tts?.stop()
         pendingUtteranceIds.clear()
-        // Audio focus stays held — only released on app destroy (releaseSessionFocus)
         Log.d(TAG, "stop() — pendingUtteranceIds cleared")
     }
 
     /**
      * Set a caller-provided UtteranceProgressListener.
-     * This is ADDITIVE to the global listener — both fire for each utterance.
-     * The global listener handles pendingUtteranceIds tracking.
+     *
+     * CRITICAL: This is ADDITIVE — the global pendingUtteranceIds listener
+     * is ALWAYS preserved. The caller's listener is wrapped around the global
+     * one so both fire for each utterance. This prevents the caller from
+     * accidentally overwriting the global listener and breaking hasPendingSpeech().
      */
     fun setOnUtteranceProgressListener(listener: UtteranceProgressListener) {
-        // The global listener is already set. We wrap the caller's listener
-        // and let the global one handle ID tracking.
         tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(utteranceId: String?) {
                 globalUtteranceListener.onStart(utteranceId)
@@ -484,9 +471,6 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
     fun playSilentUtterance(durationMs: Int = 300, queueMode: Int = TextToSpeech.QUEUE_ADD): Boolean {
         if (!isInitialized) return false
         val id = nextUtteranceId()
-        // Silence via KEY_PARAM_VOLUME = 0.0f. The queued utterance
-        // keeps hasPendingSpeech() true while the preceding audible
-        // utterance's AudioTrack hardware buffer drains.
         val params = Bundle().apply {
             putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 0.0f)
         }
@@ -567,14 +551,6 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
 
     // ── Voice Quality Selection ──────────────────────────────────
 
-    /**
-     * Scan available voices and select the highest-quality neural voice
-     * for the given locale. Avoids voices with KEY_FEATURE_NOT_INSTALLED
-     * (missing voice data that causes silent failures).
-     *
-     * Quality priority: VERY_HIGH > HIGH > NORMAL > LOW
-     * Within the same quality tier, prefer neural/network voices.
-     */
     private fun selectBestVoice(locale: Locale) {
         val engine = tts ?: return
         val voices = engine.voices
@@ -595,7 +571,6 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
             return
         }
 
-        // Sort: highest quality first, then prefer neural/network voices
         val best = localeVoices.sortedWith(
             compareByDescending<Voice> { it.quality }
                 .thenByDescending { it.isNetworkConnectionRequired }
@@ -608,37 +583,21 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
 
     // ── Natural Prosody Enhancement ───────────────────────────────
 
-    /**
-     * Inject subtle cadence micro-pauses into text before TTS synthesis.
-     *
-     * Android's TextToSpeech does NOT process SSML tags — they are read
-     * aloud as literal text. Instead, this method uses native punctuation
-     * cues that all TTS engines interpret as prosody signals:
-     *
-     * - Periods / question marks / exclamation marks: already cause natural
-     *   sentence-level pauses (~200-300ms). We ensure they are followed by
-     *   a space so the engine doesn't clip the trailing phoneme.
-     * - Commas: cause ~90-120ms clause breaks. We ensure trailing space.
-     * - Colons / semicolons: cause ~100-150ms breaks.
-     *
-     * This method is idempotent — double-wrapping is safe.
-     */
     private fun enhanceForNaturalProsody(text: String): String {
         if (text.isBlank()) return text
 
         var enhanced = text.trim()
 
-        // Ensure sentence terminators are followed by a space (prevents phoneme clipping)
+        // Ensure sentence terminators are followed by a space
         enhanced = enhanced.replace(Regex("([.!?])([A-Za-z0-9])"), "$1 $2")
 
-        // Ensure commas are followed by a space (triggers ~100ms clause break)
+        // Ensure commas are followed by a space
         enhanced = enhanced.replace(Regex("(,)([A-Za-z0-9])"), "$1 $2")
 
         // Ensure colons/semicolons are followed by a space
         enhanced = enhanced.replace(Regex("([:;])([A-Za-z0-9])"), "$1 $2")
 
-        // Add trailing period if missing — prevents the TTS engine from
-        // clipping the final phoneme of the last word.
+        // Add trailing period if missing
         if (enhanced.isNotEmpty() && !enhanced.last().isWhitespace() &&
             enhanced.last() !in charArrayOf('.', '!', '?')) {
             enhanced = "$enhanced."
@@ -649,15 +608,6 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
 
     // ── Locale Switching ──────────────────────────────────────────
 
-    /**
-     * Switch TTS voice to match the user's detected spoken language.
-     * Called dynamically by VyzeCoreController when SpeechRecognizer
-     * returns a new language.
-     *
-     * 1. Queries tts.setLanguage(locale) to verify support
-     * 2. Scans available voices for the best neural voice matching locale.language
-     * 3. Falls back to Locale.US if no matching voice pack is installed
-     */
     fun switchToLocale(locale: Locale) {
         if (!isInitialized) {
             Log.d(TAG, "switchToLocale($locale) — TTS not ready, will apply on next init")
@@ -667,11 +617,9 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
 
         val engine = tts ?: return
 
-        // Step 1: Try setting the language directly
         val result = engine.setLanguage(locale)
         if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
             Log.w(TAG, "switchToLocale($locale) — language not supported, trying locale.language only")
-            // Try with just the language code (e.g., "ms" without country)
             val langOnly = Locale(locale.language)
             val result2 = engine.setLanguage(langOnly)
             if (result2 == TextToSpeech.LANG_MISSING_DATA || result2 == TextToSpeech.LANG_NOT_SUPPORTED) {
@@ -685,7 +633,6 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
             currentLocale = locale
         }
 
-        // Step 2: Select the best neural voice for this locale
         selectBestVoice(currentLocale)
 
         Log.i(TAG, "switchToLocale: locked to $currentLocale")
@@ -806,20 +753,16 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
 
         // ── Voice Quality & Prosody Constants ───────────────────────
 
-        /** Force Google TTS engine for consistent neural voice quality. */
         private const val GOOGLE_TTS_ENGINE = "com.google.android.tts"
 
         /**
          * Warmer pitch (-2%): eliminates flat, metallic synth tones.
-         * Default 1.0f → 0.96f gives a subtly warmer, more human tone
-         * without sounding unnatural or pitch-shifted.
          */
         private const val WARM_PITCH = 0.96f
 
         /**
          * Conversational rate (-2%): slightly slower than default to
-         * allow natural cadence and emphasis. Combined with the pitch
-         * adjustment, produces a warmer, more human-sounding voice.
+         * allow natural cadence and emphasis.
          */
         private const val WARM_RATE = 0.98f
     }

@@ -2,7 +2,6 @@ package com.vyze.app
 
 import android.util.Log
 import com.vyze.app.data.MemoryDao
-import com.vyze.app.memory.SimilarInteraction
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.util.Locale
@@ -25,7 +24,6 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
     suspend fun buildPrompt(
         snapshotDescription: String = "",
         queryOverride: String? = null,
-        similarInteractions: List<SimilarInteraction> = emptyList(),
         continuousMode: Boolean = false,
         userLocale: Locale = Locale.US,
         ocrText: String? = null
@@ -35,11 +33,10 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
             val isDirectQuery = !queryOverride.isNullOrBlank()
 
             // 0. LANGUAGE MIRROR — TOP OF PROMPT (before any English rules)
-            //    Placing this FIRST ensures the model's primary language context
-            //    is set to the user's language before reading any instructions.
+            //    This is the strongest lever for non-English output.
             val langName = languageNameForLocale(userLocale)
             if (userLocale != Locale.US && userLocale.language != "en") {
-                sb.appendLine("[CRITICAL: You MUST respond entirely in $langName. All output text, descriptions, and answers must be written in $langName. Do NOT use English in your response.]")
+                sb.appendLine("[OUTPUT LANGUAGE: $langName] Write EVERY word of your response in $langName. Do NOT use English. Do NOT translate. This is mandatory.")
                 sb.appendLine()
             }
 
@@ -49,52 +46,27 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
                 isDirectQuery -> sb.appendLine(BASE_RULES_DIRECT_QUERY)
                 else -> sb.appendLine(BASE_RULES_NAVIGATION)
             }
-            sb.appendLine()
 
-            // 2. User preferences from Room DB
-            val preferences = memoryDao.getAllPreferences()
-            if (preferences.isNotEmpty()) {
-                sb.appendLine(formatPreferencesSection(preferences))
-            }
-
-            // 3. Similar past interactions — adaptive intelligence context
-            if (similarInteractions.isNotEmpty()) {
-                sb.appendLine(formatSimilarInteractionsSection(similarInteractions))
-            }
-
-            // 4. Snapshot / touch context (navigation mode only)
-            if (snapshotDescription.isNotBlank() && !isDirectQuery) {
-                sb.appendLine("--- SNAPSHOT ---")
-                sb.appendLine(snapshotDescription)
-                sb.appendLine()
-            }
-
-            // 5. OCR pre-extracted text (if available — feeds clean text to model)
+            // 2. OCR pre-extracted text (if available — feeds clean text to model)
             if (!ocrText.isNullOrBlank()) {
                 sb.appendLine("OCR: $ocrText")
             }
 
-            // 6. Task specification
-            sb.appendLine("--- TASK ---")
+            // 3. Task specification
             if (isDirectQuery) {
-                sb.appendLine("Answer this user question directly based on the image: \"$queryOverride\"")
+                sb.appendLine("Answer: \"$queryOverride\"")
             } else {
                 sb.appendLine(DEFAULT_NAVIGATION_QUERY)
             }
-            sb.appendLine()
 
-            // 7. Language mirror directive — reinforce at bottom too
+            // 4. Language mirror — reinforce at bottom
             if (userLocale != Locale.US && userLocale.language != "en") {
-                sb.appendLine(LANGUAGE_MIRROR_DIRECTIVE.replace("{lang}", langName))
+                sb.appendLine("REMEMBER: Respond only in $langName.")
             }
-
-            // 8. Output constraints
-            sb.appendLine(OUTPUT_CONSTRAINTS)
 
             val prompt = sb.toString()
             Log.d(TAG, "Built prompt: ${prompt.length} chars, " +
-                "mode=${if (isDirectQuery) "DIRECT_QUERY" else "NAVIGATION"}, " +
-                "${preferences.size} prefs, ${similarInteractions.size} similar")
+                "mode=${if (isDirectQuery) "DIRECT_QUERY" else "NAVIGATION"}")
             prompt
 
         } catch (e: Exception) {
@@ -146,48 +118,6 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
 
     // ── Section Formatters ─────────────────────────────────────────
 
-    private fun formatSimilarInteractionsSection(
-        similarInteractions: List<SimilarInteraction>
-    ): String {
-        // Cap to top 2 most relevant interactions, 80 chars each
-        val capped = similarInteractions.take(2)
-        if (capped.isEmpty()) return ""
-
-        val sb = StringBuilder()
-        sb.appendLine("Similar: ${capped.joinToString("; ") { s ->
-            "${s.record.output.take(80)} (${formatTimestamp(s.record.timestamp)})"
-        }}")
-        return sb.toString()
-    }
-
-    private fun formatPreferencesSection(
-        preferences: List<com.vyze.app.data.VyzeMemoryEntity>
-    ): String {
-        if (preferences.isEmpty()) return ""
-        val sb = StringBuilder()
-        val brevity = preferences.find { it.key == "brevity" }?.value
-        val textPriority = preferences.find { it.key == "text_priority" }?.value
-        val knownItems = preferences.find { it.key == "known_items" }?.value
-
-        if (brevity == "short") sb.append("Brevity: 1 sentence. ")
-        else if (brevity == "detailed") sb.append("Brevity: 2-3 sentences. ")
-        if (textPriority == "high") sb.append("Read all text aloud. ")
-        else if (textPriority == "low") sb.append("Skip minor text. ")
-        if (!knownItems.isNullOrBlank()) sb.append("Known: $knownItems. ")
-        if (sb.isNotEmpty()) sb.appendLine()
-        return sb.toString()
-    }
-
-    private fun formatRoomMemorySection(
-        envMemories: List<com.vyze.app.data.VyzeMemoryEntity>
-    ): String {
-        val capped = envMemories.take(2)
-        if (capped.isEmpty()) return ""
-        return "Recent: ${capped.joinToString("; ") { env ->
-            env.value.take(60)
-        }}"
-    }
-
     // ── Helpers ────────────────────────────────────────────────────
 
     /**
@@ -196,16 +126,6 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
      */
     private fun languageNameForLocale(locale: Locale): String {
         return locale.getDisplayLanguage(Locale.US).ifBlank { locale.language }
-    }
-
-    private fun formatTimestamp(timestampMs: Long): String {
-        val diff = System.currentTimeMillis() - timestampMs
-        return when {
-            diff < 60_000 -> "${diff / 1000}s ago"
-            diff < 3_600_000 -> "${diff / 60_000}m ago"
-            diff < 86_400_000 -> "${diff / 3_600_000}h ago"
-            else -> "${diff / 86_400_000}d ago"
-        }
     }
 
     // ── Constants ──────────────────────────────────────────────────
@@ -217,26 +137,24 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
          * NAVIGATION MODE — used for generic taps and automatic spatial descriptions.
          */
         private const val BASE_RULES_NAVIGATION =
-            "Describe ONLY what you see in THIS image. No filler (I see, this shows). " +
+            "Describe what you see. No filler phrases. " +
             "Use left/center/right + distance. " +
-            "Read visible text in its ORIGINAL language — do NOT translate. " +
-            "Do NOT guess, infer, or hallucinate objects not clearly visible. " +
-            "Do NOT reference prior scenes or memory. Objects outside frame excluded. " +
-            "Mirror/glass described as such."
+            "Read text in ORIGINAL language. " +
+            "If unsure about an object, say 'not clearly visible'. Do NOT guess or hallucinate. " +
+            "Mirrors/glass: describe the surface itself."
 
         private const val BASE_RULES_DIRECT_QUERY =
-            "Answer the question directly in first sentence. " +
-            "Read printed + handwritten text verbatim in its ORIGINAL language — do NOT translate. " +
-            "If text is blurry, low-res, or unreadable, say 'Text is unreadable' — NEVER guess or invent details. " +
-            "If no text is visible, say 'No text visible'. " +
-            "Only describe what you actually see in THIS image. Do not reference prior scenes. " +
-            "Mirror/screen/device only. Factual. No hallucination."
+            "Answer directly in first sentence. " +
+            "Read text verbatim in ORIGINAL language. " +
+            "If text is blurry or unreadable, say 'Text is unclear' — NEVER guess. " +
+            "If no text visible, say 'No text visible'. " +
+            "Only what you see in THIS image."
 
         private const val DEFAULT_NAVIGATION_QUERY =
             "Describe environment: obstacles, doors, people, text."
 
         private const val OUTPUT_CONSTRAINTS =
-            "1-2 sentences. Spatial. No bullet/markdown. Start with data."
+            "1-2 sentences. No bullet/markdown."
 
         /** Fallback prompt — used if dynamic prompt construction fails. */
         private const val FALLBACK_PROMPT = """You are Vyze, an accessible vision engine. Describe spatial layouts and obstacles directly. Do NOT use filler words like 'I see' or 'This photo shows'. Keep answers under 2 sentences.
@@ -254,8 +172,6 @@ Output 1-2 spoken sentences with spatial positioning. No filler, no formatting."
          * with the detected language name (e.g., "Malay", "Chinese").
          */
         private const val LANGUAGE_MIRROR_DIRECTIVE =
-            "[OUTPUT LANGUAGE: {lang}] All your output must be written in {lang}. " +
-            "Do NOT translate to English. Do NOT mix languages. " +
-            "Write every word of your response in {lang}."
+            "[OUTPUT LANGUAGE: {lang}] Write every word in {lang}. No English."
     }
 }

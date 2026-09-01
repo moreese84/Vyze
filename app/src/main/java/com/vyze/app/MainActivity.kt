@@ -256,6 +256,9 @@ class MainActivity : AppCompatActivity() {
 
         ttsManager.speak(text, TextToSpeech.QUEUE_FLUSH)
 
+        // ADDITIVE listener: setOnUtteranceProgressListener wraps the caller's
+        // listener around the global pendingUtteranceIds listener — both fire.
+        // The global listener maintains hasPendingSpeech() accuracy.
         try {
             ttsManager.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                 override fun onStart(utteranceId: String?) {
@@ -264,8 +267,6 @@ class MainActivity : AppCompatActivity() {
 
                 override fun onDone(utteranceId: String?) {
                     Log.d(TAG, "TTS onDone: $utteranceId — going to IDLE")
-                    // Audio focus stays held for the entire session.
-                    // Only released on app destroy (releaseSessionFocus).
                     runOnUiThread { onDone() }
                 }
 
@@ -282,7 +283,7 @@ class MainActivity : AppCompatActivity() {
             })
         } catch (e: Throwable) {
             Log.w(TAG, "Could not set UtteranceProgressListener: ${e.message}")
-            runOnUiThread { onDone() }
+            mainHandler.postDelayed({ onDone() }, 500L)
         }
     }
 
@@ -375,6 +376,8 @@ class MainActivity : AppCompatActivity() {
     private fun detectLocaleFromText(text: String): java.util.Locale {
         if (text.isBlank()) return java.util.Locale.US
 
+        val lower = text.lowercase()
+
         // Count character types
         var cjkCount = 0
         var totalLetters = 0
@@ -393,9 +396,24 @@ class MainActivity : AppCompatActivity() {
             return java.util.Locale.CHINESE
         }
 
-        // For Latin-script languages, use device default locale as best guess.
-        // Malay, Indonesian, English all use Latin script — can't distinguish
-        // purely from text. The device locale is the best available signal.
+        // Malay detection — common Malay words/phrases that English speakers
+        // would never say in sequence. This covers Latin-script Malay where
+        // SpeechRecognizer can't distinguish from English.
+        val malaySignals = listOf(
+            "apa ini", "apa itu", "apa khabar", "selamat",
+            "terima kasih", "tolong", "saya mahu", "saya nak",
+            "saya perlu", "boleh tak", "macam mana",
+            "di mana", "ini apa", "itu apa",
+            "bagus", "cantik", "buruk", "besar", "kecil",
+            "untuk saya", "saya tak", "saya tidak",
+            "kenapa", "bila", "siapa"
+        )
+        if (malaySignals.any { lower.contains(it) }) {
+            Log.d(TAG, "detectLocaleFromText: Malay phrases detected → ms")
+            return java.util.Locale("ms", "MY")
+        }
+
+        // For remaining Latin-script languages, use device default locale.
         val deviceLocale = java.util.Locale.getDefault()
         Log.d(TAG, "detectLocaleFromText: Latin script → device default $deviceLocale")
         return deviceLocale
