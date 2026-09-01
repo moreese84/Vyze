@@ -34,6 +34,15 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
             val sb = StringBuilder()
             val isDirectQuery = !queryOverride.isNullOrBlank()
 
+            // 0. LANGUAGE MIRROR — TOP OF PROMPT (before any English rules)
+            //    Placing this FIRST ensures the model's primary language context
+            //    is set to the user's language before reading any instructions.
+            val langName = languageNameForLocale(userLocale)
+            if (userLocale != Locale.US && userLocale.language != "en") {
+                sb.appendLine("[CRITICAL: You MUST respond entirely in $langName. All output text, descriptions, and answers must be written in $langName. Do NOT use English in your response.]")
+                sb.appendLine()
+            }
+
             // 1. Inject appropriate rules based on query intent
             when {
                 continuousMode -> sb.appendLine(CONTINUOUS_MODE_RULES)
@@ -53,12 +62,6 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
                 sb.appendLine(formatSimilarInteractionsSection(similarInteractions))
             }
 
-            // NOTE: Environment memories from Room DB are NOT injected into prompts.
-            // They persist up to 24 hours and cause stale/ghost results when the app
-            // is reopened after a long gap (e.g., describing yesterday's chair instead
-            // of today's scene). Each inference already gets a fresh camera frame —
-            // the model should describe what it sees NOW, not what was seen before.
-
             // 4. Snapshot / touch context (navigation mode only)
             if (snapshotDescription.isNotBlank() && !isDirectQuery) {
                 sb.appendLine("--- SNAPSHOT ---")
@@ -66,12 +69,12 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
                 sb.appendLine()
             }
 
-            // 6. OCR pre-extracted text (if available — feeds clean text to model)
+            // 5. OCR pre-extracted text (if available — feeds clean text to model)
             if (!ocrText.isNullOrBlank()) {
                 sb.appendLine("OCR: $ocrText")
             }
 
-            // 7. Task specification
+            // 6. Task specification
             sb.appendLine("--- TASK ---")
             if (isDirectQuery) {
                 sb.appendLine("Answer this user question directly based on the image: \"$queryOverride\"")
@@ -80,10 +83,12 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
             }
             sb.appendLine()
 
-            // 5. Language mirror directive — respond in user's language
-            sb.appendLine(LANGUAGE_MIRROR_DIRECTIVE.replace("{lang}", languageNameForLocale(userLocale)))
+            // 7. Language mirror directive — reinforce at bottom too
+            if (userLocale != Locale.US && userLocale.language != "en") {
+                sb.appendLine(LANGUAGE_MIRROR_DIRECTIVE.replace("{lang}", langName))
+            }
 
-            // 6. Output constraints
+            // 8. Output constraints
             sb.appendLine(OUTPUT_CONSTRAINTS)
 
             val prompt = sb.toString()
@@ -249,6 +254,8 @@ Output 1-2 spoken sentences with spatial positioning. No filler, no formatting."
          * with the detected language name (e.g., "Malay", "Chinese").
          */
         private const val LANGUAGE_MIRROR_DIRECTIVE =
-            "Respond strictly in {lang}. Do not translate or switch languages."
+            "[OUTPUT LANGUAGE: {lang}] All your output must be written in {lang}. " +
+            "Do NOT translate to English. Do NOT mix languages. " +
+            "Write every word of your response in {lang}."
     }
 }

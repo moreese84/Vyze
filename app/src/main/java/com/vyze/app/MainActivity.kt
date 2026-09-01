@@ -1,6 +1,7 @@
 package com.vyze.app
 
 import android.annotation.SuppressLint
+import android.content.Context
 import android.content.Intent
 import android.graphics.Color
 import android.os.Bundle
@@ -45,6 +46,8 @@ class MainActivity : AppCompatActivity() {
 
     private val ttsManager: TTSManager by lazy { ttsViewModel.ttsManager }
     private var ttsReady = false
+    var talkBackDetected = false
+        private set
 
     // ── Speech-to-Text ────────────────────────────────────────────
 
@@ -115,6 +118,13 @@ class MainActivity : AppCompatActivity() {
             initSpeechRecognizer()
             initTts()
 
+            // Hold permanent audio focus for the entire session (like Google Lens / Be My Eyes)
+            // This suppresses TalkBack and other accessibility audio while Vyze is active.
+            mainHandler.postDelayed({
+                ttsManager.holdSessionFocus()
+                detectTalkBack()
+            }, 500L)
+
             CrashLogFile.log(TAG, "onCreate completed successfully")
 
         } catch (e: Throwable) {
@@ -172,6 +182,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         destroySpeechRecognizer()
+        ttsManager.releaseSessionFocus()
         super.onDestroy()
         hapticManager?.cancel()
     }
@@ -187,6 +198,27 @@ class MainActivity : AppCompatActivity() {
             ttsReady = true
         } else {
             ttsManager.onReady = { ttsReady = true }
+        }
+    }
+
+    /**
+     * Detect if TalkBack is enabled and warn the user once.
+     * Vyze holds permanent audio focus to suppress TalkBack, but if the user
+     * has TalkBack enabled, they should know they can disable it for the best
+     * experience (fewer audio conflicts).
+     */
+    private fun detectTalkBack() {
+        try {
+            val am = getSystemService(Context.ACCESSIBILITY_SERVICE) as? android.view.accessibility.AccessibilityManager
+            if (am != null && am.isEnabled && am.isTouchExplorationEnabled) {
+                Log.i(TAG, "TalkBack detected — announcing advisory")
+                CrashLogFile.log(TAG, "TalkBack enabled — advisory spoken")
+                // One-time advisory after model is ready (handled by CameraFragment onboarding)
+                // Store flag so CameraFragment can include the advisory in its onboarding message
+                talkBackDetected = true
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "TalkBack detection failed: ${e.message}")
         }
     }
 
@@ -231,25 +263,20 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 override fun onDone(utteranceId: String?) {
-                    Log.d(TAG, "TTS onDone: $utteranceId — releasing focus, going to IDLE")
-                    // Release audio focus now that this utterance is complete.
-                    // For single-utterance calls, this is the right place.
-                    // For streaming (QUEUE_ADD), focus is abandoned when the
-                    // entire stream finishes via onInferenceComplete.
-                    ttsManager.abandonFocus()
+                    Log.d(TAG, "TTS onDone: $utteranceId — going to IDLE")
+                    // Audio focus stays held for the entire session.
+                    // Only released on app destroy (releaseSessionFocus).
                     runOnUiThread { onDone() }
                 }
 
                 @Deprecated("Deprecated in Java")
                 override fun onError(utteranceId: String?) {
                     Log.w(TAG, "TTS onError: $utteranceId")
-                    ttsManager.abandonFocus()
                     runOnUiThread { onDone() }
                 }
 
                 override fun onError(utteranceId: String?, errorCode: Int) {
                     Log.w(TAG, "TTS onError: $utteranceId code=$errorCode")
-                    ttsManager.abandonFocus()
                     runOnUiThread { onDone() }
                 }
             })
@@ -342,6 +369,39 @@ class MainActivity : AppCompatActivity() {
      */
     /**
      * Thread-safe method to start speech recognition.
+     * Detect language from transcribed text using Unicode character ranges.
+     * Fallback for devices where SpeechRecognizer doesn't return EXTRA_LANGUAGE.
+     */
+    private fun detectLocaleFromText(text: String): java.util.Locale {
+        if (text.isBlank()) return java.util.Locale.US
+
+        // Count character types
+        var cjkCount = 0
+        var totalLetters = 0
+        for (ch in text) {
+            if (ch.isLetter()) totalLetters++
+            val cp = ch.code
+            // CJK Unified Ideographs (Chinese/Japanese)
+            if (cp in 0x4E00..0x9FFF || cp in 0x3400..0x4DBF || cp in 0xF900..0xFAFF) {
+                cjkCount++
+            }
+        }
+
+        // If >30% of letters are CJK characters → Chinese
+        if (totalLetters > 0 && cjkCount.toFloat() / totalLetters > 0.3f) {
+            Log.d(TAG, "detectLocaleFromText: CJK detected ($cjkCount/$totalLetters) → zh")
+            return java.util.Locale.CHINESE
+        }
+
+        // For Latin-script languages, use device default locale as best guess.
+        // Malay, Indonesian, English all use Latin script — can't distinguish
+        // purely from text. The device locale is the best available signal.
+        val deviceLocale = java.util.Locale.getDefault()
+        Log.d(TAG, "detectLocaleFromText: Latin script → device default $deviceLocale")
+        return deviceLocale
+    }
+
+    /**
      * Wraps ALL calls inside a Main Handler block to satisfy Android's
      * strict requirement that SpeechRecognizer operations run on the Main UI thread.
      * Calls cancel() first to clear any stale session before starting a fresh one.
@@ -552,6 +612,7 @@ class MainActivity : AppCompatActivity() {
                 val bestMatch = matches?.firstOrNull()
 
                 // Extract detected language from SpeechRecognizer
+                // Many devices don't return EXTRA_LANGUAGE in results — fall back to text-based detection
                 val detectedLang = results?.getString(RecognizerIntent.EXTRA_LANGUAGE)
                 val detectedLocale: java.util.Locale? = if (!detectedLang.isNullOrBlank()) {
                     try {
@@ -562,10 +623,14 @@ class MainActivity : AppCompatActivity() {
                     }
                 } else null
 
+                // Fallback: detect language from the transcribed text itself
+                // This covers devices where EXTRA_LANGUAGE is missing from results Bundle
+                val finalLocale = detectedLocale ?: detectLocaleFromText(bestMatch ?: "")
+
                 if (!bestMatch.isNullOrBlank()) {
-                    Log.i(TAG, "onResults: \"$bestMatch\" lang=$detectedLocale")
-                    CrashLogFile.log(TAG, "Speech result: \"$bestMatch\" lang=$detectedLocale")
-                    onSpeechResult?.invoke(bestMatch, detectedLocale)
+                    Log.i(TAG, "onResults: \"$bestMatch\" lang=$finalLocale (bundle=$detectedLang)")
+                    CrashLogFile.log(TAG, "Speech result: \"$bestMatch\" lang=$finalLocale")
+                    onSpeechResult?.invoke(bestMatch, finalLocale)
                 } else {
                     Log.d(TAG, "onResults: empty — no speech recognized, silently restarting mic")
                     onPartialSpeechResult?.invoke("")

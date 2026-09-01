@@ -242,8 +242,12 @@ class CameraFragment : Fragment() {
                         val mainActivity = activity as? MainActivity
                         if (mainActivity != null && mainActivity.isTtsReady()) {
                             appState = AppState.IDLE
+                            val talkBackHint = if (mainActivity.talkBackDetected) {
+                                " TalkBack detected. Vyze will handle all audio while open. " +
+                                "You may disable TalkBack in Android Settings for the best experience. "
+                            } else ""
                             mainActivity.speakThenCallback(
-                                "Vyze model ready. Tap anywhere or speak to ask a question, " +
+                                "${talkBackHint}Vyze model ready. Tap anywhere or speak to ask a question, " +
                                 "such as what is in front of me. Tap again to interrupt or ask a new question."
                             ) {
                                 Log.d(TAG, "Onboarding spoken — starting voice listening")
@@ -266,8 +270,12 @@ class CameraFragment : Fragment() {
                     val mainActivity = activity as? MainActivity
                     if (mainActivity != null && mainActivity.isTtsReady()) {
                         appState = AppState.IDLE
+                        val talkBackHint = if (mainActivity.talkBackDetected) {
+                            " TalkBack detected. Vyze will handle all audio while open. " +
+                            "You may disable TalkBack in Android Settings for the best experience. "
+                        } else ""
                         mainActivity.speakThenCallback(
-                            "Vyze model ready. Tap anywhere or speak to ask a question, " +
+                            "${talkBackHint}Vyze model ready. Tap anywhere or speak to ask a question, " +
                             "such as what is in front of me. Tap again to interrupt or ask a new question."
                         ) {
                             Log.d(TAG, "Onboarding spoken — starting voice listening")
@@ -722,8 +730,8 @@ class CameraFragment : Fragment() {
                 } else {
                     // All utterances (including silent tail) have completed.
                     // Add a final 400ms grace for AudioTrack hardware drain.
+                    // Audio focus stays held for the entire session — only released on app destroy.
                     mainHandler.postDelayed({
-                        ttsManager.abandonFocus()
                         onDone()
                     }, AUDIO_DRAIN_GRACE_MS)
                 }

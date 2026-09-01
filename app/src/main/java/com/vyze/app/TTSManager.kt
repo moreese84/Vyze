@@ -31,9 +31,10 @@ import java.util.concurrent.atomic.AtomicLong
  * at the identical, stable gain for the entire session.
  *
  * ## Audio Focus
- * Requests AUDIOFOCUS_GAIN_TRANSIENT so TTS output is treated as primary
- * accessibility guidance. Focus is abandoned explicitly via abandonFocus()
- * or stop() — never automatically in onDone() (which fires per-utterance).
+ * Requests AUDIOFOCUS_GAIN (permanent) for the entire app session — like
+ * Google Lens and Be My Eyes. This suppresses TalkBack and other accessibility
+ * audio while Vyze is active. Focus is held from app open to app close.
+ * Never released per-utterance or on stop() — only on onDestroy().
  */
 class TTSManager(context: Context) : TextToSpeech.OnInitListener {
 
@@ -335,7 +336,8 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
         // Enhance text with natural prosody pauses before synthesis
         val enhancedText = enhanceForNaturalProsody(text)
 
-        requestAudioFocus()
+        // Audio focus is held for the entire session (holdSessionFocus)
+        // — no per-utterance request needed.
 
         val id = utteranceId ?: nextUtteranceId()
         val params = buildSpeakParams()
@@ -383,7 +385,8 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
         tts?.stop()
         pendingUtteranceIds.clear()
 
-        requestAudioFocus()
+        // Audio focus is held for the entire session (holdSessionFocus)
+        // — no per-utterance request needed.
 
         val id = nextUtteranceId()
         val params = buildSpeakParams()
@@ -432,7 +435,7 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
     fun stop() {
         tts?.stop()
         pendingUtteranceIds.clear()
-        abandonAudioFocus()
+        // Audio focus stays held — only released on app destroy (releaseSessionFocus)
         Log.d(TAG, "stop() — pendingUtteranceIds cleared")
     }
 
@@ -506,18 +509,40 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
 
     // ── Audio Focus ───────────────────────────────────────────────
 
-    private fun requestAudioFocus() {
+    /**
+     * Request permanent audio focus for the entire app session.
+     * Uses AUDIOFOCUS_GAIN (not TRANSIENT) to suppress TalkBack and
+     * other accessibility audio while Vyze is active.
+     * Called once on app open — not per-utterance.
+     */
+    fun holdSessionFocus() {
+        if (audioFocusRequest != null) {
+            Log.d(TAG, "holdSessionFocus: already holding focus")
+            return
+        }
         try {
-            audioFocusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+            audioFocusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
                 .setAudioAttributes(focusAttributes)
-                .setOnAudioFocusChangeListener { }
+                .setOnAudioFocusChangeListener { focusChange ->
+                    Log.d(TAG, "Audio focus changed: $focusChange")
+                }
                 .build()
 
-            audioManager.requestAudioFocus(audioFocusRequest!!)
-            Log.d(TAG, "Audio focus requested (GAIN_TRANSIENT, ACCESSIBILITY stream)")
+            val result = audioManager.requestAudioFocus(audioFocusRequest!!)
+            Log.i(TAG, "holdSessionFocus: AUDIOFOCUS_GAIN requested (result=$result)")
+            CrashLogFile.log(TAG, "Session audio focus acquired (GAIN, result=$result)")
         } catch (e: Throwable) {
-            Log.w(TAG, "requestAudioFocus failed: ${e.message}")
+            Log.w(TAG, "holdSessionFocus failed: ${e.message}")
         }
+    }
+
+    /**
+     * Release session audio focus. Called only on app destroy.
+     * Allows TalkBack and other services to resume.
+     */
+    fun releaseSessionFocus() {
+        abandonAudioFocus()
+        CrashLogFile.log(TAG, "Session audio focus released")
     }
 
     private fun abandonAudioFocus() {
