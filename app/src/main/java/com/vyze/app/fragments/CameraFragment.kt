@@ -60,11 +60,12 @@ class CameraFragment : Fragment() {
     private lateinit var hapticManager: HapticManager
     private var systemVibrator: Vibrator? = null
     private lateinit var flashlightManager: FlashlightManager
+    private lateinit var reportManager: ReportManager
 
     private lateinit var backgroundExecutor: ExecutorService
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    private enum class AppState { LOADING, IDLE, LISTENING, ANALYZING, SPEAKING }
+    private enum class AppState { LOADING, IDLE, LISTENING, ANALYZING, SPEAKING, REPORTING }
 
     @Volatile
     private var appState = AppState.LOADING
@@ -145,6 +146,7 @@ class CameraFragment : Fragment() {
             requireContext().getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
         }
         flashlightManager = FlashlightManager()
+        reportManager = ReportManager(requireContext().applicationContext)
 
         val app = requireActivity().applicationContext as VyzeApplication
         memoryDao = app.memoryDao
@@ -574,15 +576,25 @@ class CameraFragment : Fragment() {
             if (spokenText.isNotBlank()) {
                 Log.i(TAG, "Speech result: \"$spokenText\" lang=$detectedLocale")
                 activity.interruptTts()
-                // ── FULL PIPELINE RESET for speech-triggered captures ──
-                // Reset state + increment session before triggering.
-                // Must happen synchronously before triggerVlmSnapshot.
-                coreController.resetForNewCapture()
-                // Lock TTS + prompt language to detected user language
                 coreController.setUserLocale(detectedLocale)
-                appState = AppState.IDLE
-                updateStatus("Heard: \"$spokenText\"")
-                triggerVlmSnapshot(spokenText)
+
+                when {
+                    // ── REPORT MODE: speech is the report content ──
+                    appState == AppState.REPORTING -> {
+                        handleReportContent(spokenText)
+                    }
+                    // ── REPORT TRIGGER: enter report mode ─────────
+                    reportManager.isReportTrigger(spokenText) -> {
+                        enterReportMode()
+                    }
+                    // ── NORMAL VLM PIPELINE ──────────────────────
+                    else -> {
+                        coreController.resetForNewCapture()
+                        appState = AppState.IDLE
+                        updateStatus("Heard: \"$spokenText\"")
+                        triggerVlmSnapshot(spokenText)
+                    }
+                }
             }
         }
 
@@ -602,6 +614,77 @@ class CameraFragment : Fragment() {
                 Log.w(TAG, "Speech error: $errorMsg")
                 appState = AppState.IDLE
                 updateStatus("Ready")
+                mainHandler.postDelayed({ startVoiceListening() }, 300L)
+            }
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Voice-Driven Bug Reporting
+    // ══════════════════════════════════════════════════════════════════
+
+    /**
+     * Enter report mode. The next speech result will be treated as
+     * bug report content instead of a VLM query.
+     */
+    private fun enterReportMode() {
+        appState = AppState.REPORTING
+        updateStatus("Report mode — speak your issue")
+        Log.i(TAG, "Entering REPORTING mode")
+        CrashLogFile.log(TAG, "Report mode activated")
+
+        val mainActivity = activity as? MainActivity
+        mainActivity?.speakThenCallback(
+            "Report mode activated. Please describe the issue you want to report."
+        ) {
+            // After the prompt finishes, start listening for the report
+            mainHandler.postDelayed({ startVoiceListening() }, 300L)
+        }
+    }
+
+    /**
+     * Handle the report content spoken by the user.
+     * Saves to file, then launches email intent.
+     */
+    private fun handleReportContent(reportText: String) {
+        Log.i(TAG, "Report content received: ${reportText.take(80)}...")
+        CrashLogFile.log(TAG, "Report content: ${reportText.take(100)}")
+        updateStatus("Saving report...")
+
+        // Save report to local file
+        val reportFile = reportManager.saveReport(reportText)
+        if (reportFile == null) {
+            appState = AppState.IDLE
+            updateStatus("Report save failed")
+            val mainActivity = activity as? MainActivity
+            mainActivity?.speakThenCallback(
+                "Failed to save report. Please try again."
+            ) {
+                mainHandler.postDelayed({ startVoiceListening() }, 300L)
+            }
+            return
+        }
+
+        // Launch email intent
+        val emailSent = reportManager.sendReportEmail(reportFile)
+
+        if (emailSent) {
+            appState = AppState.IDLE
+            updateStatus("Report saved & email ready")
+            val mainActivity = activity as? MainActivity
+            mainActivity?.speakThenCallback(
+                "Report saved. Email is ready — please tap Send to submit."
+            ) {
+                mainHandler.postDelayed({ startVoiceListening() }, 300L)
+            }
+        } else {
+            // Email client not available — report still saved locally
+            appState = AppState.IDLE
+            updateStatus("Report saved (no email client)")
+            val mainActivity = activity as? MainActivity
+            mainActivity?.speakThenCallback(
+                "Report saved to Downloads folder. No email app found."
+            ) {
                 mainHandler.postDelayed({ startVoiceListening() }, 300L)
             }
         }

@@ -564,7 +564,9 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
         }
 
         if (localeVoices.isEmpty()) {
-            Log.d(TAG, "selectBestVoice: no voices for $locale, using engine default")
+            Log.w(TAG, "selectBestVoice: NO voice pack installed for ${locale.getDisplayLanguage(Locale.US)} (${locale.language}). " +
+                "TTS will use the engine default voice (likely English). " +
+                "Install the language pack in Android Settings > System > Languages > TTS.")
             return
         }
 

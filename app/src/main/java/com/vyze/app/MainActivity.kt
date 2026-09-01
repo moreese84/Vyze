@@ -450,7 +450,9 @@ class MainActivity : AppCompatActivity() {
                     RecognizerIntent.EXTRA_LANGUAGE_MODEL,
                     RecognizerIntent.LANGUAGE_MODEL_FREE_FORM
                 )
-                putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-US")
+                // Do NOT set EXTRA_LANGUAGE — let the device use its default language.
+                // This allows the recognizer to handle English, Malay, Chinese, etc.
+                // based on what the user actually speaks.
                 putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
                 putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
 

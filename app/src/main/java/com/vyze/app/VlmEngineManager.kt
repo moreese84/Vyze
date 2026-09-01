@@ -1,5 +1,6 @@
 package com.vyze.app
 
+import android.app.ActivityManager
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
@@ -72,6 +73,33 @@ class VlmEngineManager(
     @Volatile
     private var isInitialized = false
 
+    /** Whether this device is classified as low-RAM by Android. */
+    private val isLowRamDevice: Boolean by lazy {
+        try {
+            val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+            am?.isLowRamDevice == true
+        } catch (e: Throwable) { false }
+    }
+
+    /**
+     * Available device-level memory in MB.
+     * Uses ActivityManager.MemoryInfo which reports total available RAM
+     * (including native memory where LiteRT-LM loads), not just Java heap.
+     */
+    private fun availableHeapMB(): Long {
+        try {
+            val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+            if (am != null) {
+                val memInfo = ActivityManager.MemoryInfo()
+                am.getMemoryInfo(memInfo)
+                return memInfo.availMem / (1024 * 1024)
+            }
+        } catch (_: Throwable) {}
+        // Fallback: Java heap only (less accurate)
+        val runtime = Runtime.getRuntime()
+        return (runtime.freeMemory() + (runtime.maxMemory() - runtime.totalMemory())) / (1024 * 1024)
+    }
+
     // Callbacks for UI updates
     var onTokenGenerated: ((String, String) -> Unit)? = null  // (token, sessionId)
     var onComplete: ((String, String) -> Unit)? = null         // (response, sessionId)
@@ -129,6 +157,26 @@ class VlmEngineManager(
         if (isInitialized) return@withContext true
 
         CrashLogFile.log(TAG, "=== INIT START (Gemma 3n E2B) ===")
+
+        // ── Pre-flight RAM Check ──────────────────────────────────
+        // Gemma 3n E2B int4 requires ~4 GB of RAM at peak (model weights
+        // + KV-cache + image encoding). Reject early on constrained devices
+        // with a clear error instead of crashing mid-inference with OOM.
+        // Trigger GC first to reclaim idle memory before measuring.
+        System.gc()
+        Thread.sleep(100)
+        val freeMB = availableHeapMB()
+        val requiredMB = if (isLowRamDevice) MIN_RAM_LOW_RAM_DEVICE_MB else MIN_RAM_STANDARD_MB
+        if (freeMB < requiredMB) {
+            val errorMsg = "Insufficient RAM: ${freeMB}MB free, need ${requiredMB}MB. " +
+                "Gemma 3n E2B requires a device with at least ${if (isLowRamDevice) "4" else "6"}GB RAM."
+            Log.e(TAG, errorMsg)
+            CrashLogFile.logError(TAG, errorMsg)
+            onError?.invoke(errorMsg, "")
+            return@withContext false
+        }
+        Log.i(TAG, "RAM check passed: ${freeMB}MB free (lowRam=$isLowRamDevice, required=${requiredMB}MB)")
+        CrashLogFile.log(TAG, "RAM: ${freeMB}MB free, lowRam=$isLowRamDevice")
 
         try {
             Log.i(TAG, "Starting Gemma 3n E2B initialization...")
@@ -394,7 +442,20 @@ class VlmEngineManager(
                 conversation.sendMessageAsync(contents, callback)
 
                 // 8. Wait for completion (max 180s — Gemma 3n E2B int4 at 3.66GB)
-                val completed = latch.await(INFERENCE_TIMEOUT_SEC, TimeUnit.SECONDS)
+                //    On low-RAM devices, use a shorter timeout to fail fast instead of
+                //    hanging during an OOM recovery that may never complete.
+                val timeoutSec = if (isLowRamDevice) LOW_RAM_INFERENCE_TIMEOUT_SEC else INFERENCE_TIMEOUT_SEC
+                val completed = latch.await(timeoutSec, TimeUnit.SECONDS)
+
+                // ── Memory pressure check ──────────────────────────
+                // If available heap drops below threshold during inference,
+                // log a warning. The watchdog timer in VyzeCoreController
+                // handles the force-reset if the engine hangs due to OOM.
+                val remainingMB = availableHeapMB()
+                if (remainingMB < LOW_RAM_THRESHOLD_MB) {
+                    Log.w(TAG, "Memory pressure during inference: ${remainingMB}MB free — may OOM")
+                    CrashLogFile.log(TAG, "LOW MEMORY WARNING: ${remainingMB}MB free during inference")
+                }
                 activeLatch = null  // Clear — interrupt() can no longer signal this inference
 
                 // Check if interrupt() released the latch externally. If so, the native
@@ -661,23 +722,28 @@ class VlmEngineManager(
         }
         engine = null
         isInitialized = false
-        // Reinitialize on background thread — caller should check isReady() after
+        // Reinitialize on background thread — uses the SAME NPU → GPU fallback
+        // chain as initialize() so the optimal backend is always selected.
         val eng = scope.launch(Dispatchers.IO) {
             try {
                 val modelFile = resolveModelFile()
                 if (modelFile != null) {
-                    val engConfig = EngineConfig(
-                        modelPath = modelFile.absolutePath,
-                        backend = Backend.GPU(),
-                        visionBackend = Backend.GPU(),
-                        cacheDir = context.cacheDir.path
-                    )
-                    val newEngine = Engine(engConfig)
-                    newEngine.initialize()
-                    engine = newEngine
-                    activeBackend = "GPU"
-                    isInitialized = true
-                    Log.i(TAG, "resetSession: Engine reinitialized successfully")
+                    // Try NPU first, fall back to GPU — identical to initialize()
+                    val npuOk = tryInitializeWithBackend(modelFile, Backend.NPU(), "NPU")
+                    if (npuOk) {
+                        Log.i(TAG, "resetSession: reinitialized on NPU")
+                        warmUp()
+                        return@launch
+                    }
+                    val gpuOk = tryInitializeWithBackend(modelFile, Backend.GPU(), "GPU")
+                    if (gpuOk) {
+                        Log.i(TAG, "resetSession: reinitialized on GPU")
+                        warmUp()
+                        return@launch
+                    }
+                    Log.e(TAG, "resetSession: both NPU and GPU failed")
+                    engine = null
+                    isInitialized = false
                 } else {
                     Log.e(TAG, "resetSession: model file not found")
                 }
@@ -767,7 +833,16 @@ class VlmEngineManager(
 
         // Timeouts
         private const val INFERENCE_TIMEOUT_SEC = 180L  // 3 min for real inference
-        private const val WARMUP_TIMEOUT_SEC = 30L       // 30s for GPU warm-up pass
+        private const val LOW_RAM_INFERENCE_TIMEOUT_SEC = 60L  // 1 min on low-RAM devices — fail fast
+        private const val WARMUP_TIMEOUT_SEC = 60L       // 60s for GPU warm-up (mid-tier may need longer)
+
+        // ── Mid-Tier / Low-RAM Thresholds ───────────────────────
+        /** Minimum free heap (MB) required to attempt model init on standard devices. */
+        private const val MIN_RAM_STANDARD_MB = 1500L
+        /** Minimum free heap (MB) required on devices flagged as low-RAM. */
+        private const val MIN_RAM_LOW_RAM_DEVICE_MB = 1000L
+        /** Log a warning if free heap drops below this during inference. */
+        private const val LOW_RAM_THRESHOLD_MB = 500L
 
         private var nativeLibLoaded = false
 

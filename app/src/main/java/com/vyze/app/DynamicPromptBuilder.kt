@@ -29,8 +29,8 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
         continuousMode: Boolean = false,
         userLocale: Locale = Locale.US,
         ocrText: String? = null
-    ): String = withContext(Dispatchers.IO) {
-        try {
+    ): String {
+        return try {
             val sb = StringBuilder()
             val isDirectQuery = !queryOverride.isNullOrBlank()
 
@@ -53,13 +53,13 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
                 sb.appendLine(formatSimilarInteractionsSection(similarInteractions))
             }
 
-            // 4. Room memory — recent scenes + known local items
-            val envMemories = memoryDao.getRecentEnvironment(limit = 5)
-            if (envMemories.isNotEmpty()) {
-                sb.appendLine(formatRoomMemorySection(envMemories))
-            }
+            // NOTE: Environment memories from Room DB are NOT injected into prompts.
+            // They persist up to 24 hours and cause stale/ghost results when the app
+            // is reopened after a long gap (e.g., describing yesterday's chair instead
+            // of today's scene). Each inference already gets a fresh camera frame —
+            // the model should describe what it sees NOW, not what was seen before.
 
-            // 5. Snapshot / touch context (navigation mode only)
+            // 4. Snapshot / touch context (navigation mode only)
             if (snapshotDescription.isNotBlank() && !isDirectQuery) {
                 sb.appendLine("--- SNAPSHOT ---")
                 sb.appendLine(snapshotDescription)
@@ -80,16 +80,16 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
             }
             sb.appendLine()
 
-            // 7. Language mirror directive — respond in user's language
+            // 5. Language mirror directive — respond in user's language
             sb.appendLine(LANGUAGE_MIRROR_DIRECTIVE.replace("{lang}", languageNameForLocale(userLocale)))
 
-            // 9. Output constraints
+            // 6. Output constraints
             sb.appendLine(OUTPUT_CONSTRAINTS)
 
             val prompt = sb.toString()
             Log.d(TAG, "Built prompt: ${prompt.length} chars, " +
                 "mode=${if (isDirectQuery) "DIRECT_QUERY" else "NAVIGATION"}, " +
-                "${preferences.size} prefs, ${similarInteractions.size} similar, ${envMemories.size} env memories")
+                "${preferences.size} prefs, ${similarInteractions.size} similar")
             prompt
 
         } catch (e: Exception) {
@@ -212,16 +212,20 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
          * NAVIGATION MODE — used for generic taps and automatic spatial descriptions.
          */
         private const val BASE_RULES_NAVIGATION =
-            "Describe scene directly. No filler (I see, this shows). " +
+            "Describe ONLY what you see in THIS image. No filler (I see, this shows). " +
             "Use left/center/right + distance. " +
-            "Read visible text. No hallucination. No hedging. " +
-            "Objects outside frame excluded. Mirror=glass described."
+            "Read visible text in its ORIGINAL language — do NOT translate. " +
+            "Do NOT guess, infer, or hallucinate objects not clearly visible. " +
+            "Do NOT reference prior scenes or memory. Objects outside frame excluded. " +
+            "Mirror/glass described as such."
 
         private const val BASE_RULES_DIRECT_QUERY =
             "Answer the question directly in first sentence. " +
-            "Read printed + handwritten text verbatim. No filler. " +
-            "Unreadable text -> say 'Text is unreadable'. " +
-            "No hallucination. Mirror/screen=device only. Factual."
+            "Read printed + handwritten text verbatim in its ORIGINAL language — do NOT translate. " +
+            "If text is blurry, low-res, or unreadable, say 'Text is unreadable' — NEVER guess or invent details. " +
+            "If no text is visible, say 'No text visible'. " +
+            "Only describe what you actually see in THIS image. Do not reference prior scenes. " +
+            "Mirror/screen/device only. Factual. No hallucination."
 
         private const val DEFAULT_NAVIGATION_QUERY =
             "Describe environment: obstacles, doors, people, text."
