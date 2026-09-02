@@ -377,45 +377,119 @@ class MainActivity : AppCompatActivity() {
         if (text.isBlank()) return java.util.Locale.US
 
         val lower = text.lowercase()
+        val words = lower.split(Regex("\\s+"))
 
-        // Count character types
+        // ── Step 1: CJK (Chinese) detection ────────────────────
         var cjkCount = 0
         var totalLetters = 0
         for (ch in text) {
             if (ch.isLetter()) totalLetters++
             val cp = ch.code
-            // CJK Unified Ideographs (Chinese/Japanese)
             if (cp in 0x4E00..0x9FFF || cp in 0x3400..0x4DBF || cp in 0xF900..0xFAFF) {
                 cjkCount++
             }
         }
-
-        // If >30% of letters are CJK characters → Chinese
         if (totalLetters > 0 && cjkCount.toFloat() / totalLetters > 0.3f) {
             Log.d(TAG, "detectLocaleFromText: CJK detected ($cjkCount/$totalLetters) → zh")
             return java.util.Locale.CHINESE
         }
 
-        // Malay detection — common Malay words/phrases that English speakers
-        // would never say in sequence. This covers Latin-script Malay where
-        // SpeechRecognizer can't distinguish from English.
-        val malaySignals = listOf(
-            "apa ini", "apa itu", "apa khabar", "selamat",
-            "terima kasih", "tolong", "saya mahu", "saya nak",
-            "saya perlu", "boleh tak", "macam mana",
-            "di mana", "ini apa", "itu apa",
-            "bagus", "cantik", "buruk", "besar", "kecil",
-            "untuk saya", "saya tak", "saya tidak",
-            "kenapa", "bila", "siapa"
+        // ── Step 2: Malay detection (multi-signal scoring) ──────
+        // Malay uses Latin script so it can't be distinguished from English
+        // by script alone. We use a weighted scoring system:
+        //
+        // Signal A: High-frequency Malay function words (appear in almost
+        //           every Malay sentence — the most reliable signal)
+        // Signal B: Malay morphological suffixes (unique to Malay grammar)
+        // Signal C: Malay-specific word patterns
+        // Signal D: Malay reduplication (very common, e.g. "rumah-rumah")
+        //
+        // A score of 3+ is sufficient to identify Malay. English rarely
+        // scores above 1 because Malay function words don't exist in English.
+
+        var malayScore = 0
+
+        // Signal A: High-frequency function words
+        // These appear in virtually every Malay sentence and never in English.
+        val malayFunctionWords = setOf(
+            "saya", "kami", "kita", "anda", "kamu", "mereka",  // pronouns
+            "tidak", "tak", "bukan", "jangan", "belum",        // negation
+            "dan", "atau", "tapi", "kerana", "sebab",          // conjunctions
+            "ini", "itu", "sini", "situ", "sono",              // demonstratives
+            "yang", "adalah", "ialah",                            // copula/relativizer
+            "di", "ke", "dari", "dengan", "untuk",            // prepositions
+            "dalam", "atas", "bawah", "antara", "sebelum",    // spatial/temporal
+            "sudah", "sedang", "akan", "baru", "lagi",        // tense/aspect
+            "boleh", "mahu", "nak", "perlu", "mesti",         // modals
+            "ini", "apa", "siapa", "mana", "kenapa",          // question words
+            "bila", "berapa", "mengapa"
         )
-        if (malaySignals.any { lower.contains(it) }) {
-            Log.d(TAG, "detectLocaleFromText: Malay phrases detected → ms")
+        for (word in words) {
+            val cleaned = word.replace(Regex("[^a-z]"), "")
+            if (cleaned in malayFunctionWords) {
+                malayScore += 2  // high confidence signal
+            }
+        }
+
+        // Signal B: Malay morphological suffixes
+        // Malay is agglutinative — these suffixes are grammatical markers
+        // that don't appear in English.
+        val malaySuffixes = listOf(
+            "-kan", "-kan.",
+            "-an", "-an.",
+            "-i", "-i.",
+            "-lah", "-lah.",
+            "-kah", "-kah.",
+            "-tah", "-tah."
+        )
+        for (word in words) {
+            if (malaySuffixes.any { word.endsWith(it) }) {
+                malayScore += 1
+            }
+        }
+
+        // Signal C: Malay-specific word patterns
+        // These are words unique to Malay that don't exist in English.
+        val malayPatterns = listOf(
+            "selamat", "terima", "kasih", "tolong",
+            "macam", "mana", "bahasa", "malaysia",
+            "rumah", "makan", "minum", "jalan",
+            "tengok", "dengar", "cakap", "bagitahu",
+            "kenal", "paham", "faham",
+            "pergi", "datang", "balik",
+            "besar", "kecil", "cantik", "bagus",
+            "panas", "sejuk", "hujan", "cerah",
+            "hari", "malam", "pagi", "petang",
+            "orang", "anak", "ibu", "bapa"
+        )
+        for (word in words) {
+            val cleaned = word.replace(Regex("[^a-z]"), "")
+            if (cleaned in malayPatterns) {
+                malayScore += 1
+            }
+        }
+
+        // Signal D: Malay reduplication
+        // Very common in Malay (e.g., "rumah-rumah", "anak-anak",
+        // "sikit-sikit", "satu-satu"). English almost never reduplicates.
+        if (Regex("(\\b\\w+)-(\\w+)\\b").containsMatchIn(lower)) {
+            malayScore += 2
+        }
+
+        Log.d(TAG, "detectLocaleFromText: Malay score=$malayScore (words=${words.size})")
+
+        // Threshold: score >= 3 means confident Malay identification
+        // This prevents false positives from occasional English words
+        // that happen to match (e.g., "saya" could theoretically appear
+        // in English speech-to-text as noise).
+        if (malayScore >= 3) {
+            Log.d(TAG, "detectLocaleFromText: Malay detected (score=$malayScore) → ms")
             return java.util.Locale("ms", "MY")
         }
 
-        // For remaining Latin-script languages, use device default locale.
+        // ── Step 3: Fallback — device default locale ────────────
         val deviceLocale = java.util.Locale.getDefault()
-        Log.d(TAG, "detectLocaleFromText: Latin script → device default $deviceLocale")
+        Log.d(TAG, "detectLocaleFromText: no strong signal → device default $deviceLocale")
         return deviceLocale
     }
 
