@@ -248,13 +248,16 @@ class VyzeCoreController(
             }
         }
 
-        // Only announce 'downloading' if the model file is actually missing.
-        // If it's already on disk, skip the misleading announcement.
+        // Announce loading status so blind users know the app is working.
         val modelExists = vlmEngine.isModelOnDisk()
         if (!modelExists) {
             ttsManager.speakQueued(
                 "Please wait, model assets are downloading. " +
                 "This may take several minutes on first launch."
+            )
+        } else {
+            ttsManager.speakQueued(
+                "Model found. Loading now."
             )
         }
 
