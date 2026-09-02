@@ -23,6 +23,12 @@ class FlashlightManager {
     var camera: Camera? = null
 
     /**
+     * Callback fired when the torch state changes (auto or manual).
+     * Parameters: (isNowOn: Boolean)
+     */
+    var onTorchStateChanged: ((Boolean) -> Unit)? = null
+
+    /**
      * Tracks the last-known torch state to avoid redundant toggle commands.
      */
     @Volatile
@@ -72,6 +78,7 @@ class FlashlightManager {
     fun autoTorch(shouldBeOn: Boolean) {
         if (shouldBeOn != torchEnabled) {
             toggleTorch(shouldBeOn)
+            onTorchStateChanged?.invoke(torchEnabled)
         }
     }
 

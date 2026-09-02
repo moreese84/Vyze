@@ -79,11 +79,34 @@ class CameraSetupDelegate {
     @Volatile
     private var frameCounter = 0L
 
+    // ── Auto-Torch Luminance Detection ────────────────────────────
+    // Calculates average brightness from the Y plane of each YUV frame.
+    // Uses dual-threshold hysteresis to prevent rapid torch toggling:
+    //   - Torch ON  when brightness < DARK_THRESHOLD (35/255)
+    //   - Torch OFF when brightness > BRIGHT_THRESHOLD (65/255)
+    // Only samples every Nth frame to minimize CPU overhead.
+
+    /** Frame counter at last luminance check — skips frames to reduce CPU load. */
+    @Volatile
+    private var lastLuminanceCheckFrame = 0L
+
+    /** Hysteresis state — prevents rapid torch toggling at boundary light levels. */
+    @Volatile
+    private var isDarkEnvironment = false
+
     companion object {
         /** How long to poll for a fresh frame before giving up (ms). */
         private const val FRAME_WAIT_TIMEOUT_MS = 300L
         /** Polling interval when waiting for a frame (ms). */
         private const val FRAME_POLL_INTERVAL_MS = 20L
+
+        // ── Auto-Torch Luminance Thresholds ─────────────────────
+        /** Average Y-plane brightness below this → torch ON (0-255). */
+        private const val DARK_THRESHOLD = 35
+        /** Average Y-plane brightness above this → torch OFF (0-255). */
+        private const val BRIGHT_THRESHOLD = 65
+        /** Check luminance every N frames (~300ms at 30fps) to minimize CPU load. */
+        private const val LUMINANCE_CHECK_INTERVAL = 10L
     }
 
     /**
@@ -164,6 +187,12 @@ class CameraSetupDelegate {
                     // takeSnapshot() will clear frameConsumed after copying.
                     frameConsumed.set(false)
                     frameCounter++  // Signal takeSnapshot() that a genuinely new frame arrived
+
+                    // ── Auto-Torch: luminance check every 10th frame (~300ms at 30fps) ──
+                    if (frameCounter - lastLuminanceCheckFrame >= LUMINANCE_CHECK_INTERVAL) {
+                        lastLuminanceCheckFrame = frameCounter
+                        checkLuminanceAndAutoTorch(imageProxy)
+                    }
                 }
             } catch (e: Throwable) {
                 Log.w(TAG, "Frame analysis error: ${e.message}")
@@ -262,6 +291,66 @@ class CameraSetupDelegate {
     }
 
     // ── YUV → Bitmap Conversion ────────────────────────────────────
+
+    /**
+     * Calculate average luminance from the Y plane of a YUV frame and
+     * trigger auto-torch if the environment is dark or bright.
+     *
+     * Uses dual-threshold hysteresis:
+     *   - Torch ON  when avg brightness < 35/255
+     *   - Torch OFF when avg brightness > 65/255
+     *   - Between 35-65: no change (prevents rapid toggling)
+     *
+     * This runs on the analysis executor — NOT on the main thread.
+     * Sampling is throttled to every 10th frame (~300ms) to minimize CPU overhead.
+     */
+    private fun checkLuminanceAndAutoTorch(imageProxy: ImageProxy) {
+        try {
+            val planes = imageProxy.planes
+            if (planes.isEmpty()) return
+
+            val yBuffer = planes[0].buffer
+            val yRowStride = planes[0].rowStride
+            val pixelStride = planes[0].pixelStride
+            val width = imageProxy.width
+            val height = imageProxy.height
+
+            // Sample every 4th pixel for speed — enough for average brightness
+            val sampleStep = 4
+            var sum = 0L
+            var count = 0
+
+            val rowBuffer = ByteArray(yRowStride)
+            for (row in 0 until height step sampleStep) {
+                yBuffer.position(row * yRowStride)
+                yBuffer.get(rowBuffer, 0, minOf(yRowStride, rowBuffer.size))
+                for (col in 0 until width step sampleStep * pixelStride) {
+                    val idx = col * pixelStride
+                    if (idx < rowBuffer.size) {
+                        sum += (rowBuffer[idx].toInt() and 0xFF)
+                        count++
+                    }
+                }
+            }
+
+            if (count == 0) return
+            val avgBrightness = (sum / count).toInt()
+
+            // Hysteresis: ON < 35, OFF > 65, dead zone 35-65 prevents oscillation
+            val shouldBeOn = avgBrightness < DARK_THRESHOLD
+            val shouldBeOff = avgBrightness > BRIGHT_THRESHOLD
+
+            val newDarkState = if (shouldBeOn) true else if (shouldBeOff) false else isDarkEnvironment
+
+            if (newDarkState != isDarkEnvironment) {
+                isDarkEnvironment = newDarkState
+                flashlightManager.autoTorch(isDarkEnvironment)
+                Log.d(TAG, "Auto-torch: brightness=$avgBrightness/255, torch=${if (isDarkEnvironment) "ON" else "OFF"}")
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "Luminance check error: ${e.message}")
+        }
+    }
 
     /**
      * Convert an ImageProxy (YUV_888) to an ARGB_8888 Bitmap.

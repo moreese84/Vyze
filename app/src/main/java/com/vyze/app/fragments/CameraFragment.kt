@@ -161,6 +161,24 @@ class CameraFragment : Fragment() {
             requireContext().getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
         }
         flashlightManager = FlashlightManager()
+
+        // ── Auto-Torch Audio Announcement ────────────────────────
+        // When the environment darkens/brightens and the torch toggles,
+        // announce the state change so blind users know what happened.
+        flashlightManager.onTorchStateChanged = { isNowOn ->
+            mainHandler.post {
+                try {
+                    if (isNowOn) {
+                        ttsManager.speakQueued(
+                            requireContext().getString(R.string.light_dark, "")
+                        )
+                    } else {
+                        ttsManager.speakQueued("Light level sufficient. Torch is off.")
+                    }
+                } catch (_: Throwable) {}
+            }
+        }
+
         reportManager = ReportManager(requireContext().applicationContext)
 
         val app = requireActivity().applicationContext as VyzeApplication
