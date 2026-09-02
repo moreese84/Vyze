@@ -606,11 +606,11 @@ class VlmEngineManager(
     private suspend fun warmUp() = withContext(Dispatchers.IO) {
         val eng = engine ?: return@withContext
         try {
-            // 1×1 white bitmap — minimal allocation, just enough to trigger GPU kernel compilation
-            val dummy = Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
-            dummy.setPixel(0, 0, Color.WHITE)
-
-            val imageBytes = bitmapToJpegBytes(dummy)
+            // TEXT-ONLY warm-up — do NOT send images here.
+            // Sending Content.ImageBytes before the vision encoder is fully
+            // initialized causes a SIGSEGV (null pointer in liblitertlm_jni.so).
+            // The text decoder and GPU kernels are warmed up by this text-only
+            // message; the vision encoder warms up on the first real inference.
             val conversationConfig = ConversationConfig(
                 maxOutputToken = MAX_TOKENS,
                 samplerConfig = SamplerConfig(
@@ -622,8 +622,7 @@ class VlmEngineManager(
 
             eng.createConversation(conversationConfig).use { conversation ->
                 val contents = Contents.of(
-                    Content.Text("warmup"),
-                    Content.ImageBytes(imageBytes)
+                    Content.Text("hello")
                 )
                 val latch = CountDownLatch(1)
                 conversation.sendMessageAsync(contents, object : MessageCallback {
@@ -637,8 +636,7 @@ class VlmEngineManager(
                 latch.await(WARMUP_TIMEOUT_SEC, TimeUnit.SECONDS)
             }
 
-            dummy.recycle()
-            Log.i(TAG, "GPU warm-up completed")
+            Log.i(TAG, "GPU warm-up completed (text-only)")
         } catch (e: Throwable) {
             Log.w(TAG, "GPU warm-up failed (non-fatal): ${e.javaClass.simpleName}: ${e.message}")
         }
