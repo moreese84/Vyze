@@ -7,7 +7,7 @@ import kotlinx.coroutines.withContext
 import java.util.Locale
 
 /**
- * Constructs dynamic system prompts for the on-device VLM (Gemma 3n E2B).
+ * Constructs dynamic system prompts for the on-device VLM (Gemma 4 E2B).
  *
  * ## Intent-Based Prompt Branching
  * Automatically selects the appropriate system rules based on whether the user
@@ -134,18 +134,30 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
         private const val TAG = "DynamicPromptBuilder"
 
         /**
+         * System directive — injected as <|turn|>system block.
+         * Prevents Gemma from wasting cycles on internal English reasoning chains.
+         */
+        private const val SYSTEM_DIRECTIVE =
+            "You are a fast, concise visual assistant. Describe scene layouts and spatial objects " +
+            "directly in the language requested by the user without cross-translating or outputting " +
+            "internal reasoning chains. Use clear, natural punctuation (commas, periods, and short clauses) " +
+            "to guide spoken delivery. Respond only in the requested language."
+
+        /**
          * NAVIGATION MODE — used for generic taps and automatic spatial descriptions.
          */
         private const val BASE_RULES_NAVIGATION =
             "Describe what you see. No filler phrases. " +
             "Use left/center/right + distance. " +
             "Read text in ORIGINAL language. " +
+            "Use clear punctuation: periods to end sentences, commas to separate list items and clauses. " +
             "If unsure about an object, say 'not clearly visible'. Do NOT guess or hallucinate. " +
             "Mirrors/glass: describe the surface itself."
 
         private const val BASE_RULES_DIRECT_QUERY =
             "Answer directly in first sentence. " +
             "Read text verbatim in ORIGINAL language. " +
+            "Use clear punctuation: periods to end sentences, commas for pauses between items. " +
             "If text is blurry or unreadable, say 'Text is unclear' — NEVER guess. " +
             "If no text visible, say 'No text visible'. " +
             "Only what you see in THIS image."
@@ -164,7 +176,7 @@ Describe the immediate environment for navigation. Focus on obstacles, doors, pe
 Output 1-2 spoken sentences with spatial positioning. No filler, no formatting."""
 
         private const val CONTINUOUS_MODE_RULES =
-            "Instant assistant. Key objects + position. 15 words max."
+            "Instant assistant. Key objects + position. 15 words max. Use commas between items, period at end."
 
         /**
          * Language mirror directive — forces Gemma to respond in the same

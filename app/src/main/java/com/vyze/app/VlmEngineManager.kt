@@ -36,20 +36,21 @@ import java.util.concurrent.TimeUnit
  * On-device VLM engine wrapper using Google's LiteRT-LM framework.
  *
  * ## Model
- * Gemma 3n E2B (Edge 2 Billion) — int4 quantized multimodal vision-language model.
- * File: gemma-3n-E2B-it-int4.litertlm (3.66 GB)
+ * Gemma 4 E2B (Edge 2 Billion) — GPU multimodal vision-language model.
+ * File: gemma-4-E2B-it-gpu.litertlm (2.01 GB)
  *
  * ## Hardware Acceleration
  * GPU-only execution (OpenCL/Vulkan). CPU inference is not supported for this model size.
  *
  * ## Prompt Format
- * Uses Gemma's exact turn system prompt format:
- * `<start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n`
+ * Uses Gemma 4's turn format:
+ * `<|turn|>system [System Prompt]<|end_of_turn|><|turn|>user [User/Image Context]<|end_of_turn|><|turn|>model`
  * Image patch tokens are bound natively by the LiteRT-LM engine when
  * passing the Bitmap — no literal [IMAGE_TOKEN] placeholder needed.
  *
  * ## Memory Management
- * Incoming Bitmap frames are downscaled to a max of 256×256 pixels before inference.
+ * Incoming Bitmap frames are downscaled proportionally when exceeding target dimension.
+ * Gemma 4 handles dynamic aspect ratios natively — no rigid center-cropping applied.
  * All scaled bitmaps are explicitly recycled after inference to prevent memory leaks.
  *
  * ## GPU Warm-up
@@ -150,16 +151,16 @@ class VlmEngineManager(
     // ── Initialization ─────────────────────────────────────────────
 
     /**
-     * Initialize the Gemma 3n E2B engine.
-     * GPU-only — enforced for LiteRT-LM execution of int4 quantized model.
+     * Initialize the Gemma 4 E2B engine.
+     * NPU → GPU fallback chain for optimal hardware acceleration.
      */
     suspend fun initialize(): Boolean = withContext(Dispatchers.IO) {
         if (isInitialized) return@withContext true
 
-        CrashLogFile.log(TAG, "=== INIT START (Gemma 3n E2B) ===")
+        CrashLogFile.log(TAG, "=== INIT START (Gemma 4 E2B) ===")
 
         // ── Pre-flight RAM Check ──────────────────────────────────
-        // Gemma 3n E2B int4 requires ~4 GB of RAM at peak (model weights
+        // Gemma 4 E2B requires ~3 GB of RAM at peak (model weights
         // + KV-cache + image encoding). Reject early on constrained devices
         // with a clear error instead of crashing mid-inference with OOM.
         // Trigger GC first to reclaim idle memory before measuring.
@@ -169,7 +170,7 @@ class VlmEngineManager(
         val requiredMB = if (isLowRamDevice) MIN_RAM_LOW_RAM_DEVICE_MB else MIN_RAM_STANDARD_MB
         if (freeMB < requiredMB) {
             val errorMsg = "Insufficient RAM: ${freeMB}MB free, need ${requiredMB}MB. " +
-                "Gemma 3n E2B requires a device with at least ${if (isLowRamDevice) "4" else "6"}GB RAM."
+                "Gemma 4 E2B requires a device with at least ${if (isLowRamDevice) "3" else "4"}GB RAM."
             Log.e(TAG, errorMsg)
             CrashLogFile.logError(TAG, errorMsg)
             onError?.invoke(errorMsg, "")
@@ -179,7 +180,7 @@ class VlmEngineManager(
         CrashLogFile.log(TAG, "RAM: ${freeMB}MB free, lowRam=$isLowRamDevice")
 
         try {
-            Log.i(TAG, "Starting Gemma 3n E2B initialization...")
+            Log.i(TAG, "Starting Gemma 4 E2B initialization...")
 
             // Step 0: Ensure native library is loaded
             CrashLogFile.log(TAG, "Step 0: Loading native library")
@@ -216,7 +217,7 @@ class VlmEngineManager(
 
                 onStepProgress?.invoke(95, "Finalizing...")
                 CrashLogFile.log(TAG, "=== INIT SUCCESS [NPU] ===")
-                Log.i(TAG, "Gemma 3n E2B loaded successfully [backend=NPU]")
+                Log.i(TAG, "Gemma 4 E2B loaded successfully [backend=NPU]")
                 return@withContext true
             }
 
@@ -234,13 +235,13 @@ class VlmEngineManager(
 
                 onStepProgress?.invoke(95, "Finalizing...")
                 CrashLogFile.log(TAG, "=== INIT SUCCESS [GPU] ===")
-                Log.i(TAG, "Gemma 3n E2B loaded successfully [backend=GPU]")
+                Log.i(TAG, "Gemma 4 E2B loaded successfully [backend=GPU]")
                 return@withContext true
             }
 
             // Both NPU and GPU failed — no CPU fallback for this model size
             val errorMsg = "VLM init failed: NPU and GPU backends both unavailable. " +
-                "CPU fallback is disabled for Gemma 3n E2B int4 model."
+                "CPU fallback is disabled for Gemma 4 E2B model."
             Log.e(TAG, errorMsg)
             CrashLogFile.logError(TAG, errorMsg)
             onError?.invoke(errorMsg, "")
@@ -335,14 +336,14 @@ class VlmEngineManager(
     /**
      * Analyze a camera frame with a text prompt.
      *
-     * Uses Gemma's exact turn system prompt format:
-     * `<start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n`
+     * Uses Gemma 4's turn format:
+     * `<|turn|>system [System Prompt]<|end_of_turn|><|turn|>user [User/Image Context]<|end_of_turn|><|turn|>model`
      * Image patch tokens are bound natively by the engine via Content.ImageBytes.
      *
-     * @param bitmap          Camera frame — will be downscaled to [targetDimension] before inference
+     * @param bitmap          Camera frame — will be downscaled proportionally before inference
      * @param prompt          User query describing what to analyze
      * @param memoryContext   Optional context string injected below the baseline instruction
-     * @param targetDimension Target bitmap dimension (256 for scene, 384 for text extraction)
+     * @param targetDimension Target bitmap dimension (scales proportionally, no center-crop)
      * @return The complete model response, or null on error
      */
     suspend fun analyzeImage(
@@ -375,11 +376,11 @@ class VlmEngineManager(
             val imageBytes = bitmapToJpegBytes(scaledBitmap)
             CrashLogFile.log(TAG, "JPEG: ${imageBytes.size} bytes")
 
-            // 3. Build the user payload — prompt already contains system rules
-            //    from DynamicPromptBuilder. No additional BASELINE_INSTRUCTION
-            //    wrapper needed (would add ~28 redundant tokens to prefill).
+            // 3. Build the user payload + Gemma 4 turn format.
+            //    System directive is injected as <|turn|>system block.
+            //    User rules come from DynamicPromptBuilder inside the user payload.
             val userPayload = buildUserPayload(prompt, memoryContext)
-            val formattedPrompt = buildGemmaTurnPrompt(userPayload)
+            val formattedPrompt = buildGemmaTurnPrompt(userPayload, SYSTEM_DIRECTIVE)
             CrashLogFile.log(TAG, "Formatted prompt: ${formattedPrompt.take(120)}...")
 
             // 4. Create conversation with empty system instruction
@@ -522,34 +523,39 @@ class VlmEngineManager(
         }
     }
 
-    // ── Gemma Prompt Formatting ────────────────────────────────────
+    // ── Gemma 4 Prompt Formatting ─────────────────────────────────
 
     /**
-     * Build Gemma's exact turn system prompt format:
+     * Build Gemma 4's turn format:
      *
      * ```
-     * <start_of_turn>user
-     * {prompt}
-     * <end_of_turn>
-     * <start_of_turn>model
+     * <|turn|>system [System Prompt]<|end_of_turn|>
+     * <|turn|>user [User/Image Context]<|end_of_turn|>
+     * <|turn|>model
      * ```
      *
      * Image patch tokens are bound natively by the LiteRT-LM engine when
      * Content.ImageBytes is included in the same Contents — no literal
      * `[IMAGE_TOKEN]` string is inserted into the text payload.
      */
-    private fun buildGemmaTurnPrompt(prompt: String): String {
-        return "<start_of_turn>user\n" +
-            "$prompt\n" +
-            "<end_of_turn>\n" +
-            "<start_of_turn>model\n"
+    private fun buildGemmaTurnPrompt(
+        userContent: String,
+        systemPrompt: String = ""
+    ): String {
+        val sb = StringBuilder()
+        if (systemPrompt.isNotBlank()) {
+            sb.append("<|turn|>system $systemPrompt<|end_of_turn|>")
+        }
+        sb.append("<|turn|>user $userContent<|end_of_turn|>")
+        sb.append("<|turn|>model")
+        return sb.toString()
     }
 
     // ── Prompt Assembly ───────────────────────────────────────────
 
     /**
-     * Build the user payload from the prompt (which already contains system
-     * rules from DynamicPromptBuilder) + optional memory context.
+     * Build the user payload from the query + optional memory context.
+     * The system prompt is injected separately via buildGemmaTurnPrompt().
      */
     private fun buildUserPayload(query: String, memoryContext: String?): String {
         val sb = StringBuilder()
@@ -571,41 +577,29 @@ class VlmEngineManager(
 
     /**
      * Preprocess a camera bitmap for VLM input.
-     * - Downscales to a maximum dimension of 256×256 pixels to match Gemma's smallest
-     *   vision patch bucket and minimize prefill time
-     * - Returns a NEW bitmap (caller must recycle)
-     */
-    /**
-     * Preprocess a camera bitmap for VLM input.
      *
-     * 1. Center-crop to a 1:1 square aspect ratio (preserves spatial alignment)
-     * 2. Scale the square to [targetDimension] x [targetDimension]
-     *
-     * Center-cropping instead of squishing ensures that objects on the left
-     * side of the camera frame remain on the left in the VLM input — no
-     * spatial coordinate distortion.
+     * Gemma 4 handles dynamic aspect ratios natively via its vision token
+     * budget. We only downscale if the bitmap exceeds the target dimension,
+     * preserving the original aspect ratio — no center-cropping.
      *
      * @param source         Raw camera bitmap
-     * @param targetDimension 256 for standard scene queries, 384 for text extraction
-     * @return A NEW square bitmap (caller must recycle)
+     * @param targetDimension Maximum dimension (width or height) allowed
+     * @return A NEW bitmap (possibly smaller, same aspect ratio). Caller must recycle.
      */
     private fun preprocessBitmap(source: Bitmap, targetDimension: Int = MAX_INPUT_DIMENSION): Bitmap {
         val w = source.width
         val h = source.height
+        val maxDim = maxOf(w, h)
 
-        // Step 1: Center-crop to 1:1 square
-        val size = minOf(w, h)
-        val x = (w - size) / 2
-        val y = (h - size) / 2
-        val cropped = Bitmap.createBitmap(source, x, y, size, size)
-
-        // Step 2: Scale square to target dimension
-        return if (size > targetDimension) {
-            val scaled = Bitmap.createScaledBitmap(cropped, targetDimension, targetDimension, true)
-            if (scaled !== cropped) cropped.recycle()
-            scaled
+        // Only downscale if the bitmap exceeds target — preserve original aspect ratio
+        return if (maxDim > targetDimension) {
+            val scale = targetDimension.toFloat() / maxDim
+            val newW = (w * scale).toInt().coerceAtLeast(1)
+            val newH = (h * scale).toInt().coerceAtLeast(1)
+            Bitmap.createScaledBitmap(source, newW, newH, true)
         } else {
-            cropped
+            // Bitmap is already within target — return as-is (no copy needed)
+            source
         }
     }
 
@@ -763,7 +757,7 @@ class VlmEngineManager(
      * Resolve model file from the device filesystem.
      *
      * Lookup order:
-     *  1. Public Download folder — `/storage/emulated/0/Download/gemma-3n-E2B-it-int4.litertlm`
+     *  1. Public Download folder — `/storage/emulated/0/Download/gemma-4-E2B-it-gpu.litertlm`
      *  2. App-scoped external files — `context.getExternalFilesDir(null)`
      */
     private fun resolveModelFile(): File? {
@@ -817,12 +811,13 @@ class VlmEngineManager(
     companion object {
         private const val TAG = "VlmEngineManager"
 
-        // Model configuration — Gemma 3n E2B int4 quantized (3.66 GB)
-        const val MODEL_FILE = "gemma-3n-E2B-it-int4.litertlm"
+        // Model configuration — Gemma 4 E2B GPU (2.01 GB)
+        const val MODEL_FILE = "gemma-4-E2B-it-gpu.litertlm"
         const val MIN_MODEL_SIZE = 500L * 1024 * 1024  // 500MB minimum sanity check
 
-        // Image preprocessing — 256×256 max (Gemma's smallest vision patch bucket)
-        private const val MAX_INPUT_DIMENSION = 256
+        // Image preprocessing — no center-crop, just proportional downscale
+        // Gemma 4 handles dynamic aspect ratios natively
+        private const val MAX_INPUT_DIMENSION = 512
         const val JPEG_QUALITY = 75
 
         // Greedy decoding — fast, concise output with minimal latency
@@ -836,13 +831,22 @@ class VlmEngineManager(
         private const val LOW_RAM_INFERENCE_TIMEOUT_SEC = 60L  // 1 min on low-RAM devices — fail fast
         private const val WARMUP_TIMEOUT_SEC = 60L       // 60s for GPU warm-up (mid-tier may need longer)
 
+        /**
+         * Gemma 4 system directive — injected as <|turn|>system block.
+         * Prevents internal English reasoning chains and enforces language mirroring.
+         */
+        private const val SYSTEM_DIRECTIVE =
+            "You are a fast, concise visual assistant. Describe scene layouts and spatial objects " +
+            "directly in the language requested by the user without cross-translating or outputting " +
+            "internal reasoning chains. Respond only in the requested language."
+
         // ── Mid-Tier / Low-RAM Thresholds ───────────────────────
-        /** Minimum free heap (MB) required to attempt model init on standard devices. */
-        private const val MIN_RAM_STANDARD_MB = 1500L
-        /** Minimum free heap (MB) required on devices flagged as low-RAM. */
-        private const val MIN_RAM_LOW_RAM_DEVICE_MB = 1000L
-        /** Log a warning if free heap drops below this during inference. */
-        private const val LOW_RAM_THRESHOLD_MB = 500L
+        /** Minimum free device RAM (MB) required to attempt model init on standard devices. */
+        private const val MIN_RAM_STANDARD_MB = 1000L
+        /** Minimum free device RAM (MB) required on devices flagged as low-RAM. */
+        private const val MIN_RAM_LOW_RAM_DEVICE_MB = 600L
+        /** Log a warning if free device RAM drops below this during inference. */
+        private const val LOW_RAM_THRESHOLD_MB = 400L
 
         private var nativeLibLoaded = false
 
