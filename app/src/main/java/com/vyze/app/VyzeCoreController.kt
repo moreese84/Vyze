@@ -179,7 +179,20 @@ class VyzeCoreController(
         }
 
         vlmEngine.onStepProgress = { percent, step ->
-            mainHandler.post { onProgressUpdate?.invoke(percent, step) }
+            mainHandler.post {
+                onProgressUpdate?.invoke(percent, step)
+
+                // Speak key milestones so blind users hear progress
+                // during the 10-20s model loading phase.
+                when {
+                    percent >= 75 && announcedMilestones.add(75) -> {
+                        try { ttsManager.speakQueued("Almost ready.") } catch (_: Throwable) {}
+                    }
+                    percent >= 30 && percent < 75 && announcedMilestones.add(30) -> {
+                        try { ttsManager.speakQueued("Loading model weights.") } catch (_: Throwable) {}
+                    }
+                }
+            }
         }
 
         // ── Session-Gated Token Callback ──────────────────────────
