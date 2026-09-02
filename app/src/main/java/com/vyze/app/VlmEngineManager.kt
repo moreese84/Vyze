@@ -202,34 +202,17 @@ class VlmEngineManager(
             Log.i(TAG, "Model resolved: ${modelFile.absolutePath} (${modelFile.length()} bytes)")
             CrashLogFile.log(TAG, "Model: ${modelFile.absolutePath} (${modelFile.length() / (1024 * 1024)}MB)")
 
-            // Step 2: Multi-backend fallback — NPU first, then GPU
-            // NPU (Neural Processing Unit) is preferred for lower power draw and
-            // faster inference on devices with dedicated AI accelerators.
-            // GPU (OpenCL/Vulkan) is the universal fallback for all ARM64 devices.
-            onStepProgress?.invoke(50, "Initializing NPU backend...")
-            CrashLogFile.log(TAG, "Step 2: Attempting NPU backend...")
-
-            val npuSuccess = tryInitializeWithBackend(modelFile, Backend.NPU(), "NPU")
-            if (npuSuccess) {
-                onStepProgress?.invoke(85, "Warming up NPU kernels...")
-                CrashLogFile.log(TAG, "Step 3: NPU warm-up (dummy inference)...")
-                warmUp()
-
-                onStepProgress?.invoke(95, "Finalizing...")
-                CrashLogFile.log(TAG, "=== INIT SUCCESS [NPU] ===")
-                Log.i(TAG, "Gemma 4 E2B loaded successfully [backend=NPU]")
-                return@withContext true
-            }
-
-            // NPU unavailable or failed — fall back to GPU
-            Log.w(TAG, "NPU backend unavailable, falling back to GPU")
-            CrashLogFile.log(TAG, "NPU failed — falling back to GPU backend")
-            onStepProgress?.invoke(50, "Initializing GPU backend...")
+            // Step 2: GPU backend (primary)
+            // NPU is skipped — the Gemma 4 E2B generic model does not ship with
+            // TF_LITE_PREFILL_DECODE for NPU, so NPU init always fails and
+            // wastes 5-10s on mid-tier Dimensity/Snapdragon devices.
+            onStepProgress?.invoke(30, "Loading model weights into GPU...")
+            CrashLogFile.log(TAG, "Step 2: Initializing GPU backend...")
 
             val gpuSuccess = tryInitializeWithBackend(modelFile, Backend.GPU(), "GPU")
             if (gpuSuccess) {
                 // GPU warm-up — pre-compile OpenCL/Vulkan kernels
-                onStepProgress?.invoke(85, "Warming up GPU kernels...")
+                onStepProgress?.invoke(75, "Warming up GPU kernels (this takes a moment)...")
                 CrashLogFile.log(TAG, "Step 3: GPU warm-up (dummy inference)...")
                 warmUp()
 
@@ -239,8 +222,8 @@ class VlmEngineManager(
                 return@withContext true
             }
 
-            // Both NPU and GPU failed — no CPU fallback for this model size
-            val errorMsg = "VLM init failed: NPU and GPU backends both unavailable. " +
+            // GPU failed — no CPU fallback for this model size
+            val errorMsg = "VLM init failed: GPU backend unavailable. " +
                 "CPU fallback is disabled for Gemma 4 E2B model."
             Log.e(TAG, errorMsg)
             CrashLogFile.logError(TAG, errorMsg)
@@ -267,7 +250,7 @@ class VlmEngineManager(
         backendName: String
     ): Boolean {
         CrashLogFile.log(TAG, "Trying $backendName backend...")
-        onStepProgress?.invoke(60, "Initializing $backendName backend...")
+        onStepProgress?.invoke(35, "Creating $backendName engine instance...")
 
         var eng: Engine? = null
         try {
@@ -281,6 +264,7 @@ class VlmEngineManager(
             CrashLogFile.log(TAG, "EngineConfig created [$backendName] — creating Engine...")
             eng = Engine(engineConfig)
 
+            onStepProgress?.invoke(45, "Loading ${modelFile.length() / (1024 * 1024)}MB model into ${backendName}...")
             CrashLogFile.log(TAG, "Engine created [$backendName] — calling initialize()...")
             eng.initialize()
 
@@ -729,20 +713,14 @@ class VlmEngineManager(
             try {
                 val modelFile = resolveModelFile()
                 if (modelFile != null) {
-                    // Try NPU first, fall back to GPU — identical to initialize()
-                    val npuOk = tryInitializeWithBackend(modelFile, Backend.NPU(), "NPU")
-                    if (npuOk) {
-                        Log.i(TAG, "resetSession: reinitialized on NPU")
-                        warmUp()
-                        return@launch
-                    }
+                    // GPU only — NPU is skipped (see initialize() rationale)
                     val gpuOk = tryInitializeWithBackend(modelFile, Backend.GPU(), "GPU")
                     if (gpuOk) {
                         Log.i(TAG, "resetSession: reinitialized on GPU")
                         warmUp()
                         return@launch
                     }
-                    Log.e(TAG, "resetSession: both NPU and GPU failed")
+                    Log.e(TAG, "resetSession: GPU init failed")
                     engine = null
                     isInitialized = false
                 } else {
