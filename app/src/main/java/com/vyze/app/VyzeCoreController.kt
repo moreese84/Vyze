@@ -206,10 +206,15 @@ class VyzeCoreController(
             }
         }
 
-        ttsManager.speakQueued(
-            "Please wait, model assets are downloading. " +
-            "This may take several minutes on first launch."
-        )
+        // Only announce 'downloading' if the model file is actually missing.
+        // If it's already on disk, skip the misleading announcement.
+        val modelExists = vlmEngine.isModelOnDisk()
+        if (!modelExists) {
+            ttsManager.speakQueued(
+                "Please wait, model assets are downloading. " +
+                "This may take several minutes on first launch."
+            )
+        }
 
         scope.launch {
             try {

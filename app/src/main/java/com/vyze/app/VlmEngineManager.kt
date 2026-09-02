@@ -666,6 +666,14 @@ class VlmEngineManager(
     fun isReady(): Boolean = isInitialized && engine != null
     fun getActiveBackend(): String = activeBackend
 
+    /**
+     * Check if the model file exists on disk (without initializing the engine).
+     * Used to avoid announcing 'downloading' when the model is already present.
+     */
+    fun isModelOnDisk(): Boolean {
+        return resolveModelFile() != null
+    }
+
     // ── Native Interruption ──────────────────────────────────────
 
     /**
