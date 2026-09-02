@@ -4,8 +4,12 @@
     android:id="@+id/loading_container"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="#F5F6F7"
     android:contentDescription="Vyze loading screen">
+
+    <!-- Animated brand dots background (red + yellow on white) -->
+    <com.vyze.app.BrandDotsView
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
 
     <LinearLayout
         android:layout_width="wrap_content"
