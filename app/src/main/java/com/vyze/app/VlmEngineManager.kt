@@ -526,13 +526,10 @@ class VlmEngineManager(
     // ── Gemma 4 Prompt Formatting ─────────────────────────────────
 
     /**
-     * Build Gemma 4's turn format:
-     *
-     * ```
-     * <|turn|>system [System Prompt]<|end_of_turn|>
-     * <|turn|>user [User/Image Context]<|end_of_turn|>
-     * <|turn|>model
-     * ```
+     * Build the prompt using the SDK-compatible turn format.
+     * The system directive is prepended to the user content.
+     * The turn markers use <start_of_turn>/<end_of_turn> which the
+     * LiteRT-LM SDK v0.16.1 parses correctly.
      *
      * Image patch tokens are bound natively by the LiteRT-LM engine when
      * Content.ImageBytes is included in the same Contents — no literal
@@ -542,13 +539,15 @@ class VlmEngineManager(
         userContent: String,
         systemPrompt: String = ""
     ): String {
-        val sb = StringBuilder()
-        if (systemPrompt.isNotBlank()) {
-            sb.append("<|turn|>system $systemPrompt<|end_of_turn|>")
+        val fullContent = if (systemPrompt.isNotBlank()) {
+            "$systemPrompt\n\n$userContent"
+        } else {
+            userContent
         }
-        sb.append("<|turn|>user $userContent<|end_of_turn|>")
-        sb.append("<|turn|>model")
-        return sb.toString()
+        return "<start_of_turn>user\n" +
+            "$fullContent\n" +
+            "<end_of_turn>\n" +
+            "<start_of_turn>model\n"
     }
 
     // ── Prompt Assembly ───────────────────────────────────────────
