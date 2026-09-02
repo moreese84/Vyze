@@ -169,11 +169,9 @@ class CameraFragment : Fragment() {
             mainHandler.post {
                 try {
                     if (isNowOn) {
-                        ttsManager.speakQueued(
-                            requireContext().getString(R.string.light_dark, "")
-                        )
+                        ttsManager.speakQueued("It is dark. Flashlight is on.")
                     } else {
-                        ttsManager.speakQueued("Light level sufficient. Torch is off.")
+                        ttsManager.speakQueued("Light is sufficient. Flashlight is off.")
                     }
                 } catch (_: Throwable) {}
             }
@@ -611,7 +609,7 @@ class CameraFragment : Fragment() {
                     if (isAdded && _fragmentCameraBinding != null) {
                         appState = AppState.IDLE
                         updateStatus("Capture failed")
-                        ttsManager.speakImmediate("Camera frame unavailable. Please try again.")
+                        ttsManager.speakImmediate("Could not capture the scene. Please try again.")
                         mainHandler.postDelayed({ startVoiceListening() }, 1500L)
                     }
                 }

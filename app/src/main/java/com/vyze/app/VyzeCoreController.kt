@@ -136,8 +136,8 @@ class VyzeCoreController(
                     mainHandler.post {
                         try {
                             ttsManager.speakQueued(
-                                "Model not found. Downloading now. " +
-                                "This is about ${mbTotal / 1024} gigabytes."
+                                "First time setup. Downloading AI engine. " +
+                                "This takes a few minutes on first use."
                             )
                         } catch (_: Throwable) {}
                     }
@@ -146,7 +146,7 @@ class VyzeCoreController(
                 progressPercent >= 25 && announcedMilestones.add(25) -> {
                     mainHandler.post {
                         try {
-                            ttsManager.speakQueued("25 percent downloaded.")
+                            ttsManager.speakQueued("Quarterway there.")
                         } catch (_: Throwable) {}
                     }
                 }
@@ -154,7 +154,7 @@ class VyzeCoreController(
                 progressPercent >= 50 && announcedMilestones.add(50) -> {
                     mainHandler.post {
                         try {
-                            ttsManager.speakQueued("Halfway downloaded.")
+                            ttsManager.speakQueued("Halfway done.")
                         } catch (_: Throwable) {}
                     }
                 }
@@ -162,7 +162,7 @@ class VyzeCoreController(
                 progressPercent >= 75 && announcedMilestones.add(75) -> {
                     mainHandler.post {
                         try {
-                            ttsManager.speakQueued("75 percent downloaded. Almost done.")
+                            ttsManager.speakQueued("Almost there.")
                         } catch (_: Throwable) {}
                     }
                 }
@@ -170,7 +170,7 @@ class VyzeCoreController(
                 progressPercent >= 99 && announcedMilestones.add(100) -> {
                     mainHandler.post {
                         try {
-                            ttsManager.speakQueued("Download complete. Loading model now.")
+                            ttsManager.speakQueued("Download complete. Preparing AI assistant.")
                         } catch (_: Throwable) {}
                     }
                 }
@@ -252,12 +252,12 @@ class VyzeCoreController(
         val modelExists = vlmEngine.isModelOnDisk()
         if (!modelExists) {
             ttsManager.speakQueued(
-                "Please wait, model assets are downloading. " +
-                "This may take several minutes on first launch."
+                "First time setup. Downloading AI engine. " +
+                "This takes a few minutes on first use."
             )
         } else {
             ttsManager.speakQueued(
-                "Model found. Loading now."
+                "Preparing your AI assistant."
             )
         }
 
@@ -272,10 +272,10 @@ class VyzeCoreController(
                 } else {
                     Log.e(TAG, "VLM engine failed to initialize")
                     mainHandler.post {
-                        try {
-                            ttsManager.speakImmediate(
-                                "Model download failed. Please check your internet connection."
-                            )
+                    try {
+                        ttsManager.speakImmediate(
+                            "AI engine setup failed. Please check your connection and try again."
+                        )
                         } catch (_: Throwable) {}
                         onStatusUpdate?.invoke("Error: Model failed to load")
                     }
@@ -287,7 +287,7 @@ class VyzeCoreController(
                 mainHandler.post {
                     try {
                         ttsManager.speakImmediate(
-                            "Model load failed. ${e.message ?: "Unknown error."}"
+                            "AI engine failed to start. ${e.message ?: "Please restart the app."}"
                         )
                     } catch (_: Throwable) {}
                     onStatusUpdate?.invoke("Error: $errorMsg")
