@@ -106,7 +106,13 @@ class VyzeCoreController(
 
     // ── Initialization ─────────────────────────────────────────────
 
+    /** Tracks which download milestones have been announced to avoid repeats. */
+    private val announcedMilestones = java.util.concurrent.ConcurrentHashMap.newKeySet<Int>()
+
     fun initialize() {
+        // Reset milestone tracker for this download session
+        announcedMilestones.clear()
+
         vlmEngine.onModelCopyProgress = { copied, total ->
             val mbCopied = copied / (1024 * 1024)
             val mbTotal = total / (1024 * 1024)
@@ -117,23 +123,59 @@ class VyzeCoreController(
                 onProgressUpdate?.invoke(percent, msg)
                 onStatusUpdate?.invoke(msg)
             }
-            if (copied < total / 20) {
-                mainHandler.post {
-                    try {
-                        ttsManager.speakQueued(
-                            "Please wait, model assets are downloading. " +
-                            "This may take several minutes on first launch."
-                        )
-                    } catch (_: Throwable) {}
+
+            // ── Audio Progress Milestones ─────────────────────────
+            // Speak at 0% (start), 25%, 50%, 75%, and 100% (complete)
+            // so blind users hear regular progress updates.
+            if (total > 0) {
+            val progressPercent = (copied * 100 / total).toInt()
+
+            when {
+                // Start: first callback, announce download is beginning
+                copied < total / 50 && announcedMilestones.add(0) -> {
+                    mainHandler.post {
+                        try {
+                            ttsManager.speakQueued(
+                                "Model not found. Downloading now. " +
+                                "This is about ${mbTotal / 1024} gigabytes."
+                            )
+                        } catch (_: Throwable) {}
+                    }
+                }
+                // 25%
+                progressPercent >= 25 && announcedMilestones.add(25) -> {
+                    mainHandler.post {
+                        try {
+                            ttsManager.speakQueued("25 percent downloaded.")
+                        } catch (_: Throwable) {}
+                    }
+                }
+                // 50%
+                progressPercent >= 50 && announcedMilestones.add(50) -> {
+                    mainHandler.post {
+                        try {
+                            ttsManager.speakQueued("Halfway downloaded.")
+                        } catch (_: Throwable) {}
+                    }
+                }
+                // 75%
+                progressPercent >= 75 && announcedMilestones.add(75) -> {
+                    mainHandler.post {
+                        try {
+                            ttsManager.speakQueued("75 percent downloaded. Almost done.")
+                        } catch (_: Throwable) {}
+                    }
+                }
+                // 100%
+                progressPercent >= 99 && announcedMilestones.add(100) -> {
+                    mainHandler.post {
+                        try {
+                            ttsManager.speakQueued("Download complete. Loading model now.")
+                        } catch (_: Throwable) {}
+                    }
                 }
             }
-            if (total > 0 && copied in (total / 2 - 10_000_000)..(total / 2 + 10_000_000)) {
-                mainHandler.post {
-                    try {
-                        ttsManager.speakQueued("Download is halfway complete.")
-                    } catch (_: Throwable) {}
-                }
-            }
+            } // end if (total > 0)
         }
 
         vlmEngine.onStepProgress = { percent, step ->
