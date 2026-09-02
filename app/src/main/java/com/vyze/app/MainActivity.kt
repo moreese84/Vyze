@@ -185,6 +185,17 @@ class MainActivity : AppCompatActivity() {
         ttsManager.releaseSessionFocus()
         super.onDestroy()
         hapticManager?.cancel()
+
+        // Kill process on exit — releases all GPU, camera, and TTS resources
+        // immediately. Prevents background battery drain from orphaned
+        // LiteRT-LM GPU delegates and CameraX sessions.
+        // isFinishing() = true only when user exits (back/home), not on
+        // rotation or temporary backgrounding.
+        if (isFinishing) {
+            mainHandler.postDelayed({
+                android.os.Process.killProcess(android.os.Process.myPid())
+            }, 300L)
+        }
     }
 
     // ── TTS Setup ────────────────────────────────────────────────
