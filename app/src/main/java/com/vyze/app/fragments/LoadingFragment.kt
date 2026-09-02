@@ -283,7 +283,7 @@ class LoadingFragment : Fragment() {
             binding.retryButton.text = "Retry"
             if (message.contains("not found")) {
                 binding.hintText.visibility = View.VISIBLE
-                binding.hintText.text = "adb push gemma-4-E2B-it-gpu.litertlm /sdcard/Download/"
+                binding.hintText.text = "adb push gemma-4-E2B-it.litertlm /sdcard/Download/"
             }
         }
     }

@@ -614,11 +614,17 @@ class MainActivity : AppCompatActivity() {
                         onPartialSpeechResult?.invoke("")
                         mainHandler.postDelayed({ startListeningSafely() }, 300L)
                     }
-                    SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> {
-                        // Retry with cancel-first (thread-safe)
-                        mainHandler.postDelayed({ startListeningSafely() }, 2000L)
+                    SpeechRecognizer.ERROR_RECOGNIZER_BUSY,
+                    SpeechRecognizer.ERROR_CLIENT -> {
+                        // CLIENT errors cascade when mic is grabbed by another service.
+                        // Use exponential backoff: 1s → 2s → 4s (capped at 4s).
+                        // Reset isListening so next startListeningSafely() actually fires.
+                        isListening = false
+                        val backoffMs = 1000L.coerceAtMost(4000L)
+                        mainHandler.postDelayed({ startListeningSafely() }, backoffMs)
                     }
                     else -> {
+                        isListening = false
                         onSpeechError?.invoke(errorMsg)
                     }
                 }

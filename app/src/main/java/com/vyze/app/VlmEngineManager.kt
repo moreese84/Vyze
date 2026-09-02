@@ -36,8 +36,8 @@ import java.util.concurrent.TimeUnit
  * On-device VLM engine wrapper using Google's LiteRT-LM framework.
  *
  * ## Model
- * Gemma 4 E2B (Edge 2 Billion) — GPU multimodal vision-language model.
- * File: gemma-4-E2B-it-gpu.litertlm (2.01 GB)
+ * Gemma 4 E2B (Edge 2 Billion) — multimodal vision-language model.
+ * File: gemma-4-E2B-it.litertlm (2.59 GB) — generic variant with vision encoder
  *
  * ## Hardware Acceleration
  * GPU-only execution (OpenCL/Vulkan). CPU inference is not supported for this model size.
@@ -764,7 +764,7 @@ class VlmEngineManager(
      * Resolve model file from the device filesystem.
      *
      * Lookup order:
-     *  1. Public Download folder — `/storage/emulated/0/Download/gemma-4-E2B-it-gpu.litertlm`
+     *  1. Public Download folder — `/storage/emulated/0/Download/gemma-4-E2B-it.litertlm`
      *  2. App-scoped external files — `context.getExternalFilesDir(null)`
      */
     private fun resolveModelFile(): File? {
@@ -818,8 +818,8 @@ class VlmEngineManager(
     companion object {
         private const val TAG = "VlmEngineManager"
 
-        // Model configuration — Gemma 4 E2B GPU (2.01 GB)
-        const val MODEL_FILE = "gemma-4-E2B-it-gpu.litertlm"
+        // Model configuration — Gemma 4 E2B (2.59 GB) — generic multimodal with vision encoder
+        const val MODEL_FILE = "gemma-4-E2B-it.litertlm"
         const val MIN_MODEL_SIZE = 500L * 1024 * 1024  // 500MB minimum sanity check
 
         // Image preprocessing — no center-crop, just proportional downscale
@@ -849,11 +849,11 @@ class VlmEngineManager(
 
         // ── Mid-Tier / Low-RAM Thresholds ───────────────────────
         /** Minimum free device RAM (MB) required to attempt model init on standard devices. */
-        private const val MIN_RAM_STANDARD_MB = 1000L
+        private const val MIN_RAM_STANDARD_MB = 1200L
         /** Minimum free device RAM (MB) required on devices flagged as low-RAM. */
-        private const val MIN_RAM_LOW_RAM_DEVICE_MB = 600L
+        private const val MIN_RAM_LOW_RAM_DEVICE_MB = 800L
         /** Log a warning if free device RAM drops below this during inference. */
-        private const val LOW_RAM_THRESHOLD_MB = 400L
+        private const val LOW_RAM_THRESHOLD_MB = 500L
 
         private var nativeLibLoaded = false
 

@@ -116,7 +116,7 @@ GPU kernels are pre-compiled during warm-up to eliminate first-inference cold-st
 
 | Component | Technology |
 |---|---|
-| **VLM Engine** | Gemma 4 E2B GPU (2.01 GB) via LiteRT-LM 0.16.1 |
+| **VLM Engine** | Gemma 4 E2B (2.59 GB, multimodal) via LiteRT-LM 0.16.1 |
 | **OCR** | Google ML Kit Text Recognition (Latin + Chinese) |
 | **Camera** | CameraX 1.3.1 |
 | **TTS** | Google Android TTS (neural voice selection) |
@@ -148,7 +148,7 @@ GPU kernels are pre-compiled during warm-up to eliminate first-inference cold-st
 Push the Gemma 4 E2B model to your device:
 
 ```bash
-adb push gemma-4-E2B-it-gpu.litertlm /storage/emulated/0/Download/
+adb push gemma-4-E2B-it.litertlm /storage/emulated/0/Download/
 ```
 
 The app checks both `/storage/emulated/0/Download/` and the app-scoped external files directory.
