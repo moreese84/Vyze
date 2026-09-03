@@ -25,8 +25,8 @@ import com.vyze.app.data.InteractionRecord
  * history that the VLM needs for personalized responses.
  */
 @Database(
-    entities = [ScanEntity::class, ErrorLogEntity::class, VyzeMemoryEntity::class, InteractionRecord::class],
-    version = 5,
+    entities = [ScanEntity::class, ErrorLogEntity::class, VyzeMemoryEntity::class, InteractionRecord::class, MedicineEntity::class],
+    version = 6,
     exportSchema = false
 )
 abstract class VyzeDatabase : RoomDatabase() {
@@ -35,6 +35,7 @@ abstract class VyzeDatabase : RoomDatabase() {
     abstract fun errorLogDao(): ErrorLogDao
     abstract fun memoryDao(): MemoryDao
     abstract fun interactionDao(): InteractionDao
+    abstract fun medicineDao(): MedicineDao
 
     companion object {
         private const val DATABASE_NAME = "vyze_scans.db"
@@ -127,11 +128,39 @@ abstract class VyzeDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * Migration 5 → 6: Added `medicines` table for local drug knowledge base.
+         * Pre-populated via MedicineDatabaseCallback.onCreate().
+         */
+        val MIGRATION_5_6 = object : Migration(5, 6) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """CREATE TABLE IF NOT EXISTS `medicines` (
+                        `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        `name` TEXT NOT NULL,
+                        `genericName` TEXT NOT NULL,
+                        `dosage` TEXT NOT NULL,
+                        `frequency` TEXT NOT NULL,
+                        `warnings` TEXT NOT NULL,
+                        `category` TEXT NOT NULL,
+                        `searchName` TEXT NOT
+                    )"""
+                )
+                db.execSQL(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS `index_medicines_searchName` ON `medicines` (`searchName`)"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_medicines_category` ON `medicines` (`category`)"
+                )
+            }
+        }
+
         /** All registered migrations, in order. */
         private val ALL_MIGRATIONS = arrayOf(
             MIGRATION_2_3,
             MIGRATION_3_4,
-            MIGRATION_4_5
+            MIGRATION_4_5,
+            MIGRATION_5_6
         )
 
         // ── Instance Creation ──────────────────────────────────────
@@ -144,6 +173,7 @@ abstract class VyzeDatabase : RoomDatabase() {
                     DATABASE_NAME
                 )
                     .addMigrations(*ALL_MIGRATIONS)
+                    .addCallback(MedicineDatabaseCallback.createCallback(context))
                     .build()
                     .also { INSTANCE = it }
             }

@@ -99,6 +99,12 @@ class VyzeCoreController(
     /** Monotonically increasing counter for unique utterance IDs per session. */
     private val chunkCounter = java.util.concurrent.atomic.AtomicInteger(0)
 
+    // ── Confidence Check ─────────────────────────────────────────
+    /** Buffer for first N tokens to check for hedging language. */
+    private val tokenConfidenceBuffer = StringBuilder()
+    /** Once first N tokens pass confidence check, stop checking. */
+    private var confidenceCheckPassed = false
+
     var onStatusUpdate: ((String) -> Unit)? = null
     var onProgressUpdate: ((Int, String) -> Unit)? = null
     var onError: ((String) -> Unit)? = null
@@ -217,6 +223,34 @@ class VyzeCoreController(
                 // Stale token — SILENTLY DROP
             } else {
                 try {
+                    // ── CONFIDENCE CHECK: abort if model is hedging ──────
+                    // Track the first few tokens. If the model starts with
+                    // hedging language ("I think", "maybe", "it looks like"),
+                    // it's uncertain. Abort early and return a safe fallback
+                    // instead of letting it guess and potentially hallucinate.
+                    if (!confidenceCheckPassed) {
+                        tokenConfidenceBuffer.append(token)
+                        val accumulated = tokenConfidenceBuffer.toString().trim()
+                        if (accumulated.length >= CONFIDENCE_CHECK_CHARS) {
+                            val lowerAccumulated = accumulated.lowercase()
+                            val isHedging = HEDGING_PHRASES.any { phrase ->
+                                lowerAccumulated.contains(phrase)
+                            }
+                            if (isHedging) {
+                                Log.w(TAG, "Confidence abort: model hedging on '$accumulated'")
+                                CrashLogFile.log(TAG, "CONFIDENCE ABORT: hedging detected")
+                                confidenceCheckPassed = true  // prevent re-entry
+                                isInferring.set(false)
+                                vlmEngine.interrupt()
+                                mainHandler.post {
+                                    onInferenceComplete?.invoke("Not clearly visible.")
+                                    onStatusUpdate?.invoke("Ready [low confidence]")
+                                }
+                            }
+                            confidenceCheckPassed = true  // first N tokens OK — no more checking
+                        }
+                    }
+
                     synchronized(bufferLock) {
                         sentenceBuffer.append(token)
                     }
@@ -480,6 +514,8 @@ class VyzeCoreController(
             sentenceBuffer.clear()
         }
         firstChunkSent = false
+        tokenConfidenceBuffer.clear()
+        confidenceCheckPassed = false
     }
 
     // ── Full Pipeline Reset ────────────────────────────────────────
@@ -651,6 +687,22 @@ class VyzeCoreController(
                     ocrText = ocrResult.first
                     ocrConfidence = ocrResult.second
                     CrashLogFile.log(TAG, "OCR result: ${ocrText?.take(100) ?: "(none)"} confidence=$ocrConfidence")
+
+                    // ── MEDICINE LOOKUP: cross-reference OCR against local DB ──
+                    // If OCR text matches a known medicine, inject structured drug
+                    // info into the prompt so Gemma can provide accurate medical
+                    // information without guessing from visual patterns.
+                    if (!ocrText.isNullOrBlank() && isMedicineQuery(query)) {
+                        try {
+                            val medicineInfo = lookupMedicine(ocrText)
+                            if (medicineInfo != null) {
+                                CrashLogFile.log(TAG, "Medicine match: ${medicineInfo.name}")
+                                ocrText = "$ocrText\n[MEDICINE INFO: ${medicineInfo.name}, ${medicineInfo.genericName}, ${medicineInfo.dosage}. ${medicineInfo.frequency}. WARNING: ${medicineInfo.warnings}]"
+                            }
+                        } catch (e: Throwable) {
+                            CrashLogFile.logError(TAG, "Medicine lookup failed: ${e.message}", e)
+                        }
+                    }
                 }
 
                 // ── OCR FAST-PATH: skip Gemma if confidence is high ──
@@ -909,6 +961,50 @@ class VyzeCoreController(
         return TEXT_KEYWORDS.any { keyword -> lower.contains(keyword) }
     }
 
+    // ── Medicine Knowledge Base ──────────────────────────────────
+
+    /**
+     * Detect if the query is asking about medicine.
+     * Returns true for queries containing medicine-related keywords
+     * in English or Malay.
+     */
+    private fun isMedicineQuery(query: String?): Boolean {
+        if (query.isNullOrBlank()) return false
+        val lower = query.lowercase()
+        return MEDICINE_KEYWORDS.any { keyword -> lower.contains(keyword) }
+    }
+
+    /**
+     * Look up a medicine from the local knowledge base by matching
+     * OCR text against the database. Tries exact match first, then
+     * fuzzy substring search.
+     *
+     * @return [MedicineEntity] if matched, null otherwise
+     */
+    private suspend fun lookupMedicine(ocrText: String): com.vyze.app.data.MedicineEntity? {
+        val app = context as? android.app.Application ?: return null
+        val medicineDao = (app as? VyzeApplication)?.medicineDao ?: return null
+
+        // Normalize OCR text for matching
+        val normalized = ocrText.lowercase().replace(Regex("[^a-z0-9 ]"), "").trim()
+
+        // 1. Try exact search key match
+        val exactMatch = medicineDao.findBySearchKey(normalized)
+        if (exactMatch != null) return exactMatch
+
+        // 2. Try fuzzy substring match — extract individual words and search
+        val words = normalized.split(Regex("\\s+")).filter { it.length >= 3 }
+        for (word in words) {
+            val matches = medicineDao.searchByName(word)
+            if (matches.isNotEmpty()) {
+                // Return the first match (most relevant)
+                return matches.first()
+            }
+        }
+
+        return null
+    }
+
     companion object {
         private const val TAG = "VyzeCoreController"
 
@@ -956,6 +1052,25 @@ class VyzeCoreController(
             "baca", "harga", "ramuan", "resipi", "ubat",
             "dos", "arahan", "alamat", "telefon", "nota",
             "menu", "surat", "tulisan", "nombor", "nama"
+        )
+
+        /** Keywords that trigger medicine database lookup. */
+        private val MEDICINE_KEYWORDS = listOf(
+            "medicine", "medication", "drug", "pill", "tablet",
+            "capsule", "dosage", "prescription", "pharmacy",
+            "ubat", "dos", "ubat apa", "jenis ubat"
+        )
+
+        // ── Confidence Check Constants ───────────────────────────
+        /** Number of characters to accumulate before checking for hedging. */
+        private const val CONFIDENCE_CHECK_CHARS = 30
+
+        /** Hedging phrases that indicate low model confidence. */
+        private val HEDGING_PHRASES = listOf(
+            "i think", "maybe", "it looks like", "it appears",
+            "possibly", "might be", "could be", "not sure",
+            "hard to tell", "unclear", "difficult to determine",
+            "not certain", "seems like", "i guess"
         )
     }
 }

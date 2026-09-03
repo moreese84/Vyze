@@ -152,7 +152,11 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
             "Read text in ORIGINAL language. " +
             "Use clear punctuation: periods to end sentences, commas to separate list items and clauses. " +
             "If unsure about an object, say 'not clearly visible'. Do NOT guess or hallucinate. " +
-            "Mirrors/glass: describe the surface itself."
+            "Mirrors/glass: describe the surface itself.\n" +
+            "Examples:\n" +
+            "Input: door in front. Output: Wooden door, center, about 2 steps ahead.\n" +
+            "Input: person nearby. Output: Person on your left, about 1 step away.\n" +
+            "Input: dark room. Output: Dark room. No obstacles detected within 3 steps."
 
         private const val BASE_RULES_DIRECT_QUERY =
             "Answer directly in first sentence. " +
@@ -160,7 +164,11 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
             "Use clear punctuation: periods to end sentences, commas for pauses between items. " +
             "If text is blurry or unreadable, say 'Text is unclear' — NEVER guess. " +
             "If no text visible, say 'No text visible'. " +
-            "Only what you see in THIS image."
+            "Only what you see in THIS image.\n" +
+            "Examples:\n" +
+            "Input: what medicine is this? Image shows Diclac Retard box. Output: Diclac Retard, diclofenac sodium 100mg. Take one tablet daily after meals.\n" +
+            "Input: read this label. Image shows price tag RM12.90. Output: Price is 12 Ringgit and 90 sen.\n" +
+            "Input: what does this sign say? Image blurry. Output: Text is unclear."
 
         private const val DEFAULT_NAVIGATION_QUERY =
             "Describe environment: obstacles, doors, people, text."

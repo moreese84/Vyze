@@ -54,6 +54,11 @@ class VyzeApplication : Application() {
         database.interactionDao()
     }
 
+    /** DAO for medicine knowledge base (local drug lookup). */
+    val medicineDao: com.vyze.app.data.MedicineDao by lazy {
+        database.medicineDao()
+    }
+
     /**
      * Singleton VyzeCoreController, created by LoadingFragment after VLM init
      * and shared with CameraFragment so the initialized engine is reused.
