@@ -55,3 +55,6 @@ Thumbs.db
 # Generated documents (keep local only)
 *.pdf
 generate_vyze_*.py
+
+# Play Store mockups (local only)
+playstore-screenshots/
