@@ -245,7 +245,7 @@ class LoadingFragment : Fragment() {
                 }
             }
 
-            updateStatus("Initializing VLM engine...", 10)
+            updateStatus("Waking up...", 10)
             coreController?.initialize()
 
         } catch (e: Throwable) {

@@ -380,25 +380,30 @@ class VyzeCoreController(
             if (text.isEmpty()) return
 
             // ── Ultra-fast path: first chunk of response ─────────
-            // Flush as soon as 1+ word (≥3 chars) — minimizes
-            // Time-To-First-Token for immediate audio feedback.
+            // Flush once a real phrase has arrived (2+ words or ≥8 chars).
+            // Requiring this prevents stray single-token artifacts from the
+            // model/tokenizer ("A", "The", "\n") from being spoken aloud
+            // as the start of every answer.
             if (!firstChunkSent) {
-                val wordCount = text.trim().split(Regex("\\s+")).size
-                if (wordCount >= FIRST_CHUNK_MIN_WORDS || text.trim().length >= FIRST_CHUNK_MIN_CHARS) {
-                    chunk = sanitizeForTts(text.trim())
-                    sentenceBuffer.setLength(0)
-                    if (chunk.isNotEmpty()) {
-                        mainHandler.post {
-                            try {
-                                val chunkId = "${activeSessionId}_chunk_${chunkCounter.incrementAndGet()}"
-                                ttsManager.speak(chunk, TextToSpeech.QUEUE_FLUSH, utteranceId = chunkId)
-                                firstChunkSent = true
-                                CrashLogFile.log(TAG, "First-chunk flush (id=$chunkId): ${chunk.take(60)}...")
-                            } catch (e: Throwable) {
-                                Log.w(TAG, "TTS first-chunk error: ${e.message}")
+                val trimmed = text.trim()
+                if (trimmed.isNotEmpty()) {
+                    val wordCount = trimmed.split(Regex("\\s+")).size
+                    if (wordCount >= FIRST_CHUNK_MIN_WORDS || trimmed.length >= FIRST_CHUNK_MIN_CHARS) {
+                        chunk = sanitizeForTts(trimmed)
+                        sentenceBuffer.setLength(0)
+                        if (chunk.isNotEmpty()) {
+                            mainHandler.post {
+                                try {
+                                    val chunkId = "${activeSessionId}_chunk_${chunkCounter.incrementAndGet()}"
+                                    ttsManager.speak(chunk, TextToSpeech.QUEUE_FLUSH, utteranceId = chunkId)
+                                    firstChunkSent = true
+                                    CrashLogFile.log(TAG, "First-chunk flush (id=$chunkId): ${chunk.take(60)}...")
+                                } catch (e: Throwable) {
+                                    Log.w(TAG, "TTS first-chunk error: ${e.message}")
+                                }
                             }
+                            return
                         }
-                        return
                     }
                 }
             }
@@ -486,25 +491,28 @@ class VyzeCoreController(
     private fun flushRemainingSentenceBuffer() {
         val remaining: String
         synchronized(bufferLock) {
-            if (sentenceBuffer.isEmpty()) return
-            remaining = sanitizeForTts(sentenceBuffer.toString().trim())
-            sentenceBuffer.setLength(0)  // force-clear, not just clear()
+            if (sentenceBuffer.isNotEmpty()) {
+                remaining = sanitizeForTts(sentenceBuffer.toString().trim())
+                sentenceBuffer.setLength(0)  // force-clear, not just clear()
+            } else {
+                remaining = ""
+            }
         }
 
-        if (remaining.isNotEmpty()) {
-            mainHandler.post {
-                try {
+        // Post unconditionally: even with nothing left to speak, queue a
+        // silent tail so hasPendingSpeech() stays true while the hardware
+        // AudioTrack drains the last audible utterance — prevents the final
+        // words from being clipped when the caller polls for completion.
+        mainHandler.post {
+            try {
+                if (remaining.isNotEmpty()) {
                     val finalChunkId = "${activeSessionId}_final_${chunkCounter.incrementAndGet()}"
                     ttsManager.speak(remaining, TextToSpeech.QUEUE_ADD, utteranceId = finalChunkId)
                     CrashLogFile.log(TAG, "Final flush (id=$finalChunkId): ${remaining.take(80)}...")
-
-                    // Queue a silent tail utterance to keep hasPendingSpeech() true
-                    // while the hardware AudioTrack drains the final audible text.
-                    // onDone fires when encoding finishes, NOT when speaker finishes.
-                    ttsManager.playSilentUtterance(350, TextToSpeech.QUEUE_ADD)
-                } catch (e: Throwable) {
-                    Log.w(TAG, "TTS final flush error: ${e.message}")
                 }
+                ttsManager.playSilentUtterance(450, TextToSpeech.QUEUE_ADD)
+            } catch (e: Throwable) {
+                Log.w(TAG, "TTS final flush error: ${e.message}")
             }
         }
     }
@@ -1018,8 +1026,8 @@ class VyzeCoreController(
         /** Max dimension for continuous mode bitmap downsampling. */
         private const val CONTINUOUS_MAX_DIM = 256
         private const val MIN_EARLY_FLUSH_CHARS = 12
-        private const val FIRST_CHUNK_MIN_WORDS = 1
-        private const val FIRST_CHUNK_MIN_CHARS = 3
+        private const val FIRST_CHUNK_MIN_WORDS = 2
+        private const val FIRST_CHUNK_MIN_CHARS = 8
 
         // ── Dynamic Resolution Constants ──────────────────────────
 
@@ -1030,10 +1038,10 @@ class VyzeCoreController(
         private const val SCENE_QUERY_DIMENSION = 256
 
         // ── Dynamic Token Limits ────────────────────────────────
-        /** Scene queries: concise descriptions (25 words, ~35 tokens). */
-        private const val SCENE_QUERY_MAX_TOKENS = 48
-        /** Text queries: full label/document reading (96 tokens = ~70 words). */
-        private const val TEXT_QUERY_MAX_TOKENS = 96
+        /** Scene queries: concise descriptions (raised — avoids mid-sentence cutoffs). */
+        private const val SCENE_QUERY_MAX_TOKENS = 96
+        /** Text queries: full label/document reading (raised for long labels). */
+        private const val TEXT_QUERY_MAX_TOKENS = 160
 
         // ── OCR Fast-Path ──────────────────────────────────────
         /** ML Kit confidence threshold to skip Gemma and read OCR text directly. */

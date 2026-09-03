@@ -16,8 +16,8 @@
 
     <!-- ── Onboarding ────────────────────────────────────────────────── -->
     <string name="onboarding_welcome">Selamat datang ke Vyze. Saya mata anda. Biar saya ajar anda cara mengguna saya.</string>
-    <string name="onboarding_single_tap">Sentuh sekali di mana-mana skrin untuk mengesan objek di sekeliling anda. Saya akan beritahu apa yang saya nampak dan di mana ia berada.</string>
-    <string name="onboarding_double_tap">Sentuh dua kali di mana-mana untuk membaca teks. Saya akan mengimbas tanda, label, dan dokumen.</string>
+    <string name="onboarding_single_tap">Sentuh sekali di mana-mana untuk melihat sekeliling anda. Saya akan menerangkan pemandangan dan apa yang ada di hadapan anda.</string>
+    <string name="onboarding_double_tap">Sentuh dua kali dan tanya saya apa-apa soalan dengan suara, contohnya: apa ini, atau baca label ini. Saya akan jawab dengan kuat.</string>
     <string name="onboarding_long_press">Tekan dan tahan untuk menyemak tahap cahaya. Saya akan menghidupkan suluh jika keadaan gelap.</string>
     <string name="onboarding_swipe">Geser ke kiri atau kanan untuk bertukar antara mod kamera dan galeri.</string>
     <string name="onboarding_complete">Itu sahaja. Anda sudah bersedia. Saya sentiasa di sini untuk membantu.</string>
@@ -95,6 +95,11 @@
     <string name="tts_lang_english">English</string>
     <string name="tts_lang_malay">Bahasa Melayu</string>
     <string name="tts_lang_chinese">Mandarin</string>
+    <string name="tts_voice">Suara</string>
+    <string name="tts_voice_automatic">Automatik (terbaik yang tersedia)</string>
+    <string name="tts_voice_prev">Suara sebelumnya</string>
+    <string name="tts_voice_next">Suara seterusnya</string>
+    <string name="tts_voice_use">Guna suara ini</string>
 
     <!-- ── Scene ─────────────────────────────────────────────────────── -->
     <string name="scene_no_data">Data pemandangan belum tersedia.</string>
@@ -102,7 +107,7 @@
     <string name="scene_summary_not_available">Ringkasan pemandangan belum tersedia. Sila tunggu.</string>
 
     <!-- ── Accessibility (TalkBack) ────────────────────────────────── -->
-    <string name="camera_container_desc">Skrin kamera Vyze. Sentuh untuk mengesan objek. Sentuh dua kali untuk membaca teks. Tekan tahan untuk ringkasan pemandangan.</string>
+    <string name="camera_container_desc">Skrin kamera Vyze. Sentuh untuk melihat sekeliling anda. Sentuh dua kali untuk bertanya soalan dengan suara. Tekan tahan untuk menyemak cahaya.</string>
     <string name="view_finder_desc">Pratonton kamera — sentuh di mana-mana untuk deskripsi pemandangan</string>
 
     <!-- ── Emergency SOS ───────────────────────────────────────────── -->

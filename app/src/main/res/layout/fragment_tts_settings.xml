@@ -176,6 +176,65 @@
             android:contentDescription="Tap to hear a sample with current voice settings"
             android:layout_marginBottom="24dp" />
 
+        <!-- Voice Picker -->
+        <TextView
+            android:id="@+id/label_voice"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/tts_voice"
+            android:textSize="22sp"
+            android:textStyle="bold"
+            android:textColor="@android:color/white"
+            android:layout_marginBottom="4dp" />
+
+        <TextView
+            android:id="@+id/value_voice"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/tts_voice_automatic"
+            android:textSize="24sp"
+            android:textStyle="bold"
+            android:textColor="#FFD700"
+            android:maxLines="2"
+            android:ellipsize="end"
+            android:layout_marginBottom="8dp" />
+
+        <Button
+            android:id="@+id/btn_voice_prev"
+            android:layout_width="match_parent"
+            android:layout_height="64dp"
+            android:text="@string/tts_voice_prev"
+            android:textSize="18sp"
+            android:textStyle="bold"
+            android:backgroundTint="#FFD700"
+            android:textColor="@android:color/black"
+            android:contentDescription="Previous voice. Tap to hear the previous voice speak a sample"
+            android:layout_marginBottom="12dp" />
+
+        <Button
+            android:id="@+id/btn_voice_next"
+            android:layout_width="match_parent"
+            android:layout_height="64dp"
+            android:text="@string/tts_voice_next"
+            android:textSize="18sp"
+            android:textStyle="bold"
+            android:backgroundTint="#FFD700"
+            android:textColor="@android:color/black"
+            android:contentDescription="Next voice. Tap to hear the next voice speak a sample"
+            android:layout_marginBottom="12dp" />
+
+        <Button
+            android:id="@+id/btn_voice_use"
+            android:layout_width="match_parent"
+            android:layout_height="64dp"
+            android:text="@string/tts_voice_use"
+            android:textSize="18sp"
+            android:textStyle="bold"
+            android:backgroundTint="#00CC88"
+            android:textColor="@android:color/white"
+            android:contentDescription="Use the voice you just heard"
+            android:layout_marginBottom="24dp" />
+
         <!-- Divider -->
         <View
             android:layout_width="match_parent"

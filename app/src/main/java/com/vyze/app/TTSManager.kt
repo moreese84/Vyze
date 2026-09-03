@@ -201,6 +201,13 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
             // ── Voice Quality Selection ──────────────────────────────
             selectBestVoice(currentLocale)
 
+            // ── User Voice Preference ───────────────────────────────
+            // Restore the user's chosen voice (if any) over the auto pick.
+            val savedVoice = prefs.getString(KEY_VOICE_NAME, "") ?: ""
+            if (savedVoice.isNotBlank() && savedVoice != VOICE_AUTO) {
+                setVoiceByName(savedVoice)
+            }
+
             // ── Prosody Tuning ───────────────────────────────────────
             tts?.setPitch(WARM_PITCH)
             tts?.setSpeechRate(WARM_RATE)
@@ -581,6 +588,63 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
             "locale=${best.locale} network=${best.isNetworkConnectionRequired}")
     }
 
+    // ── Voice Picker Support (Tier 1) ──────────────────────────────
+
+    /** Installed voices for the current language (uninstalled packs excluded). */
+    fun getInstalledVoicesForCurrentLanguage(): List<Voice> {
+        val engine = tts ?: return emptyList()
+        val voices = engine.voices ?: return emptyList()
+        return voices.filter { voice ->
+            voice.locale.language == currentLocale.language &&
+                !voice.features.contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED)
+        }.sortedByDescending { it.quality }
+    }
+
+    /** Name of the voice actually in use, or null if unknown. */
+    fun getCurrentVoiceName(): String? = tts?.voice?.name
+
+    /**
+     * Select a voice by name ("" or [VOICE_AUTO] → auto-pick the best
+     * installed voice). No-op if the name is no longer installed.
+     */
+    fun setVoiceByName(name: String) {
+        val engine = tts ?: return
+        if (!isInitialized) {
+            Log.d(TAG, "setVoiceByName($name) — TTS not ready, ignored (applied on init)")
+            return
+        }
+        if (name.isBlank() || name == VOICE_AUTO) {
+            selectBestVoice(currentLocale)
+            return
+        }
+        val match = engine.voices?.find { v ->
+            v.name == name &&
+                !v.features.contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED)
+        }
+        if (match != null) {
+            engine.voice = match
+            Log.i(TAG, "setVoiceByName: chose '${match.name}' quality=${match.quality}")
+        } else {
+            Log.w(TAG, "setVoiceByName: '$name' not installed — keeping current voice")
+        }
+    }
+
+    /**
+     * True when the best installed voice for the current language is the
+     * robotic base quality (or when no voice pack is installed at all and
+     * the engine falls back to its default). Used to offer the better
+     * voice install prompt.
+     */
+    fun isVoiceQualityLow(): Boolean {
+        val engine = tts ?: return false
+        if (!isInitialized) return false
+        val installed = getInstalledVoicesForCurrentLanguage()
+        if (installed.isEmpty()) return true
+        val bestQuality = installed.maxOf { it.quality }
+        Log.d(TAG, "isVoiceQualityLow: best quality=$bestQuality (${installed.size} installed)")
+        return bestQuality < Voice.QUALITY_HIGH
+    }
+
     // ── Natural Prosody Enhancement ───────────────────────────────
 
     private fun enhanceForNaturalProsody(text: String): String {
@@ -692,6 +756,14 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
 
         val savedLang = prefs.getString(KEY_LANGUAGE, LANGUAGE_ENGLISH) ?: LANGUAGE_ENGLISH
         setLanguage(savedLang, context)
+
+        // Restore the user's chosen voice (or re-auto-pick best after language switch)
+        val savedVoice = prefs.getString(KEY_VOICE_NAME, "") ?: ""
+        if (savedVoice.isNotBlank() && savedVoice != VOICE_AUTO) {
+            setVoiceByName(savedVoice)
+        } else {
+            selectBestVoice(currentLocale)
+        }
     }
 
     // ── Lifecycle ─────────────────────────────────────────────────
@@ -735,6 +807,13 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
         const val KEY_PITCH = "pitch"
         const val KEY_VOLUME = "volume"
         const val KEY_LANGUAGE = "tts_language"
+        const val KEY_VOICE_NAME = "tts_voice_name"
+
+        /** Sentinel value: auto-pick the best installed voice. */
+        const val VOICE_AUTO = "automatic"
+
+        /** Set once the weak-voice install prompt has been answered/skipped. */
+        const val KEY_VOICE_PROMPT_RESOLVED = "voice_prompt_resolved"
 
         const val DEFAULT_SPEECH_RATE = 1.0f
         const val DEFAULT_PITCH = 1.0f

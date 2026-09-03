@@ -16,8 +16,8 @@
 
     <!-- ── Onboarding ────────────────────────────────────────────────── -->
     <string name="onboarding_welcome">欢迎使用Vyze。我是您的眼睛。让我教您如何使用我。</string>
-    <string name="onboarding_single_tap">在屏幕上任意位置点击一次，检测周围的物体。我会告诉您我看到了什么以及它在哪里。</string>
-    <string name="onboarding_double_tap">双击任意位置来读取文字。我会扫描标牌、标签和文件。</string>
+    <string name="onboarding_single_tap">在屏幕上任意位置点击一次即可环顾四周。我会描述场景和您面前的事物。</string>
+    <string name="onboarding_double_tap">双击任意位置并用语音问我任何问题，例如：这是什么，或请读这个标签。我会大声回答。</string>
     <string name="onboarding_long_press">长按以检查光线水平。如果环境昏暗，我会打开手电筒。</string>
     <string name="onboarding_swipe">左右滑动以在相机和图库模式之间切换。</string>
     <string name="onboarding_complete">这就是全部了。您已经准备好了。我随时在这里帮助您。</string>
@@ -95,6 +95,11 @@
     <string name="tts_lang_english">English</string>
     <string name="tts_lang_malay">Bahasa Melayu</string>
     <string name="tts_lang_chinese">普通话</string>
+    <string name="tts_voice">语音</string>
+    <string name="tts_voice_automatic">自动（最佳可用）</string>
+    <string name="tts_voice_prev">上一个语音</string>
+    <string name="tts_voice_next">下一个语音</string>
+    <string name="tts_voice_use">使用此语音</string>
 
     <!-- ── Scene ─────────────────────────────────────────────────────── -->
     <string name="scene_no_data">场景数据暂不可用。</string>
@@ -102,7 +107,7 @@
     <string name="scene_summary_not_available">场景摘要暂不可用。请稍候。</string>
 
     <!-- ── Accessibility (TalkBack) ────────────────────────────────── -->
-    <string name="camera_container_desc">Vyze相机屏幕。点击检测物体。双击读取文字。长按查看场景摘要。</string>
+    <string name="camera_container_desc">Vyze相机屏幕。点击查看四周。双击语音提问。长按检查光线。</string>
     <string name="view_finder_desc">相机预览 — 点击任意处获取场景描述</string>
 
     <!-- ── Emergency SOS ───────────────────────────────────────────── -->

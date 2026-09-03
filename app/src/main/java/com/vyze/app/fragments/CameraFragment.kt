@@ -34,10 +34,18 @@ import java.util.concurrent.TimeUnit
  * - Onboarding fires after VLM model is ready (deferred from TTS init)
  * - Barge-in: touch events instantly silence any active TTS
  * - Single-output: speak VLM result once, return to IDLE (no infinite loop)
- * - Touch anywhere to interrupt TTS and trigger a new capture
+ * - Mic is CLOSED at IDLE — voice sessions open on demand (double-tap)
+ *
+ * ## Gesture Map
+ * Single tap → look (scene description) | Double tap → ask (voice session) |
+ * Long press → light check | Triple tap → color | Triple tap + hold → SOS
  *
  * ## State Machine
- * IDLE → listening → (speech result) → analyzing → (VLM result) → speaking → IDLE
+ * IDLE → (tap) → ANALYZING → SPEAKING → (follow-up window) → IDLE
+ * IDLE → (double tap) → LISTENING → (speech) → ANALYZING → SPEAKING → IDLE
+ *
+ * Follow-up window: after every answer the mic reopens hands-free for
+ * CONVERSATION_WINDOW_MS — keep talking, no gesture needed until silence.
  */
 class CameraFragment : Fragment() {
 
@@ -75,6 +83,26 @@ class CameraFragment : Fragment() {
 
     @Volatile
     private var onboardingSpoken = false
+
+    /** True while the "better voice" install question awaits an answer. */
+    @Volatile
+    private var awaitingInstallVoiceAnswer = false
+
+    /** True once the weak-voice prompt was handled this session (no repeat nags). */
+    @Volatile
+    private var voicePromptHandledInSession = false
+
+    /** True right after the user chose to open the voice installer. */
+    @Volatile
+    private var pendingVoiceInstallConfirmation = false
+
+    /** True while the hands-free voice-selection audition is running. */
+    @Volatile
+    private var voiceAuditionActive = false
+
+    /** Candidate voices for the audition — entry 0 is "automatic". */
+    private val voiceAuditionVoices = ArrayList<android.speech.tts.Voice>()
+    private var voiceAuditionIndex = 0
 
     /** Debounce: prevents duplicate triggers from gesture + click overlap or speech re-trigger. */
     private var lastTriggerTime = 0L
@@ -203,25 +231,19 @@ class CameraFragment : Fragment() {
                             if (coreController.isDuplicateDescription(response)) {
                                 Log.d(TAG, "Duplicate description — skipping TTS, returning to IDLE")
                                 appState = AppState.IDLE
-                                if (!isContinuousMode) {
-                                    mainHandler.postDelayed({ startVoiceListening() }, 300L)
-                                }
+                                startFollowUpWindow(cue = false)
                             } else if (coreController.isStreamingActive()) {
                                 Log.d(TAG, "Streaming active — waiting for TTS queue to drain")
                                 waitForTtsDrain {
                                     appState = AppState.IDLE
-                                    Log.d(TAG, "TTS drain complete — returning to IDLE")
-                                    if (!isContinuousMode) {
-                                        mainHandler.postDelayed({ startVoiceListening() }, 300L)
-                                    }
+                                    Log.d(TAG, "TTS drain complete — opening follow-up window")
+                                    startFollowUpWindow(cue = false)
                                 }
                             } else {
                                 mainActivity.speakThenCallback(response) {
                                     appState = AppState.IDLE
-                                    Log.d(TAG, "Response spoken — returning to IDLE")
-                                    if (!isContinuousMode) {
-                                        mainHandler.postDelayed({ startVoiceListening() }, 300L)
-                                    }
+                                    Log.d(TAG, "Response spoken — opening follow-up window")
+                                    startFollowUpWindow(cue = false)
                                 }
                             }
                         } else {
@@ -236,9 +258,6 @@ class CameraFragment : Fragment() {
                                 Log.w(TAG, "SPEAKING timeout — forcing IDLE")
                                 appState = AppState.IDLE
                                 updateStatus("Ready")
-                                if (!isContinuousMode) {
-                                    startVoiceListening()
-                                }
                             }
                         }, SPEAKING_TIMEOUT_MS)
                     }
@@ -272,7 +291,6 @@ class CameraFragment : Fragment() {
                     // Don't speak the error — just log it. Speaking errors during
                     // rapid tapping causes "Failed to capture" double-speak.
                     Log.e(TAG, "VLM error (not spoken to user): $error")
-                    mainHandler.postDelayed({ startVoiceListening() }, 1000L)
                 }
             }
         }
@@ -291,14 +309,11 @@ class CameraFragment : Fragment() {
                                 "You may disable TalkBack in Android Settings for the best experience. "
                             } else ""
                             mainActivity.speakThenCallback(
-                                "${talkBackHint}Vyze model ready. Tap anywhere or speak to ask a question, " +
-                                "such as what is in front of me. Tap again to interrupt or ask a new question."
+                                "${talkBackHint}Vyze is ready. Tap once to describe what is in front of you. " +
+                                "Double tap to ask a question by voice. Press and hold to check the light."
                             ) {
-                                Log.d(TAG, "Onboarding spoken — starting voice listening")
-                                mainHandler.postDelayed({ startVoiceListening() }, 300L)
+                                Log.d(TAG, "Onboarding spoken — staying quiet (mic closed at IDLE)")
                             }
-                        } else {
-                            startVoiceListening()
                         }
                     }
                 }
@@ -319,14 +334,11 @@ class CameraFragment : Fragment() {
                             "You may disable TalkBack in Android Settings for the best experience. "
                         } else ""
                         mainActivity.speakThenCallback(
-                            "${talkBackHint}Vyze model ready. Tap anywhere or speak to ask a question, " +
-                            "such as what is in front of me. Tap again to interrupt or ask a new question."
+                            "${talkBackHint}Vyze is ready. Tap once to describe what is in front of you. " +
+                            "Double tap to ask a question by voice. Press and hold to check the light."
                         ) {
-                            Log.d(TAG, "Onboarding spoken — starting voice listening")
-                            mainHandler.postDelayed({ startVoiceListening() }, 300L)
+                            Log.d(TAG, "Onboarding spoken — staying quiet (mic closed at IDLE)")
                         }
-                    } else {
-                        startVoiceListening()
                     }
                 }
             } else {
@@ -350,16 +362,27 @@ class CameraFragment : Fragment() {
             mainHandler = mainHandler
         )
 
+        // ── Gesture Map (v2) ────────────────────────────────────────
+        // Single tap  → "look": describe the scene (absorbs the old single-tap
+        //               hit-test + double-tap navigation query).
+        // Double tap  → "ask": open an on-demand voice session — the user
+        //               speaks a question to the VLM (OCR reading included
+        //               automatically via reading keywords).
+        // Long press  → check ambient light + flashlight status.
+        // Triple tap  → color analysis. Triple tap + hold → SOS.
         gestureRouter.onSingleTapAction = { x, y ->
-            bargeInAndCapture("User tapped at position (${x.toInt()}, ${y.toInt()})")
+            bargeInAndCapture(
+                "User tapped at position (${x.toInt()}, ${y.toInt()}). " +
+                "Describe what is in front of me and around me for navigation."
+            )
         }
 
         gestureRouter.onDoubleTapAction = {
-            bargeInAndCapture("Describe what is in front of me and around me for navigation.")
+            openVoiceQuery()
         }
 
         gestureRouter.onLongPressAction = {
-            bargeInAndCapture("Give me a detailed description of my surroundings including obstacles, furniture, and navigation paths.")
+            performLightCheck()
         }
 
         gestureRouter.attach(fragmentCameraBinding.cameraContainer)
@@ -370,10 +393,9 @@ class CameraFragment : Fragment() {
             }
         }
 
-        fragmentCameraBinding.viewFinder.setOnClickListener {
-            Log.d(TAG, "Touch fallback — barge-in + manual capture")
-            bargeInAndCapture("User tapped to capture scene.")
-        }
+        // NOTE: no viewFinder.setOnClickListener fallback — it fired on every
+        // tap-up and would defeat single-vs-double disambiguation (a double
+        // tap would also have triggered a scene analysis).
     }
 
     override fun onResume() {
@@ -403,19 +425,22 @@ class CameraFragment : Fragment() {
         isCameraActive = true
 
         if (coreController.isEngineReady() && onboardingSpoken) {
+            // Mic stays CLOSED at IDLE — voice sessions open only on demand
+            // (double-tap voice query, report mode).
             appState = AppState.IDLE
-            startVoiceListening()
-            startContinuousLoop()
         } else {
             appState = AppState.LOADING
         }
+
+        maybePromptBetterVoice()
+        confirmVoiceInstallIfReturned()
     }
 
     override fun onPause() {
         super.onPause()
         isCameraActive = false
         stopContinuousLoop()
-        stopVoiceListening()
+        endFollowUpWindow()
         cameraSetup.releaseCamera()
     }
 
@@ -464,6 +489,9 @@ class CameraFragment : Fragment() {
     // ══════════════════════════════════════════════════════════════════
 
     private fun bargeInAndCapture(query: String) {
+        // Any new gesture always ends an in-progress voice audition first.
+        stopVoiceAuditionIfActive()
+
         // ── DEBOUNCE: reject if triggered too recently ───────────
         // Prevents double-fire from gesture+click overlap or speech re-trigger.
         val now = android.os.SystemClock.elapsedRealtime()
@@ -489,7 +517,17 @@ class CameraFragment : Fragment() {
 
         val mainActivity = activity as? MainActivity
         mainActivity?.stopListening()
-        mainActivity?.interruptTtsWithMicPause()
+        // NOTE: do NOT reopen the mic here (interruptTtsWithMicPause would
+        // restart listening ~100ms later). In a noisy room, other people's
+        // conversation gets transcribed as a "query" while the VLM is still
+        // analyzing the tap — cancelling the user's in-flight analysis
+        // (resetForNewCapture) and replacing it with the overheard chat.
+        // The mic stays closed for the whole ANALYZING/SPEAKING phase and
+        // is reopened automatically when the app returns to IDLE.
+        mainActivity?.interruptTts()
+        // Explicit user action: clear any noise pause + backoff (Tier 1 L1/L3)
+        // so the mic reopens normally once this analysis finishes.
+        mainActivity?.resumeAfterNoisePause()
 
         // Now safe to extract frame — isInferring lock + ANALYZING state
         // will reject any duplicate triggerVlmSnapshot calls.
@@ -551,7 +589,6 @@ class CameraFragment : Fragment() {
                             if (isAdded && _fragmentCameraBinding != null && appState == AppState.ANALYZING) {
                                 appState = AppState.IDLE
                                 updateStatus("Ready")
-                                mainHandler.postDelayed({ startVoiceListening() }, 500L)
                             }
                         }
                         return@takeSnapshot
@@ -591,7 +628,6 @@ class CameraFragment : Fragment() {
                         if (isAdded && _fragmentCameraBinding != null && appState == AppState.ANALYZING) {
                             appState = AppState.IDLE
                             updateStatus("Error: ${e.message}")
-                            mainHandler.postDelayed({ startVoiceListening() }, 1000L)
                         }
                     }
                 } finally {
@@ -610,7 +646,6 @@ class CameraFragment : Fragment() {
                         appState = AppState.IDLE
                         updateStatus("Capture failed")
                         ttsManager.speakImmediate("Could not capture the scene. Please try again.")
-                        mainHandler.postDelayed({ startVoiceListening() }, 1500L)
                     }
                 }
             }
@@ -627,24 +662,50 @@ class CameraFragment : Fragment() {
         activity.onSpeechResult = { spokenText, detectedLocale ->
             if (spokenText.isNotBlank()) {
                 Log.i(TAG, "Speech result: \"$spokenText\" lang=$detectedLocale")
-                activity.interruptTts()
-                coreController.setUserLocale(detectedLocale)
+                if (voiceAuditionActive) {
+                    handleVoiceAuditionCommand(spokenText)
+                } else if (awaitingInstallVoiceAnswer && !isVoiceSettingsRequest(spokenText)) {
+                    // A voice-settings request always wins over the pending
+                    // "install a better voice?" yes/no question — the user is
+                    // asking about voices, so route them to the audition.
+                    handleVoiceInstallAnswer(spokenText)
+                } else {
+                    activity.interruptTts()
+                    coreController.setUserLocale(detectedLocale)
 
-                when {
-                    // ── REPORT MODE: speech is the report content ──
-                    appState == AppState.REPORTING -> {
-                        handleReportContent(spokenText)
-                    }
-                    // ── REPORT TRIGGER: enter report mode ─────────
-                    reportManager.isReportTrigger(spokenText) -> {
-                        enterReportMode()
-                    }
-                    // ── NORMAL VLM PIPELINE ──────────────────────
-                    else -> {
-                        coreController.resetForNewCapture()
-                        appState = AppState.IDLE
-                        updateStatus("Heard: \"$spokenText\"")
-                        triggerVlmSnapshot(spokenText)
+                    when {
+                        // ── REPORT MODE: speech is the report content ──
+                        appState == AppState.REPORTING -> {
+                            handleReportContent(spokenText)
+                        }
+                        // ── REPORT TRIGGER: enter report mode ─────────
+                        reportManager.isReportTrigger(spokenText) -> {
+                            enterReportMode()
+                        }
+                        // ── NORMAL VLM PIPELINE ──────────────────────
+                        else -> {
+                            // ── VOICE SETTINGS COMMAND ───────────────
+                            // "voice settings" / "change your voice" starts
+                            // the hands-free voice audition (no screen needed).
+                            if (isVoiceSettingsRequest(spokenText)) {
+                                startVoiceAudition()
+                            } else if (appState == AppState.ANALYZING || appState == AppState.SPEAKING) {
+                                // ── NOISE GATE ────────────────────────
+                                // The recognizer can transcribe other people's
+                                // conversation as a "query" in a noisy room.
+                                // If the app is already analyzing or speaking,
+                                // drop the result instead of cancelling the
+                                // user's in-flight query — otherwise ambient
+                                // chat makes the response come back "lost" and
+                                // restarts the recognition beep loop.
+                                Log.d(TAG, "Speech result during $appState — dropping (possible ambient noise)")
+                            } else {
+                                coreController.resetForNewCapture()
+                                appState = AppState.IDLE
+                                updateStatus("Heard: \"$spokenText\"")
+                                triggerVlmSnapshot(spokenText)
+                            }
+                        }
                     }
                 }
             }
@@ -664,9 +725,59 @@ class CameraFragment : Fragment() {
         activity.onSpeechError = { errorMsg ->
             if (isAdded && _fragmentCameraBinding != null) {
                 Log.w(TAG, "Speech error: $errorMsg")
-                appState = AppState.IDLE
-                updateStatus("Ready")
-                mainHandler.postDelayed({ startVoiceListening() }, 300L)
+
+                if (voiceAuditionActive) {
+                    // Voice audition: a silent/errored cycle just means the
+                    // user didn't answer — re-hint and keep listening.
+                    val mainActivity = activity as? MainActivity
+                    if (mainActivity != null) {
+                        mainActivity.speakThenCallback("Say next, use this, or cancel.") {
+                            mainHandler.postDelayed({ startVoiceListening() }, VOICE_SESSION_OPEN_DELAY_MS)
+                        }
+                    }
+                } else {
+                    // ── CONVERSATION WINDOW: a silent recognizer cycle inside
+                    // the follow-up window just means the user paused. Quietly
+                    // reopen the mic while the deadline is still valid; the
+                    // watchdog closes the window when it expires.
+                    val pausedInWindow = inConversationWindow &&
+                        (errorMsg.contains("No speech") || errorMsg.contains("timed out"))
+                    if (pausedInWindow) {
+                        if (android.os.SystemClock.elapsedRealtime() < conversationDeadlineMs) {
+                            appState = AppState.LISTENING
+                            updateStatus("Listening...")
+                            mainHandler.postDelayed({ startVoiceListening() }, FOLLOW_UP_RETRY_DELAY_MS)
+                        } else {
+                            endFollowUpWindow()
+                        }
+                    } else {
+                        val wasVoiceSession = appState == AppState.LISTENING
+                        appState = AppState.IDLE
+                        updateStatus("Ready")
+                        // Voice sessions are on-demand — an empty/failed session
+                        // ends quietly instead of auto-restarting the mic forever.
+                        if (wasVoiceSession) {
+                            try {
+                                ttsManager.speakQueued("I did not catch that. Double tap and try again.")
+                            } catch (_: Throwable) {}
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── TIER 1 L3: NOISY-ROOM AUTO-ADAPT ─────────────────────
+        // The recognizer kept committing ambient conversation. Announce
+        // it and stay quiet until the user taps to analyze.
+        activity.onNoiseDetected = {
+            if (isAdded && _fragmentCameraBinding != null) {
+                Log.w(TAG, "Noisy room detected — ending conversation window")
+                stopVoiceAuditionIfActive()
+                endFollowUpWindow()
+                updateStatus("Noisy — tap or double tap to continue")
+                try {
+                    ttsManager.speakQueued("The room is noisy. Tap once to look, or double tap to ask.")
+                } catch (_: Throwable) {}
             }
         }
     }
@@ -680,6 +791,8 @@ class CameraFragment : Fragment() {
      * bug report content instead of a VLM query.
      */
     private fun enterReportMode() {
+        stopVoiceAuditionIfActive()
+        endFollowUpWindow()
         appState = AppState.REPORTING
         updateStatus("Report mode — speak your issue")
         Log.i(TAG, "Entering REPORTING mode")
@@ -711,9 +824,7 @@ class CameraFragment : Fragment() {
             val mainActivity = activity as? MainActivity
             mainActivity?.speakThenCallback(
                 "Failed to save report. Please try again."
-            ) {
-                mainHandler.postDelayed({ startVoiceListening() }, 300L)
-            }
+            ) {}
             return
         }
 
@@ -726,9 +837,7 @@ class CameraFragment : Fragment() {
             val mainActivity = activity as? MainActivity
             mainActivity?.speakThenCallback(
                 "Report saved. Email is ready — please tap Send to submit."
-            ) {
-                mainHandler.postDelayed({ startVoiceListening() }, 300L)
-            }
+            ) {}
         } else {
             // Email client not available — report still saved locally
             appState = AppState.IDLE
@@ -736,9 +845,7 @@ class CameraFragment : Fragment() {
             val mainActivity = activity as? MainActivity
             mainActivity?.speakThenCallback(
                 "Report saved to Downloads folder. No email app found."
-            ) {
-                mainHandler.postDelayed({ startVoiceListening() }, 300L)
-            }
+            ) {}
         }
     }
 
@@ -872,12 +979,419 @@ class CameraFragment : Fragment() {
         }
     }
 
+    /**
+     * Double-tap "ask" session: barge-in, cue the user, then open the mic
+     * for ONE question. The session ends when speech is recognized or the
+     * recognizer errors — the mic never stays open at IDLE.
+     */
+    private fun openVoiceQuery() {
+        if (!isAdded) return
+        stopVoiceAuditionIfActive()
+
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - lastTriggerTime < TRIGGER_DEBOUNCE_MS) {
+            Log.d(TAG, "Voice query debounced")
+            return
+        }
+        lastTriggerTime = now
+
+        val mainActivity = activity as? MainActivity ?: return
+
+        // Barge-in: cancel any in-flight analysis/response before asking
+        coreController.resetForNewCapture()
+        endFollowUpWindow()
+        hapticManager.vibrateDoubleTap()
+        mainActivity.interruptTts()
+        mainActivity.resumeAfterNoisePause()
+
+        // Open a fresh conversation session with a spoken cue. After each
+        // answer the mic reopens automatically (startFollowUpWindow) so
+        // follow-ups flow hands-free until the user goes quiet.
+        startFollowUpWindow(cue = true)
+    }
+
+    /**
+     * Long-press light check: report ambient light + flashlight status.
+     * The torch itself is managed continuously by the auto-torch luminance
+     * monitor, so this is a status readout on demand.
+     */
+    private fun performLightCheck() {
+        if (!isAdded) return
+        stopVoiceAuditionIfActive()
+        hapticManager.vibrateTap()
+        val dark = cameraSetup.isEnvironmentDark()
+        val torchOn = flashlightManager.isTorchOn()
+        Log.d(TAG, "Light check: dark=$dark torchOn=$torchOn")
+        try {
+            if (dark) {
+                // If the auto-torch hasn't flipped yet, apply it now
+                if (!torchOn) flashlightManager.toggleTorch(true)
+                ttsManager.speakQueued("It is dark. Flashlight is on.")
+            } else {
+                ttsManager.speakQueued("Light is sufficient. Flashlight is off.")
+            }
+        } catch (_: Throwable) {}
+        updateStatus(if (dark) "Dark — flashlight on" else "Light sufficient")
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Better Voice Prompt (Tier 1)
+    // ══════════════════════════════════════════════════════════════════
+
+    /**
+     * Post-onboarding prompt (first run only): if the installed voice pack is
+     * the robotic base quality, offer to open Google's voice installer.
+     * Asked once per session; marked resolved forever once answered.
+     */
+    private fun maybePromptBetterVoice() {
+        if (!isAdded || voicePromptHandledInSession || !onboardingSpoken) return
+        if (awaitingInstallVoiceAnswer) return
+        if (appState != AppState.IDLE) return
+        voicePromptHandledInSession = true
+
+        try {
+            if (!ttsManager.isReady() || !ttsManager.isVoiceQualityLow()) return
+            val prefs = requireContext()
+                .getSharedPreferences(TTSManager.PREFS_NAME, Context.MODE_PRIVATE)
+            if (prefs.getBoolean(TTSManager.KEY_VOICE_PROMPT_RESOLVED, false)) return
+
+            Log.d(TAG, "Weak voice detected — offering better voice install")
+            awaitingInstallVoiceAnswer = true
+            val mainActivity = activity as? MainActivity ?: return
+            mainActivity.speakThenCallback(
+                "Your current voice sounds basic. A better voice is available for free from Google. " +
+                "Say yes to open the voice installer, or say skip."
+            ) {
+                // Open the mic after the prompt so the user can answer
+                mainHandler.postDelayed({
+                    startVoiceListening()
+                    // Close quietly if they never answer
+                    mainHandler.postDelayed({
+                        if (awaitingInstallVoiceAnswer) {
+                            awaitingInstallVoiceAnswer = false
+                            stopVoiceListening()
+                        }
+                    }, VOICE_INSTALL_WAIT_MS)
+                }, VOICE_INSTALL_PROMPT_GAP_MS)
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "maybePromptBetterVoice failed: ${e.message}")
+            awaitingInstallVoiceAnswer = false
+        }
+    }
+
+    /** Parse the user's yes/no answer to the better-voice question. */
+    private fun handleVoiceInstallAnswer(spokenText: String) {
+        awaitingInstallVoiceAnswer = false
+        stopVoiceListening()
+        val text = spokenText.trim().lowercase()
+        val yes = listOf(
+            "yes", "yeah", "yep", "yup", "sure", "ok", "okay",
+            "install", "better", "ya", "boleh", "好", "是", "要"
+        ).any { text.contains(it) }
+        val no = listOf(
+            "no", "nope", "skip", "not now", "later", "cancel",
+            "tak", "tidak", "jangan", "不用", "不要", "跳过"
+        ).any { text.contains(it) }
+
+        val prefs = requireContext()
+            .getSharedPreferences(TTSManager.PREFS_NAME, Context.MODE_PRIVATE)
+        prefs.edit().putBoolean(TTSManager.KEY_VOICE_PROMPT_RESOLVED, true).apply()
+
+        val mainActivity = activity as? MainActivity ?: return
+        if (yes && !no) {
+            Log.i(TAG, "User chose to install a better voice")
+            pendingVoiceInstallConfirmation = true
+            if (mainActivity.openTtsVoiceInstaller()) {
+                ttsManager.speakQueued("Opening the voice installer. Pick a higher quality voice, then come back.")
+            } else {
+                pendingVoiceInstallConfirmation = false
+                ttsManager.speakQueued("The voice installer is not available on this device. You can manage voices in Android TTS settings.")
+            }
+        } else {
+            Log.i(TAG, "User skipped the better voice prompt")
+            ttsManager.speakQueued("No problem. You can change my voice anytime in Voice Settings.")
+        }
+    }
+
+    /**
+     * After returning from the Google voice installer, re-check the voice
+     * and confirm whether a better pack was installed.
+     */
+    private fun confirmVoiceInstallIfReturned() {
+        if (!isAdded || !pendingVoiceInstallConfirmation) return
+        pendingVoiceInstallConfirmation = false
+        mainHandler.postDelayed({
+            try {
+                ttsManager.applySettings(requireContext())
+                if (!ttsManager.isVoiceQualityLow()) {
+                    ttsManager.speakQueued("Better voice installed. I will use it from now on.")
+                } else {
+                    ttsManager.speakQueued("I did not detect a new voice. You can pick one in Voice Settings.")
+                }
+            } catch (e: Throwable) {
+                Log.w(TAG, "confirmVoiceInstallIfReturned failed: ${e.message}")
+            }
+        }, VOICE_INSTALL_RECHECK_DELAY_MS)
+    }
+
     private fun stopVoiceListening() {
         try {
             val activity = requireActivity() as? MainActivity ?: return
             activity.stopListening()
         } catch (e: Throwable) {
             Log.w(TAG, "stopVoiceListening failed: ${e.message}")
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Voice Settings Command
+    // ══════════════════════════════════════════════════════════════════
+
+    /** Spoken command phrases that start the hands-free voice audition. */
+    private fun isVoiceSettingsRequest(text: String): Boolean {
+        val t = text.trim().lowercase()
+        if (VOICE_SETTINGS_PHRASES.any { t.contains(it) }) return true
+
+        // Fallback 1 — recognizer variants the direct list can miss
+        // ("voice setting" without the trailing s, "sound setting",
+        // "set my voice"): a voice-word plus an intent-word anywhere.
+        val hasVoiceWord = listOf("voice", "suara", "语音", "声音").any { t.contains(it) }
+        val hasIntentWord = listOf(
+            "setting", "settings", "setup", "set ", "change", "changing",
+            "choose", "pick", "select", "option", "preference", "preferences",
+            "tetapan", "tukar", "ganti", "ubah", "设置", "设定", "选择", "更换"
+        ).any { t.contains(it) }
+        if (hasVoiceWord && hasIntentWord) return true
+
+        // Fallback 2 — a very short utterance that is basically the command
+        // itself ("voice", "suara"), typically spoken right after the
+        // listening cue that just mentioned "voice settings".
+        val wordCount = t.split(Regex("\\s+")).size
+        return wordCount <= 2 && hasVoiceWord
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Hands-free Voice Audition (choose my voice by speaking)
+    // ══════════════════════════════════════════════════════════════════
+
+    /**
+     * Voice-driven voice picker. No screen, no tapping: the app cycles
+     * through the installed voices for the current language, speaking a
+     * sample in each one, and the user replies with voice commands.
+     *
+     * Say "next" → hear the next voice | "use this" → keep it | "cancel" → stop.
+     */
+    private fun startVoiceAudition() {
+        if (!isAdded) return
+        Log.i(TAG, "Voice command: starting hands-free voice audition")
+        stopVoiceAuditionIfActive()
+        stopVoiceListening()
+        endFollowUpWindow()
+        // If the "install a better voice?" question was still awaiting an
+        // answer, this explicit request supersedes it (without resolving it).
+        awaitingInstallVoiceAnswer = false
+        coreController.resetForNewCapture()
+        hapticManager.vibrateTap()
+
+        voiceAuditionVoices.clear()
+        voiceAuditionVoices.addAll(ttsManager.getInstalledVoicesForCurrentLanguage())
+        voiceAuditionIndex = 0 // 0 = automatic (best available)
+        voiceAuditionActive = true
+        appState = AppState.LISTENING
+        updateStatus("Voice selection — say next / use this / cancel")
+
+        val mainActivity = activity as? MainActivity
+        if (mainActivity == null) {
+            voiceAuditionActive = false
+            return
+        }
+        val total = voiceAuditionVoices.size + 1
+        ttsManager.setVoiceByName(TTSManager.VOICE_AUTO)
+        mainActivity.speakThenCallback(
+            "Voice selection. ${total} choices, including automatic. " +
+            "I will speak a sample in each voice. Say next for the next voice, " +
+            "use this to keep the voice you just heard, or cancel to stop."
+        ) {
+            mainHandler.postDelayed({ if (voiceAuditionActive) auditionSpeakCurrent() }, 300L)
+        }
+    }
+
+    /** Speak the current candidate's sample (in its own voice), then listen. */
+    private fun auditionSpeakCurrent() {
+        if (!isAdded || !voiceAuditionActive) return
+        val mainActivity = activity as? MainActivity ?: return
+        val total = voiceAuditionVoices.size + 1
+
+        // Apply the candidate so the sample plays in THAT voice
+        if (voiceAuditionIndex == 0) {
+            ttsManager.setVoiceByName(TTSManager.VOICE_AUTO)
+        } else {
+            voiceAuditionVoices.getOrNull(voiceAuditionIndex - 1)?.name
+                ?.let { ttsManager.setVoiceByName(it) }
+        }
+
+        val voiceLabel = if (voiceAuditionIndex == 0) {
+            "Automatic voice, best available quality"
+        } else {
+            "Voice ${voiceAuditionIndex} of $total"
+        }
+        appState = AppState.LISTENING
+        updateStatus(if (voiceAuditionIndex == 0) "Audition: Automatic" else "Audition: voice $voiceAuditionIndex of $total")
+        mainActivity.speakThenCallback(
+            "${auditionSampleText()} $voiceLabel. Say next, use this, or cancel."
+        ) {
+            mainHandler.postDelayed({ startVoiceListening() }, VOICE_SESSION_OPEN_DELAY_MS)
+        }
+    }
+
+    /** Parse the user's spoken command during the audition. */
+    private fun handleVoiceAuditionCommand(text: String) {
+        if (!voiceAuditionActive) return
+        val t = text.trim().lowercase()
+        val total = voiceAuditionVoices.size + 1
+
+        when {
+            containsAny(t, AUDITION_USE_PHRASES) -> {
+                // Save the currently auditioned voice (or automatic)
+                stopVoiceListening()
+                val name = if (voiceAuditionIndex == 0) TTSManager.VOICE_AUTO
+                else voiceAuditionVoices[voiceAuditionIndex - 1].name
+                requireContext().getSharedPreferences(TTSManager.PREFS_NAME, Context.MODE_PRIVATE)
+                    .edit().putString(TTSManager.KEY_VOICE_NAME, name).apply()
+                voiceAuditionActive = false
+                appState = AppState.IDLE
+                updateStatus("Voice selected")
+                try {
+                    ttsManager.speakImmediate(
+                        if (voiceAuditionIndex == 0) {
+                            "Automatic voice selected."
+                        } else {
+                            "Voice selected. You will hear me in this voice."
+                        }
+                    )
+                } catch (_: Throwable) {}
+            }
+            containsAny(t, AUDITION_NEXT_PHRASES) -> {
+                voiceAuditionIndex = ((voiceAuditionIndex + 1) % total + total) % total
+                auditionSpeakCurrent()
+            }
+            containsAny(t, AUDITION_CANCEL_PHRASES) -> {
+                stopVoiceListening()
+                voiceAuditionActive = false
+                appState = AppState.IDLE
+                updateStatus("Ready")
+                try {
+                    ttsManager.speakImmediate("Voice selection cancelled.")
+                } catch (_: Throwable) {}
+            }
+            else -> {
+                // Unclear — re-hint inside the audition
+                val mainActivity = activity as? MainActivity
+                mainActivity?.speakThenCallback("I did not catch that. Say next, use this, or cancel.") {
+                    mainHandler.postDelayed({ startVoiceListening() }, VOICE_SESSION_OPEN_DELAY_MS)
+                }
+            }
+        }
+    }
+
+    /** End the audition quietly when another action takes over. */
+    private fun stopVoiceAuditionIfActive() {
+        if (voiceAuditionActive) {
+            voiceAuditionActive = false
+            stopVoiceListening()
+            if (appState == AppState.LISTENING) {
+                appState = AppState.IDLE
+                updateStatus("Ready")
+            }
+        }
+    }
+
+    /** Short localized sample used during the audition. */
+    private fun auditionSampleText(): String = when (ttsManager.getCurrentLanguageKey()) {
+        TTSManager.LANGUAGE_MALAY -> "Ini adalah bagaimana saya berbunyi."
+        TTSManager.LANGUAGE_CHINESE -> "这是我说话的声音。"
+        else -> "This is how I sound."
+    }
+
+    private fun containsAny(text: String, phrases: List<String>): Boolean =
+        phrases.any { text.contains(it) }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Conversation Window (hands-free follow-ups)
+    // ══════════════════════════════════════════════════════════════════
+    // After a double-tap "ask" (or any completed answer), the mic reopens
+    // for CONVERSATION_WINDOW_MS so follow-up questions flow without
+    // repeating the gesture. Each accepted query resets the deadline; the
+    // window closes quietly after the deadline passes with no speech, or
+    // when a new action (tap/report) takes over.
+
+    /** True while the hands-free follow-up window is open. */
+    @Volatile
+    private var inConversationWindow = false
+
+    /** Rolling deadline (elapsedRealtime) — extended on every accepted query. */
+    @Volatile
+    private var conversationDeadlineMs = 0L
+
+    /** Periodically checks the deadline and closes the window when it expires. */
+    private val conversationWatchdog = object : Runnable {
+        override fun run() {
+            if (!inConversationWindow || !isAdded) return
+            if (android.os.SystemClock.elapsedRealtime() >= conversationDeadlineMs) {
+                Log.d(TAG, "Conversation window expired — closing mic")
+                endFollowUpWindow()
+            } else {
+                mainHandler.postDelayed(this, CONVERSATION_WINDOW_TICK_MS)
+            }
+        }
+    }
+
+    /**
+     * Open (or extend) the hands-free conversation window and reopen the mic.
+     * @param cue true when the user explicitly asked (double-tap) — a spoken
+     *            "Listening" prompt is played; follow-up reopens stay silent.
+     */
+    private fun startFollowUpWindow(cue: Boolean) {
+        if (!isAdded) return
+        inConversationWindow = true
+        conversationDeadlineMs = android.os.SystemClock.elapsedRealtime() + CONVERSATION_WINDOW_MS
+        mainHandler.removeCallbacks(conversationWatchdog)
+        mainHandler.postDelayed(conversationWatchdog, CONVERSATION_WINDOW_TICK_MS)
+
+        stopVoiceListening() // clear any stale recognition session first
+        appState = AppState.LISTENING
+        updateStatus("Listening...")
+
+        if (cue) {
+            // Spoken cue that also teaches the voice-settings command, then
+            // opens the mic AFTER the cue finishes so it is never captured.
+            val mainActivity = activity as? MainActivity
+            if (mainActivity != null) {
+                mainActivity.speakThenCallback(
+                    "Listening. Ask your question, or say voice settings to change how I sound."
+                ) {
+                    mainHandler.postDelayed({ startVoiceListening() }, VOICE_SESSION_OPEN_DELAY_MS)
+                }
+                return
+            }
+        }
+        // Follow-up reopens (and cue fallback): open the mic after a short
+        // settle so the answer's last words are never captured as the query.
+        mainHandler.postDelayed(
+            { startVoiceListening() },
+            FOLLOW_UP_OPEN_DELAY_MS
+        )
+    }
+
+    /** Close the conversation window and the mic (stays closed at IDLE). */
+    private fun endFollowUpWindow() {
+        inConversationWindow = false
+        mainHandler.removeCallbacks(conversationWatchdog)
+        stopVoiceListening()
+        if (appState == AppState.LISTENING) {
+            appState = AppState.IDLE
+            updateStatus("Ready")
         }
     }
 
@@ -899,7 +1413,38 @@ class CameraFragment : Fragment() {
          * releasing audio focus. Compensates for Android AudioTrack
          * hardware drain latency after onDone() fires.
          */
-        private const val AUDIO_DRAIN_GRACE_MS = 400L
+        private const val AUDIO_DRAIN_GRACE_MS = 600L
+
+        /** Spoken phrases that open the voice audition ("double tap, then say…"). */
+        private val VOICE_SETTINGS_PHRASES = listOf(
+            "voice settings", "voice setting", "voice setup", "change your voice",
+            "change my voice", "change voice", "change the voice", "set my voice",
+            "set your voice", "voice selection", "choose a voice", "choose voice",
+            "pick a voice", "pick my voice", "how you sound", "how i sound",
+            "sound settings", "sound setting", "speech settings", "tts settings",
+            "text to speech settings", "voice preferences", "tetapan suara",
+            "tukar suara", "ubah suara", "语音设置", "设置语音", "更换语音",
+            "换语音", "声音设置", "换声音", "选择语音"
+        )
+
+        /** Audition: move to the next voice. */
+        private val AUDITION_NEXT_PHRASES = listOf(
+            "next", "forward", "continue", "another", "other", "seterusnya",
+            "下一个", "下一个语音", "下一种"
+        )
+
+        /** Audition: keep the voice that was just heard. */
+        private val AUDITION_USE_PHRASES = listOf(
+            "use this", "this one", "this voice", "keep it", "keep this",
+            "select", "choose", "pick this", "yes", "ok", "guna", "pilih", "ini",
+            "用这个", "就要这个", "好", "是", "要"
+        )
+
+        /** Audition: stop without changing the voice. */
+        private val AUDITION_CANCEL_PHRASES = listOf(
+            "cancel", "stop", "exit", "quit", "back", "skip", "done", "finish",
+            "batal", "tamat", "取消", "停止", "退出", "完成"
+        )
 
         /** Interval (ms) between auto-snapshot captures in continuous mode. */
         private const val AUTO_SNAPSHOT_INTERVAL_MS = 4000L
@@ -918,5 +1463,29 @@ class CameraFragment : Fragment() {
          * Doubles the interval to reduce sustained GPU load.
          */
         private const val THERMALTHROTTLE_INTERVAL_MS = 8000L
+
+        /** Delay (ms) between the "Listening" cue and opening the mic. */
+        private const val VOICE_SESSION_OPEN_DELAY_MS = 700L
+
+        /** Hands-free follow-up window: mic stays open this long after each answer. */
+        private const val CONVERSATION_WINDOW_MS = 12_000L
+
+        /** How often the conversation-window watchdog checks the deadline (ms). */
+        private const val CONVERSATION_WINDOW_TICK_MS = 2_000L
+
+        /** Delay before a silent follow-up reopen listens again (ms). */
+        private const val FOLLOW_UP_RETRY_DELAY_MS = 500L
+
+        /** Delay before the mic opens after an answer ends (ms). */
+        private const val FOLLOW_UP_OPEN_DELAY_MS = 600L
+
+        /** Delay between the better-voice prompt and opening the mic (ms). */
+        private const val VOICE_INSTALL_PROMPT_GAP_MS = 600L
+
+        /** How long to wait for the user's yes/skip answer (ms). */
+        private const val VOICE_INSTALL_WAIT_MS = 12_000L
+
+        /** Delay before re-checking the voice after returning from the installer (ms). */
+        private const val VOICE_INSTALL_RECHECK_DELAY_MS = 1_800L
     }
 }

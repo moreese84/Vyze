@@ -418,6 +418,13 @@ class CameraSetupDelegate {
     }
 
     /**
+     * Last known dark/bright environment state, maintained by the auto-torch
+     * luminance checks (refreshed roughly every 10th frame). Used by the
+     * long-press light check.
+     */
+    fun isEnvironmentDark(): Boolean = isDarkEnvironment
+
+    /**
      * Releases the camera and unbinds all use cases.
      */
     fun releaseCamera() {

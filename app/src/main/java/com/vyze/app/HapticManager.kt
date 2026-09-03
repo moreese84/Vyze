@@ -29,9 +29,11 @@ class HapticManager(context: Context) {
     /**
      * Two quick 40 ms pulses separated by 60 ms for double-tap / OCR confirmation.
      * Pattern: [delay 0ms, vibrate 40ms, delay 60ms, vibrate 40ms]
+     * NOTE: repeat must be -1 (play once) — repeat 0 would loop the pattern
+     * forever, buzzing continuously until the next vibration call.
      */
     fun vibrateDoubleTap() {
-        vibratePattern(longArrayOf(0, 40, 60, 40), 0)
+        vibratePattern(longArrayOf(0, 40, 60, 40), -1)
     }
 
     /**
@@ -44,9 +46,10 @@ class HapticManager(context: Context) {
     /**
      * A sharp triple-burst pulse for low-light warnings or system errors.
      * Pattern: [delay 0ms, vibrate 50ms, delay 40ms, vibrate 50ms, delay 40ms, vibrate 50ms]
+     * NOTE: repeat must be -1 (play once) — repeat 0 would loop forever.
      */
     fun vibrateWarning() {
-        vibratePattern(longArrayOf(0, 50, 40, 50, 40, 50), 0)
+        vibratePattern(longArrayOf(0, 50, 40, 50, 40, 50), -1)
     }
 
     /**

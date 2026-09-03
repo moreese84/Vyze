@@ -54,6 +54,22 @@ class MainActivity : AppCompatActivity() {
     private var speechRecognizer: SpeechRecognizer? = null
     private var isListening = false
 
+    // ── Noise Robustness (Tier 1) ────────────────────────────────
+    // L1: Adaptive restart backoff — grows between failed recognition
+    // cycles so the recognizer doesn't beep-loop in noisy rooms.
+    // L3: Chatter counter — when ambient conversation keeps getting
+    // rejected, pause free-form listening until the user taps.
+    private var retryIndex = 0
+
+    @Volatile
+    private var noisePaused = false
+
+    private var rejectedCycleCount = 0
+
+    /** Last partial transcription from the active session (L2 stability check). */
+    @Volatile
+    private var lastPartialText: String = ""
+
     /** Cached intent for speech recognition sessions. */
     private var speechIntent: Intent? = null
 
@@ -65,6 +81,9 @@ class MainActivity : AppCompatActivity() {
 
     /** Callback for speech recognition errors (non-fatal). */
     var onSpeechError: ((String) -> Unit)? = null
+
+    /** Invoked when repeated rejected cycles indicate a noisy room (Tier 1 L3). */
+    var onNoiseDetected: (() -> Unit)? = null
 
     /** Permission launcher for RECORD_AUDIO at runtime. */
     private val audioPermissionLauncher =
@@ -373,6 +392,76 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // ── Noise Robustness Helpers (Tier 1) ─────────────────────────
+
+    /** L1: schedule the next mic restart with adaptive backoff. */
+    private fun scheduleAdaptiveRestart() {
+        if (noisePaused) {
+            Log.d(TAG, "scheduleAdaptiveRestart: noise pause active — not restarting")
+            return
+        }
+        val delay = RETRY_RAMP_MS[retryIndex]
+        if (retryIndex < RETRY_RAMP_MS.size - 1) retryIndex++
+        Log.d(TAG, "Adaptive mic restart in ${delay}ms (ramp=$retryIndex)")
+        mainHandler.postDelayed({ startListeningSafely() }, delay)
+    }
+
+    /** L1: reset the backoff ramp (real query accepted or user tapped). */
+    fun resetRetryBackoff() {
+        retryIndex = 0
+        Log.d(TAG, "Retry backoff reset to ${RETRY_RAMP_MS[0]}ms")
+    }
+
+    /** L3: count a rejected ambient-chatter cycle; pause listening at threshold. */
+    private fun registerRejectedCycle() {
+        rejectedCycleCount++
+        Log.d(TAG, "Rejected cycle #$rejectedCycleCount (threshold $NOISE_DETECTION_THRESHOLD)")
+        if (rejectedCycleCount >= NOISE_DETECTION_THRESHOLD) {
+            noisePaused = true
+            rejectedCycleCount = 0
+            Log.w(TAG, "Noise detected — pausing free-form listening until user taps")
+            CrashLogFile.log(TAG, "NOISE PAUSE triggered: $NOISE_DETECTION_THRESHOLD rejected cycles")
+            mainHandler.post { onNoiseDetected?.invoke() }
+        } else {
+            scheduleAdaptiveRestart()
+        }
+    }
+
+    /** Clear the noise pause + backoff — called when the user taps. */
+    fun resumeAfterNoisePause() {
+        noisePaused = false
+        rejectedCycleCount = 0
+        resetRetryBackoff()
+        Log.i(TAG, "Noise pause cleared — listening can resume")
+    }
+
+    /** L2: decide whether a transcription is ambient conversation, not the user. */
+    private fun isAmbientChat(text: String, confidence: FloatArray?): Boolean {
+        // 1. Fragmentary single-word results ("yeah", "okay", "hi") — pass-over chatter
+        val trimmed = text.trim()
+        if (trimmed.split(Regex("\\s+")).size == 1 && trimmed.length < MIN_SINGLE_WORD_CHARS) {
+            return true
+        }
+        // 2. Low recognition confidence — mumbles and mixed chatter score low
+        if (confidence != null && confidence.isNotEmpty()) {
+            val score = confidence.firstOrNull() ?: return false
+            if (score in 0.0f..1.0f && score < MIN_CONFIDENCE) {
+                return true
+            }
+        }
+        // 3. Unstable transcription: the final text shares no words with the
+        //    partial stream — a sign the recognizer latched onto a different speaker.
+        val partial = lastPartialText
+        if (partial.isNotBlank() && partial.length >= 4 && trimmed.length >= 4) {
+            val finalWords = trimmed.lowercase().split(Regex("\\s+")).toSet()
+            val partialWords = partial.lowercase().split(Regex("\\s+")).toSet()
+            if (finalWords.none { it in partialWords }) {
+                return true
+            }
+        }
+        return false
+    }
+
     // ── Public API ────────────────────────────────────────────────
 
     /**
@@ -517,6 +606,14 @@ class MainActivity : AppCompatActivity() {
                     return@post
                 }
 
+                // ── L3: NOISE PAUSE ──────────────────────────────
+                // After repeated ambient-chatter rejections, stay quiet
+                // until the user taps. Only an explicit tap re-opens the mic.
+                if (noisePaused) {
+                    Log.d(TAG, "startListeningSafely: noise pause active — staying quiet until tap")
+                    return@post
+                }
+
                 // ALWAYS cancel first — clears stale audio buffer from previous
                 // recognition session. Without this, the recognizer may carry
                 // partial audio from the last session into the new one, causing
@@ -572,6 +669,30 @@ class MainActivity : AppCompatActivity() {
         } catch (e: Throwable) {
             Log.w(TAG, "stopListening failed: ${e.message}")
             isListening = false
+        }
+    }
+
+    /**
+     * Open the TTS engine's "install voice data" screen so the user can
+     * download a better (neural) voice pack. Returns false if no installer
+     * is available on the device.
+     */
+    fun openTtsVoiceInstaller(): Boolean {
+        return try {
+            val intent = Intent(TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            if (intent.resolveActivity(packageManager) != null) {
+                startActivity(intent)
+                Log.i(TAG, "Opened TTS voice installer")
+                true
+            } else {
+                Log.w(TAG, "No TTS voice installer available")
+                false
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "Failed to open TTS voice installer: ${e.message}")
+            false
         }
     }
 
@@ -634,6 +755,9 @@ class MainActivity : AppCompatActivity() {
             }.also { speechIntent = it }
 
             isListening = true
+            // Fresh session — clear the partial stream so the L2 stability
+            // check never compares against a previous session's text.
+            lastPartialText = ""
             speechRecognizer?.startListening(intent)
             Log.i(TAG, "Speech recognition started — waiting for voice input")
             CrashLogFile.log(TAG, "Speech recognition started")
@@ -695,18 +819,19 @@ class MainActivity : AppCompatActivity() {
                 when (error) {
                     SpeechRecognizer.ERROR_NO_MATCH,
                     SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> {
-                        // Silently reset and auto-restart mic (thread-safe)
+                        // On-demand voice session — no speech was heard, so end
+                        // the session cleanly instead of auto-restarting the mic
+                        // (no beep loops, no idle listening).
                         onPartialSpeechResult?.invoke("")
-                        mainHandler.postDelayed({ startListeningSafely() }, 300L)
+                        onSpeechError?.invoke(errorMsg)
                     }
                     SpeechRecognizer.ERROR_RECOGNIZER_BUSY,
                     SpeechRecognizer.ERROR_CLIENT -> {
-                        // CLIENT errors cascade when mic is grabbed by another service.
-                        // Use exponential backoff: 1s → 2s → 4s (capped at 4s).
-                        // Reset isListening so next startListeningSafely() actually fires.
+                        // Mic briefly busy — one short retry for the on-demand
+                        // session, then the error surfaces and the session ends.
                         isListening = false
-                        val backoffMs = 1000L.coerceAtMost(4000L)
-                        mainHandler.postDelayed({ startListeningSafely() }, backoffMs)
+                        onPartialSpeechResult?.invoke("")
+                        mainHandler.postDelayed({ startListeningSafely() }, 1000L)
                     }
                     else -> {
                         isListening = false
@@ -719,6 +844,30 @@ class MainActivity : AppCompatActivity() {
                 isListening = false
                 val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                 val bestMatch = matches?.firstOrNull()
+
+                if (bestMatch.isNullOrBlank()) {
+                    Log.d(TAG, "onResults: empty — no speech recognized, ending session")
+                    onPartialSpeechResult?.invoke("")
+                    onSpeechError?.invoke("No speech detected.")
+                    return
+                }
+
+                // ── L2: AMBIENT CHATTER FILTER ──────────────────────
+                // In a noisy room, the recognizer commits background
+                // conversation as if the user spoke it. Reject fragmentary,
+                // low-confidence, or unstable transcriptions before they
+                // become VLM queries.
+                val confidence = results?.getFloatArray(SpeechRecognizer.CONFIDENCE_SCORES)
+                if (isAmbientChat(bestMatch, confidence)) {
+                    Log.d(TAG, "onResults: chatter filter dropped \"$bestMatch\"")
+                    onPartialSpeechResult?.invoke("")
+                    registerRejectedCycle()
+                    return
+                }
+
+                // Real query — reset adaptive backoff + chatter counters
+                resetRetryBackoff()
+                rejectedCycleCount = 0
 
                 // Extract detected language from SpeechRecognizer
                 // Many devices don't return EXTRA_LANGUAGE in results — fall back to text-based detection
@@ -734,23 +883,18 @@ class MainActivity : AppCompatActivity() {
 
                 // Fallback: detect language from the transcribed text itself
                 // This covers devices where EXTRA_LANGUAGE is missing from results Bundle
-                val finalLocale = detectedLocale ?: detectLocaleFromText(bestMatch ?: "")
+                val finalLocale = detectedLocale ?: detectLocaleFromText(bestMatch)
 
-                if (!bestMatch.isNullOrBlank()) {
-                    Log.i(TAG, "onResults: \"$bestMatch\" lang=$finalLocale (bundle=$detectedLang)")
-                    CrashLogFile.log(TAG, "Speech result: \"$bestMatch\" lang=$finalLocale")
-                    onSpeechResult?.invoke(bestMatch, finalLocale)
-                } else {
-                    Log.d(TAG, "onResults: empty — no speech recognized, silently restarting mic")
-                    onPartialSpeechResult?.invoke("")
-                    mainHandler.postDelayed({ startListeningSafely() }, 300L)
-                }
+                Log.i(TAG, "onResults: \"$bestMatch\" lang=$finalLocale (bundle=$detectedLang)")
+                CrashLogFile.log(TAG, "Speech result: \"$bestMatch\" lang=$finalLocale")
+                onSpeechResult?.invoke(bestMatch, finalLocale)
             }
 
             override fun onPartialResults(partialResults: Bundle?) {
                 val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                 val partial = matches?.firstOrNull()
                 if (!partial.isNullOrBlank()) {
+                    lastPartialText = partial
                     Log.d(TAG, "onPartialResults: \"$partial\"")
                     onPartialSpeechResult?.invoke(partial)
                 }
@@ -762,5 +906,18 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val TAG = "MainActivity"
+
+        // ── Tier 1: Noise Robustness ──────────────────────────────
+        /** L1: restart delays after failed recognition cycles (ms). */
+        private val RETRY_RAMP_MS = longArrayOf(300L, 1000L, 3000L, 8000L)
+
+        /** L3: consecutive rejected chatter cycles before pausing listening. */
+        private const val NOISE_DETECTION_THRESHOLD = 5
+
+        /** L2: reject transcriptions below this confidence (0.0–1.0). */
+        private const val MIN_CONFIDENCE = 0.35f
+
+        /** L2: reject one-word results shorter than this ("yeah", "okay"). */
+        private const val MIN_SINGLE_WORD_CHARS = 5
     }
 }

@@ -1,0 +1,845 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Vyze — Play Store Screenshots</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;900&family=Plus+Jakarta+Sans:wght@500;700;800&display=swap');
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: #111111;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 60px;
+    padding: 60px 20px;
+    font-family: 'Plus Jakarta Sans', 'Inter', sans-serif;
+  }
+
+  .page-title {
+    color: #fff;
+    font-size: 14px;
+    text-transform: uppercase;
+    letter-spacing: 4px;
+    opacity: 0.4;
+  }
+
+  /* ── Screenshot Card ─────────────────────── */
+  .screenshot-card {
+    width: 1080px;
+    height: 1920px;
+    position: relative;
+    overflow: hidden;
+    border-radius: 24px;
+    flex-shrink: 0;
+  }
+
+  /* ── Background Variants ─────────────────── */
+  .bg-hero {
+    background: linear-gradient(165deg, #0A0A0A 0%, #1A1A2E 40%, #16213E 100%);
+  }
+  .bg-warm {
+    background: linear-gradient(165deg, #1A0A0A 0%, #2E1515 40%, #1A0F0F 100%);
+  }
+  .bg-teal {
+    background: linear-gradient(165deg, #0A1A1A 0%, #0F2A2A 40%, #0A1F1F 100%);
+  }
+  .bg-purple {
+    background: linear-gradient(165deg, #12081E 0%, #1E1030 40%, #150D22 100%);
+  }
+  .bg-gold {
+    background: linear-gradient(165deg, #1A1508 0%, #2E2510 40%, #1F1A0A 100%);
+  }
+  .bg-brand {
+    background: linear-gradient(165deg, #1A0A0D 0%, #2E1015 40%, #200A0F 100%);
+  }
+
+  /* ── Floating Dots (ambient brand element) ── */
+  .dots {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    overflow: hidden;
+  }
+  .dot {
+    position: absolute;
+    border-radius: 50%;
+    opacity: 0.08;
+  }
+  .dot-red { background: #CE2028; }
+  .dot-yellow { background: #FBD10A; }
+
+  /* ── Content Layout ─────────────────────── */
+  .card-content {
+    position: relative;
+    z-index: 2;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 100px 80px 80px;
+    height: 100%;
+  }
+
+  /* ── Headline ───────────────────────────── */
+  .headline {
+    font-size: 72px;
+    font-weight: 800;
+    color: #FFFFFF;
+    text-align: center;
+    line-height: 1.1;
+    letter-spacing: -1px;
+    margin-bottom: 16px;
+  }
+  .headline .accent-red { color: #CE2028; }
+  .headline .accent-yellow { color: #FBD10A; }
+  .headline .accent-teal { color: #00B4C5; }
+
+  .subheadline {
+    font-size: 34px;
+    font-weight: 500;
+    color: rgba(255,255,255,0.5);
+    text-align: center;
+    margin-bottom: 60px;
+    max-width: 800px;
+  }
+
+  /* ── Phone Mockup ─────────────────────── */
+  .phone-frame {
+    width: 640px;
+    height: 1280px;
+    background: #000;
+    border-radius: 56px;
+    border: 4px solid rgba(255,255,255,0.12);
+    overflow: hidden;
+    position: relative;
+    box-shadow:
+      0 0 0 2px rgba(255,255,255,0.05),
+      0 40px 120px rgba(0,0,0,0.6),
+      inset 0 0 80px rgba(0,0,0,0.3);
+    flex-shrink: 0;
+  }
+
+  .phone-notch {
+    position: absolute;
+    top: 0;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 180px;
+    height: 32px;
+    background: #000;
+    border-radius: 0 0 20px 20px;
+    z-index: 10;
+  }
+
+  .phone-screen {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    position: relative;
+  }
+
+  /* ── Screen UI Mocks ──────────────────── */
+
+  /* Screen 1: Scene Description */
+  .screen-camera {
+    background: linear-gradient(180deg, #1a2a1a 0%, #0d1a0d 100%);
+    position: relative;
+  }
+  .camera-viewfinder {
+    flex: 1;
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .viewfinder-grid {
+    width: 100%;
+    height: 100%;
+    position: absolute;
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    grid-template-rows: 1fr 1fr 1fr;
+    gap: 1px;
+  }
+  .viewfinder-grid div {
+    border: 1px solid rgba(255,255,255,0.08);
+  }
+  .viewfinder-crosshair {
+    width: 80px;
+    height: 80px;
+    border: 2px solid rgba(255,255,255,0.3);
+    border-radius: 50%;
+    position: relative;
+  }
+  .viewfinder-crosshair::before,
+  .viewfinder-crosshair::after {
+    content: '';
+    position: absolute;
+    background: rgba(255,255,255,0.3);
+  }
+  .viewfinder-crosshair::before {
+    width: 2px;
+    height: 20px;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+  }
+  .viewfinder-crosshair::after {
+    width: 20px;
+    height: 2px;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+  }
+  .camera-label {
+    position: absolute;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(0,180,197,0.9);
+    color: #fff;
+    padding: 10px 24px;
+    border-radius: 30px;
+    font-size: 18px;
+    font-weight: 600;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+  }
+
+  /* TTS Output Bar */
+  .tts-bar {
+    background: rgba(0,0,0,0.85);
+    backdrop-filter: blur(20px);
+    padding: 28px 32px;
+    border-top: 1px solid rgba(255,255,255,0.08);
+  }
+  .tts-indicator {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 12px;
+  }
+  .tts-wave {
+    display: flex;
+    gap: 3px;
+    align-items: center;
+  }
+  .tts-wave span {
+    width: 4px;
+    background: #00B4C5;
+    border-radius: 2px;
+    animation: wave 0.8s ease-in-out infinite;
+  }
+  .tts-wave span:nth-child(1) { height: 12px; animation-delay: 0s; }
+  .tts-wave span:nth-child(2) { height: 20px; animation-delay: 0.1s; }
+  .tts-wave span:nth-child(3) { height: 14px; animation-delay: 0.2s; }
+  .tts-wave span:nth-child(4) { height: 24px; animation-delay: 0.3s; }
+  .tts-wave span:nth-child(5) { height: 16px; animation-delay: 0.4s; }
+  .tts-wave span:nth-child(6) { height: 10px; animation-delay: 0.5s; }
+  @keyframes wave {
+    0%, 100% { transform: scaleY(0.5); }
+    50% { transform: scaleY(1.2); }
+  }
+  .tts-label {
+    color: #00B4C5;
+    font-size: 16px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+  }
+  .tts-text {
+    color: #fff;
+    font-size: 26px;
+    line-height: 1.5;
+    font-weight: 500;
+  }
+
+  /* Screen 2: OCR / Text Reading */
+  .screen-ocr {
+    background: #FAFAFA;
+  }
+  .ocr-header {
+    background: #fff;
+    padding: 48px 28px 20px;
+    border-bottom: 1px solid #E5E5E5;
+  }
+  .ocr-header-title {
+    font-size: 16px;
+    font-weight: 600;
+    color: #999;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+  }
+  .ocr-card {
+    margin: 32px 28px;
+    background: #fff;
+    border-radius: 20px;
+    padding: 36px;
+    box-shadow: 0 2px 20px rgba(0,0,0,0.06);
+  }
+  .ocr-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: #E8F5E9;
+    color: #2E7D32;
+    padding: 6px 14px;
+    border-radius: 20px;
+    font-size: 14px;
+    font-weight: 600;
+    margin-bottom: 20px;
+  }
+  .ocr-badge::before {
+    content: '✓';
+    font-size: 12px;
+  }
+  .ocr-text-block {
+    font-size: 22px;
+    color: #1A1A1A;
+    line-height: 1.8;
+    font-weight: 500;
+  }
+  .ocr-text-block .highlight {
+    background: #FFF3CD;
+    padding: 2px 6px;
+    border-radius: 4px;
+  }
+  .ocr-warning {
+    margin-top: 24px;
+    padding: 20px;
+    background: #FFF3E0;
+    border-radius: 12px;
+    border-left: 4px solid #FF9800;
+  }
+  .ocr-warning-title {
+    font-size: 16px;
+    font-weight: 700;
+    color: #E65100;
+    margin-bottom: 6px;
+  }
+  .ocr-warning-text {
+    font-size: 16px;
+    color: #BF360C;
+    line-height: 1.5;
+  }
+
+  /* Screen 3: Multilingual */
+  .screen-lang {
+    background: #0A0A0A;
+    display: flex;
+    flex-direction: column;
+  }
+  .lang-header {
+    padding: 48px 32px 24px;
+    text-align: center;
+  }
+  .lang-title {
+    font-size: 36px;
+    font-weight: 800;
+    color: #fff;
+  }
+  .lang-bubbles {
+    flex: 1;
+    padding: 20px 28px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    justify-content: center;
+  }
+  .lang-bubble {
+    display: flex;
+    gap: 16px;
+    align-items: flex-end;
+  }
+  .lang-bubble.right {
+    flex-direction: row-reverse;
+  }
+  .lang-avatar {
+    width: 44px;
+    height: 44px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 20px;
+    flex-shrink: 0;
+  }
+  .lang-avatar.user { background: #333; }
+  .lang-avatar.ai { background: linear-gradient(135deg, #CE2028, #FBD10A); }
+  .lang-msg {
+    padding: 18px 24px;
+    border-radius: 20px;
+    font-size: 22px;
+    line-height: 1.5;
+    max-width: 75%;
+    font-weight: 500;
+  }
+  .lang-msg.user { background: #1E1E1E; color: #fff; }
+  .lang-msg.ai { background: #1A2A2A; color: #7FDBDA; }
+  .lang-flag {
+    display: inline-block;
+    margin-left: 8px;
+    font-size: 18px;
+  }
+
+  /* Screen 4: Flashlight */
+  .screen-dark {
+    background: #000;
+    position: relative;
+    overflow: hidden;
+  }
+  .torch-beam {
+    position: absolute;
+    top: 15%;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 400px;
+    height: 600px;
+    background: radial-gradient(ellipse at center top,
+      rgba(255,248,220,0.35) 0%,
+      rgba(255,248,220,0.15) 30%,
+      rgba(255,248,220,0.05) 60%,
+      transparent 100%);
+    clip-path: polygon(35% 0%, 65% 0%, 90% 100%, 10% 100%);
+  }
+  .dark-content {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    padding: 40px 32px;
+    background: linear-gradient(transparent, rgba(0,0,0,0.95));
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 20px;
+  }
+  .torch-icon {
+    width: 80px;
+    height: 80px;
+    border-radius: 50%;
+    background: rgba(255,200,0,0.2);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 40px;
+  }
+  .torch-status {
+    font-size: 28px;
+    font-weight: 700;
+    color: #FFC800;
+  }
+  .torch-desc {
+    font-size: 22px;
+    color: rgba(255,255,255,0.5);
+    text-align: center;
+    line-height: 1.5;
+  }
+
+  /* Screen 5: Privacy */
+  .screen-privacy {
+    background: #0A0A0A;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 60px 48px;
+  }
+  .privacy-shield {
+    width: 160px;
+    height: 160px;
+    background: linear-gradient(135deg, rgba(206,32,40,0.15), rgba(251,209,10,0.15));
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 80px;
+    margin-bottom: 48px;
+    border: 2px solid rgba(206,32,40,0.2);
+  }
+  .privacy-items {
+    display: flex;
+    flex-direction: column;
+    gap: 28px;
+    width: 100%;
+  }
+  .privacy-item {
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    padding: 24px 28px;
+    background: rgba(255,255,255,0.04);
+    border-radius: 16px;
+    border: 1px solid rgba(255,255,255,0.06);
+  }
+  .privacy-check {
+    width: 36px;
+    height: 36px;
+    background: rgba(46,125,50,0.2);
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #4CAF50;
+    font-size: 18px;
+    font-weight: 700;
+    flex-shrink: 0;
+  }
+  .privacy-item-text {
+    font-size: 24px;
+    color: rgba(255,255,255,0.8);
+    font-weight: 500;
+  }
+
+  /* Screen 6: Continuous Mode */
+  .screen-continuous {
+    background: linear-gradient(180deg, #0d1a0d 0%, #1a2a1a 50%, #0d1a0d 100%);
+    position: relative;
+  }
+  .continuous-header {
+    padding: 48px 32px 24px;
+    text-align: center;
+    position: relative;
+    z-index: 2;
+  }
+  .continuous-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    background: rgba(0,180,197,0.15);
+    border: 1px solid rgba(0,180,197,0.3);
+    padding: 8px 20px;
+    border-radius: 30px;
+    color: #00B4C5;
+    font-size: 16px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+  }
+  .pulse-dot {
+    width: 8px;
+    height: 8px;
+    background: #00B4C5;
+    border-radius: 50%;
+    animation: pulse 1.5s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.5; transform: scale(1.5); }
+  }
+  .continuous-feed {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 24px;
+    padding: 20px 32px;
+    position: relative;
+    z-index: 2;
+  }
+  .feed-item {
+    background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 16px;
+    padding: 24px 28px;
+  }
+  .feed-item.active {
+    border-color: rgba(0,180,197,0.3);
+    background: rgba(0,180,197,0.06);
+  }
+  .feed-time {
+    font-size: 14px;
+    color: rgba(255,255,255,0.3);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 8px;
+  }
+  .feed-text {
+    font-size: 22px;
+    color: rgba(255,255,255,0.8);
+    line-height: 1.5;
+    font-weight: 500;
+  }
+  .feed-item.active .feed-text { color: #7FDBDA; }
+</style>
+</head>
+<body>
+
+<div class="page-title">Vyze — Play Store Screenshot Set (1080 × 1920)</div>
+
+<!-- ═══════════════════════════════════════════
+     SCREEN 1 — Hero / Scene Description
+     ═══════════════════════════════════════════ -->
+<div class="screenshot-card bg-hero" id="screen1">
+  <div class="dots">
+    <div class="dot dot-red" style="width:120px;height:120px;top:8%;right:10%;"></div>
+    <div class="dot dot-yellow" style="width:80px;height:80px;top:15%;left:8%;"></div>
+    <div class="dot dot-red" style="width:60px;height:60px;bottom:25%;right:5%;"></div>
+    <div class="dot dot-yellow" style="width:100px;height:100px;bottom:10%;left:15%;"></div>
+  </div>
+  <div class="card-content">
+    <div class="headline">
+      Point. Listen.<br><span class="accent-teal">Know.</span>
+    </div>
+    <div class="subheadline">
+      Instant scene descriptions powered by AI — completely offline.
+    </div>
+    <div class="phone-frame">
+      <div class="phone-notch"></div>
+      <div class="phone-screen">
+        <div class="screen-camera">
+          <div class="camera-viewfinder">
+            <div class="viewfinder-grid">
+              <div></div><div></div><div></div>
+              <div></div><div></div><div></div>
+              <div></div><div></div><div></div>
+            </div>
+            <div class="viewfinder-crosshair"></div>
+            <div class="camera-label">◉ SCANNING</div>
+          </div>
+          <div class="tts-bar">
+            <div class="tts-indicator">
+              <div class="tts-wave">
+                <span></span><span></span><span></span><span></span><span></span><span></span>
+              </div>
+              <div class="tts-label">Speaking</div>
+            </div>
+            <div class="tts-text">
+              Wooden chair, center, about 2 steps ahead. Table to your left with a red cup.
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════
+     SCREEN 2 — Read Any Text (OCR)
+     ═══════════════════════════════════════════ -->
+<div class="screenshot-card bg-warm" id="screen2">
+  <div class="dots">
+    <div class="dot dot-yellow" style="width:100px;height:100px;top:5%;left:12%;"></div>
+    <div class="dot dot-red" style="width:70px;height:70px;top:20%;right:8%;"></div>
+  </div>
+  <div class="card-content">
+    <div class="headline">
+      Read <span class="accent-red">Any</span> Label
+    </div>
+    <div class="subheadline">
+      Medicine, food, documents — Vyze reads them all aloud instantly.
+    </div>
+    <div class="phone-frame">
+      <div class="phone-notch"></div>
+      <div class="phone-screen">
+        <div class="screen-ocr">
+          <div class="ocr-header">
+            <div class="ocr-header-title">Medicine Reader</div>
+          </div>
+          <div class="ocr-card">
+            <div class="ocr-badge">Text Recognized</div>
+            <div class="ocr-text-block">
+              <strong>DICLAC RETARD</strong><br>
+              Diclofenac sodium <span class="highlight">100mg</span><br>
+              Modified-release tablet<br><br>
+              Take <span class="highlight">one tablet daily</span><br>
+              after meals.
+            </div>
+            <div class="ocr-warning">
+              <div class="ocr-warning-title">⚠ Warning</div>
+              <div class="ocr-warning-text">Avoid if allergic to NSAIDs. Take after food to prevent stomach irritation.</div>
+            </div>
+          </div>
+          <div style="padding:0 28px;">
+            <div class="ocr-card" style="margin:0;">
+              <div style="font-size:16px;color:#666;margin-bottom:8px;">Also read in:</div>
+              <div style="display:flex;gap:12px;">
+                <span style="padding:8px 16px;background:#F5F5F5;border-radius:20px;font-size:16px;font-weight:600;color:#333;">Bahasa Melayu</span>
+                <span style="padding:8px 16px;background:#F5F5F5;border-radius:20px;font-size:16px;font-weight:600;color:#333;">中文</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════
+     SCREEN 3 — Your Language
+     ═══════════════════════════════════════════ -->
+<div class="screenshot-card bg-teal" id="screen3">
+  <div class="dots">
+    <div class="dot dot-yellow" style="width:90px;height:90px;top:10%;right:15%;"></div>
+    <div class="dot dot-red" style="width:110px;height:110px;bottom:15%;left:10%;"></div>
+  </div>
+  <div class="card-content">
+    <div class="headline">
+      Your Language,<br><span class="accent-yellow">Your Way.</span>
+    </div>
+    <div class="subheadline">
+      Speak in English, Bahasa Melayu, or Chinese — Vyze understands and replies in your language.
+    </div>
+    <div class="phone-frame">
+      <div class="phone-notch"></div>
+      <div class="phone-screen">
+        <div class="screen-lang">
+          <div class="lang-header">
+            <div class="lang-title">Language Mirror</div>
+          </div>
+          <div class="lang-bubbles">
+            <div class="lang-bubble right">
+              <div class="lang-avatar user">👤</div>
+              <div class="lang-msg user">Apa ini? <span class="lang-flag">🇲🇾</span></div>
+            </div>
+            <div class="lang-bubble">
+              <div class="lang-avatar ai">V</div>
+              <div class="lang-msg ai">Ini kerusi kayu, di hadapan anda, kira-kira dua langkah. <span class="lang-flag">🇲🇾</span></div>
+            </div>
+            <div class="lang-bubble right" style="margin-top:24px;">
+              <div class="lang-avatar user">👤</div>
+              <div class="lang-msg user">这是什么？ <span class="lang-flag">🇨🇳</span></div>
+            </div>
+            <div class="lang-bubble">
+              <div class="lang-avatar ai">V</div>
+              <div class="lang-msg ai">这是一把木椅，在您前方大约两步远的地方。 <span class="lang-flag">🇨🇳</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════
+     SCREEN 4 — Auto Flashlight
+     ═══════════════════════════════════════════ -->
+<div class="screenshot-card bg-gold" id="screen4">
+  <div class="dots">
+    <div class="dot dot-yellow" style="width:140px;height:140px;top:8%;left:50%;transform:translateX(-50%);opacity:0.12;"></div>
+  </div>
+  <div class="card-content">
+    <div class="headline">
+      Never in the <span class="accent-yellow">Dark.</span>
+    </div>
+    <div class="subheadline">
+      Vyze auto-detects low light and turns on your flashlight — zero interaction needed.
+    </div>
+    <div class="phone-frame">
+      <div class="phone-notch"></div>
+      <div class="phone-screen">
+        <div class="screen-dark">
+          <div class="torch-beam"></div>
+          <div class="dark-content">
+            <div class="torch-icon">🔦</div>
+            <div class="torch-status">Flashlight On</div>
+            <div class="torch-desc">Environment is dark.<br>Flashlight activated automatically.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════
+     SCREEN 5 — 100% Private / Offline
+     ═══════════════════════════════════════════ -->
+<div class="screenshot-card bg-purple" id="screen5">
+  <div class="dots">
+    <div class="dot dot-red" style="width:100px;height:100px;top:12%;right:12%;"></div>
+    <div class="dot dot-yellow" style="width:70px;height:70px;bottom:20%;left:8%;"></div>
+  </div>
+  <div class="card-content">
+    <div class="headline">
+      100% <span class="accent-red">Private.</span>
+    </div>
+    <div class="subheadline">
+      Everything runs on your device. No internet. No data collection. No accounts.
+    </div>
+    <div class="phone-frame">
+      <div class="phone-notch"></div>
+      <div class="phone-screen">
+        <div class="screen-privacy">
+          <div class="privacy-shield">🛡️</div>
+          <div style="font-size:32px;font-weight:800;color:#fff;margin-bottom:40px;text-align:center;">Your Data Stays Yours</div>
+          <div class="privacy-items">
+            <div class="privacy-item">
+              <div class="privacy-check">✓</div>
+              <div class="privacy-item-text">Runs 100% offline on-device</div>
+            </div>
+            <div class="privacy-item">
+              <div class="privacy-check">✓</div>
+              <div class="privacy-item-text">No internet connection required</div>
+            </div>
+            <div class="privacy-item">
+              <div class="privacy-check">✓</div>
+              <div class="privacy-item-text">No accounts or sign-ups</div>
+            </div>
+            <div class="privacy-item">
+              <div class="privacy-check">✓</div>
+              <div class="privacy-item-text">No data sent to any server</div>
+            </div>
+            <div class="privacy-item">
+              <div class="privacy-check">✓</div>
+              <div class="privacy-item-text">Camera images never leave your phone</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════
+     SCREEN 6 — Continuous Mode
+     ═══════════════════════════════════════════ -->
+<div class="screenshot-card bg-brand" id="screen6">
+  <div class="dots">
+    <div class="dot dot-yellow" style="width:80px;height:80px;top:10%;left:20%;"></div>
+    <div class="dot dot-red" style="width:60px;height:60px;top:25%;right:10%;"></div>
+    <div class="dot dot-yellow" style="width:100px;height:100px;bottom:15%;left:5%;"></div>
+  </div>
+  <div class="card-content">
+    <div class="headline">
+      Your AI<br><span class="accent-teal">Companion.</span>
+    </div>
+    <div class="subheadline">
+      Enable continuous mode for hands-free, real-time scene narration as you move.
+    </div>
+    <div class="phone-frame">
+      <div class="phone-notch"></div>
+      <div class="phone-screen">
+        <div class="screen-continuous">
+          <div class="continuous-header">
+            <div class="continuous-badge">
+              <div class="pulse-dot"></div>
+              Live Describing
+            </div>
+          </div>
+          <div class="continuous-feed">
+            <div class="feed-item">
+              <div class="feed-time">Just now</div>
+              <div class="feed-text">Hallway, about 4 steps to a closed door. Handle on the right side.</div>
+            </div>
+            <div class="feed-item">
+              <div class="feed-time">4 sec ago</div>
+              <div class="feed-text">Kitchen counter ahead. Objects: kettle on left, bottles on right.</div>
+            </div>
+            <div class="feed-item active">
+              <div class="feed-time">Live</div>
+              <div class="feed-text">Entering living room. Sofa to your left. Clear path forward for 3 steps.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>

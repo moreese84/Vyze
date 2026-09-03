@@ -206,13 +206,13 @@ class VlmEngineManager(
             // NPU is skipped — the Gemma 4 E2B generic model does not ship with
             // TF_LITE_PREFILL_DECODE for NPU, so NPU init always fails and
             // wastes 5-10s on mid-tier Dimensity/Snapdragon devices.
-            onStepProgress?.invoke(30, "Loading model weights into GPU...")
+            onStepProgress?.invoke(30, "Opening my eyes...")
             CrashLogFile.log(TAG, "Step 2: Initializing GPU backend...")
 
             val gpuSuccess = tryInitializeWithBackend(modelFile, Backend.GPU(), "GPU")
             if (gpuSuccess) {
                 // GPU warm-up — pre-compile OpenCL/Vulkan kernels
-                onStepProgress?.invoke(75, "Warming up GPU kernels (this takes a moment)...")
+                onStepProgress?.invoke(75, "Sharpening my focus (this takes a moment)...")
                 CrashLogFile.log(TAG, "Step 3: GPU warm-up (dummy inference)...")
                 warmUp()
 
@@ -250,7 +250,7 @@ class VlmEngineManager(
         backendName: String
     ): Boolean {
         CrashLogFile.log(TAG, "Trying $backendName backend...")
-        onStepProgress?.invoke(35, "Creating $backendName engine instance...")
+        onStepProgress?.invoke(35, "Preparing my vision...")
 
         var eng: Engine? = null
         try {
@@ -264,7 +264,7 @@ class VlmEngineManager(
             CrashLogFile.log(TAG, "EngineConfig created [$backendName] — creating Engine...")
             eng = Engine(engineConfig)
 
-            onStepProgress?.invoke(45, "Loading ${modelFile.length() / (1024 * 1024)}MB model into ${backendName}...")
+            onStepProgress?.invoke(45, "Getting my vision ready...")
             CrashLogFile.log(TAG, "Engine created [$backendName] — calling initialize()...")
             eng.initialize()
 

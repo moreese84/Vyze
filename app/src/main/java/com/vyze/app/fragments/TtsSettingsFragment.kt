@@ -56,6 +56,12 @@ class TtsSettingsFragment : Fragment() {
     private lateinit var sliderVolume: SeekBar
     private lateinit var btnTestVoice: Button
 
+    // Voice picker views
+    private lateinit var valueVoice: TextView
+    private lateinit var btnVoicePrev: Button
+    private lateinit var btnVoiceUse: Button
+    private lateinit var btnVoiceNext: Button
+
     // P2 views
     private lateinit var valueNightMode: TextView
     private lateinit var spinnerNightMode: Spinner
@@ -98,6 +104,10 @@ class TtsSettingsFragment : Fragment() {
         valueVolume = view.findViewById(R.id.value_volume)
         sliderVolume = view.findViewById(R.id.slider_volume)
         btnTestVoice = view.findViewById(R.id.btn_test_voice)
+        valueVoice = view.findViewById(R.id.value_voice)
+        btnVoicePrev = view.findViewById(R.id.btn_voice_prev)
+        btnVoiceUse = view.findViewById(R.id.btn_voice_use)
+        btnVoiceNext = view.findViewById(R.id.btn_voice_next)
 
         // Load saved values and set initial positions
         loadSavedSettings()
@@ -108,6 +118,7 @@ class TtsSettingsFragment : Fragment() {
         setupPitchSlider()
         setupVolumeSlider()
         setupTestButton()
+        setupVoicePicker()
 
         // P2 views
         valueNightMode = view.findViewById(R.id.value_night_mode)
@@ -278,6 +289,8 @@ class TtsSettingsFragment : Fragment() {
                 if (selectedKey != currentKey) {
                     ttsManager.setLanguage(selectedKey, requireContext())
                     valueLanguage.text = languageDisplayName(selectedKey)
+                    // Voices differ per language — rebuild the picker list
+                    refreshVoiceChoices()
                     speakSample()
                 }
             }
@@ -300,12 +313,74 @@ class TtsSettingsFragment : Fragment() {
      * Speaks a sample phrase so the user can hear the current TTS settings.
      */
     private fun speakSample() {
-        val phrase = when (ttsManager.getCurrentLanguageKey()) {
-            TTSManager.LANGUAGE_MALAY  -> SAMPLE_PHRASE_MS
-            TTSManager.LANGUAGE_CHINESE -> SAMPLE_PHRASE_ZH
-            else           -> SAMPLE_PHRASE_EN
+        ttsManager.speakImmediate(samplePhraseForLanguage())
+    }
+
+    private fun samplePhraseForLanguage(): String = when (ttsManager.getCurrentLanguageKey()) {
+        TTSManager.LANGUAGE_MALAY  -> SAMPLE_PHRASE_MS
+        TTSManager.LANGUAGE_CHINESE -> SAMPLE_PHRASE_ZH
+        else           -> SAMPLE_PHRASE_EN
+    }
+
+    // ── Voice Picker (Tier 1) ──────────────────────────────────────────
+
+    /** Installed voices for the current language. Index 0 = automatic. */
+    private val voiceChoices = ArrayList<android.speech.tts.Voice>()
+    private var voiceIndex = 0
+
+    private fun setupVoicePicker() {
+        btnVoicePrev.setOnClickListener { stepVoice(-1) }
+        btnVoiceNext.setOnClickListener { stepVoice(+1) }
+        btnVoiceUse.setOnClickListener { useCurrentVoice() }
+        refreshVoiceChoices()
+    }
+
+    /** Rebuild the voice list for the current language and reset to automatic. */
+    private fun refreshVoiceChoices() {
+        voiceChoices.clear()
+        voiceChoices.addAll(ttsManager.getInstalledVoicesForCurrentLanguage())
+        voiceIndex = 0 // 0 = automatic (best available)
+        updateVoiceLabel()
+    }
+
+    private fun updateVoiceLabel() {
+        valueVoice.text = if (voiceIndex == 0) {
+            requireContext().getString(R.string.tts_voice_automatic)
+        } else {
+            voiceChoices[voiceIndex - 1].name
         }
-        ttsManager.speakImmediate(phrase)
+    }
+
+    /** Move to the next/previous voice and audition it (sample in that voice). */
+    private fun stepVoice(delta: Int) {
+        val total = voiceChoices.size + 1 // +1 for the automatic entry
+        voiceIndex = ((voiceIndex + delta) % total + total) % total
+
+        if (voiceIndex == 0) {
+            ttsManager.setVoiceByName(TTSManager.VOICE_AUTO)
+        } else {
+            ttsManager.setVoiceByName(voiceChoices[voiceIndex - 1].name)
+        }
+        updateVoiceLabel()
+
+        // Audition: the sample speaks in the candidate voice itself
+        val phrase = samplePhraseForLanguage()
+        val announcement = if (voiceIndex == 0) {
+            "$phrase Automatic voice, best available quality."
+        } else {
+            "$phrase Voice ${voiceIndex} of ${voiceChoices.size}."
+        }
+        ttsManager.speakImmediate(announcement)
+    }
+
+    /** Persist the currently auditioned voice (automatic or a specific one). */
+    private fun useCurrentVoice() {
+        val name = if (voiceIndex == 0) TTSManager.VOICE_AUTO else voiceChoices[voiceIndex - 1].name
+        prefs.edit().putString(TTSManager.KEY_VOICE_NAME, name).apply()
+        updateVoiceLabel()
+        ttsManager.speakImmediate(
+            if (voiceIndex == 0) "Automatic voice selected." else "Voice selected."
+        )
     }
 
     /**
