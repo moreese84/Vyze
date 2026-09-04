@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Vyze — Technical Whitepaper</title>
+<style>
+@page { size: A4; margin: 16mm 15mm 18mm 15mm; }
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+
+body {
+  font-family: "Segoe UI", "Helvetica Neue", Arial, "Microsoft YaHei", sans-serif;
+  font-size: 10pt;
+  line-height: 1.55;
+  color: #1b1b1f;
+  -webkit-print-color-adjust: exact;
+  print-color-adjust: exact;
+}
+
+/* ── Cover ─────────────────────────────────────────── */
+.cover {
+  height: 256mm;
+  page-break-after: always;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+.cover .dots { position: absolute; top: 0; left: 0; right: 0; height: 90mm; overflow: hidden; }
+.cover .dot { position: absolute; border-radius: 50%; }
+.cover .dot-red { background: #CE2028; }
+.cover .dot-yellow { background: #FBD10A; }
+.cover-main { flex: 1; display: flex; flex-direction: column; justify-content: center; }
+.wordmark {
+  font-size: 15pt; font-weight: 800; letter-spacing: 10px; color: #111;
+  margin-bottom: 6mm; display: flex; align-items: center; gap: 2mm;
+}
+.wordmark .sw { width: 3.2mm; height: 3.2mm; border-radius: 50%; display: inline-block; }
+.sw-red { background: #CE2028; }
+.sw-yellow { background: #FBD10A; }
+.cover h1 {
+  font-size: 33pt; line-height: 1.08; margin: 0 0 7mm 0;
+  letter-spacing: -0.5px; color: #0d0d0f; font-weight: 800;
+}
+.cover h1 .amp { color: #CE2028; }
+.cover .tagline {
+  font-size: 13.5pt; color: #444; max-width: 150mm;
+  line-height: 1.5; margin: 0 0 14mm 0; font-weight: 400;
+}
+.cover .rule { height: 1.1mm; width: 32mm; background: #CE2028; margin-bottom: 10mm; }
+.facts { width: 100%; border-collapse: collapse; }
+.facts td {
+  padding: 3.1mm 0; border-bottom: 0.35pt solid #e2e2e6;
+  vertical-align: top; font-size: 10.5pt;
+}
+.facts td.k {
+  width: 34mm; color: #777; text-transform: uppercase;
+  font-size: 8pt; font-weight: 700; letter-spacing: 1.6px; padding-top: 3.6mm;
+}
+.facts tr:last-child td { border-bottom: none; }
+.cover-foot { margin-top: 10mm; font-size: 9pt; color: #999; letter-spacing: 0.4px; }
+
+/* ── Body ──────────────────────────────────────────── */
+main { }
+h2 {
+  font-size: 15.5pt; color: #101014; margin: 9mm 0 3.5mm 0;
+  padding-bottom: 1.8mm; border-bottom: 0.6pt solid #d8d8de;
+  break-after: avoid; page-break-after: avoid;
+}
+h2 .no { color: #CE2028; }
+h3 {
+  font-size: 12pt; color: #202024; margin: 6mm 0 2.2mm 0;
+  break-after: avoid; page-break-after: avoid;
+}
+p { margin: 0 0 3mm 0; }
+ul, ol { margin: 0 0 3mm 0; padding-left: 6.5mm; }
+li { margin-bottom: 1.4mm; }
+li > ul, li > ol { margin-top: 1.4mm; }
+code {
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 8.7pt; background: #f1f1f4; border-radius: 2pt;
+  padding: 0.3pt 2.5pt; color: #111;
+}
+pre {
+  background: #f6f6f8; border: 0.5pt solid #e3e3e8; border-left: 2.5pt solid #d8d8de;
+  border-radius: 3pt; padding: 4mm 5mm; overflow: hidden;
+  break-inside: avoid; page-break-inside: avoid;
+  margin: 3.5mm 0;
+}
+pre code { background: none; padding: 0; font-size: 8.4pt; }
+pre.art {
+  font-family: Consolas, "Cascadia Mono", "MS Gothic", "Segoe UI Symbol", monospace;
+  font-size: 7.8pt; line-height: 1.3; letter-spacing: 0.2px;
+}
+pre.art code { font-size: 7.8pt; }
+table { width: 100%; border-collapse: collapse; margin: 3.5mm 0 4.5mm 0; font-size: 9.3pt; }
+th {
+  text-align: left; background: #f0f0f3; color: #0d0d0f;
+  font-weight: 700; padding: 2.2mm 3mm; border-bottom: 0.9pt solid #c9c9d2;
+  font-size: 8.6pt; text-transform: uppercase; letter-spacing: 0.8px;
+}
+td { padding: 2mm 3mm; border-bottom: 0.35pt solid #e0e0e5; vertical-align: top; }
+tr { break-inside: avoid; page-break-inside: avoid; }
+tbody tr:nth-child(even) { background: #fafafc; }
+blockquote {
+  margin: 3.5mm 0 4mm 0; padding: 2.5mm 5mm; background: #fbf4f4;
+  border-left: 2.5pt solid #CE2028; border-radius: 0 3pt 3pt 0;
+  color: #333; font-style: italic; break-inside: avoid;
+}
+strong { color: #0d0d0f; }
+</style>
+</head>
+<body>
+
+<section class="cover">
+  <div class="dots">
+    <div class="dot dot-red" style="width:14mm;height:14mm;top:8mm;right:30mm;"></div>
+    <div class="dot dot-yellow" style="width:9mm;height:9mm;top:20mm;right:16mm;"></div>
+    <div class="dot dot-yellow" style="width:6mm;height:6mm;bottom:60mm;left:26mm;"></div>
+    <div class="dot dot-red" style="width:5mm;height:5mm;bottom:110mm;left:8mm;opacity:.5;"></div>
+  </div>
+  <div class="cover-main">
+    <div class="wordmark"><span class="sw sw-red"></span>&nbsp;<span class="sw sw-yellow"></span>&nbsp;VYZE</div>
+    <div class="rule"></div>
+    <h1>Vyze<br><span class="amp">Technical</span> Whitepaper</h1>
+    <p class="tagline">On-Device, Voice-First Visual Assistance for Blind and Low-Vision Users</p>
+    <table class="facts"><tr><td class="k">Product</td><td>Vyze (com.vyze.app)</td></tr><tr><td class="k">Version</td><td>1.0</td></tr><tr><td class="k">Platform</td><td>Android — minSdk 26 (Android 8.0), targetSdk 34, arm64-v8a</td></tr><tr><td class="k">Status</td><td>Production candidate</td></tr></table>
+  </div>
+  <div class="cover-foot">On-device multimodal AI for visual accessibility &nbsp;·&nbsp; September 2026</div>
+</section>
+
+<main><h2><span class="no">1.</span> Abstract</h2>
+<p>Vyze is an Android application that gives blind and low-vision users real-time understanding of the world around them through a <strong>fully offline, on-device multimodal large language model (VLM)</strong>. A user points the phone's camera at a scene, taps once to "look" or double-taps to ask a spoken question, and Vyze describes what it sees in natural language — spoken aloud in the user's own language (English, Bahasa Melayu, or Chinese). Every byte of inference happens on the device: there is no network dependency, no account, and no image ever leaves the phone.</p>
+<p>This document describes the system's architecture, the interaction model, the vision-language inference stack, the speech and audio subsystems, the on-device data layer, and the engineering measures taken for battery life, thermal control, privacy, and reliability.</p>
+<h2><span class="no">2.</span> Problem Statement</h2>
+<p>Visually impaired users navigate the world with assistive technologies that are often <strong>remote-first</strong> (they send images or live video to a human or cloud model), which carries four fundamental problems:</p>
+<ol><li><strong>Privacy</strong> — scenes from a user's home and life are transmitted to a third party.</li><li><strong>Latency &amp; connectivity</strong> — cloud assistance fails in areas with poor coverage and adds round-trip delay to every query.</li><li><strong>Battery &amp; cost</strong> — always-on remote streaming drains the phone and depends on external infrastructure.</li><li><strong>Environmental noise</strong> — hands-free voice interfaces that keep a microphone open in public spaces misfire on surrounding chatter, wasting GPU work and confusing the user.</li></ol>
+<p>A practical assistive device must therefore be <strong>private, instant, offline, battery-conscious, and robust to noisy environments</strong> — while remaining usable by a person who cannot see the screen.</p>
+<h2><span class="no">3.</span> Design Principles</h2>
+<p>The architecture is governed by five principles:</p>
+<table><thead><tr><th>Principle</th><th>Consequence</th></tr></thead><tbody><tr><td><strong>100% on-device</strong></td><td>A 2.59 GB vision-language model runs locally via GPU acceleration. No network permissions are required for core function.</td></tr><tr><td><strong>Tap-first, voice on demand</strong></td><td>The microphone is <strong>closed by default</strong>. The user explicitly opens a voice session (double-tap) or triggers an action with a tap. This eliminates idle-listening battery drain and noise misfires.</td></tr><tr><td><strong>Audible-first UX</strong></td><td>All feedback is spoken or haptic; every screen and control is announced. Gestures — not screen elements — are the primary interaction surface.</td></tr><tr><td><strong>Language mirroring</strong></td><td>Vyze detects the language the user speaks (English, Bahasa Melayu, Chinese) and answers in that language, with per-language TTS voices.</td></tr><tr><td><strong>Graceful degradation</strong></td><td>The system has explicit fallback chains (NPU → GPU, OCR fast-path → full VLM, standard RAM → low-RAM profiles) so mid-range hardware still works.</td></tr></tbody></table>
+<h2><span class="no">4.</span> System Architecture</h2>
+<p>Vyze is a single-module Kotlin application organized into four layers. All components live in the process; there is no server component.</p>
+<pre class="art"><code>┌─────────────────────────────────────────────────────────────────────┐
+│  UI LAYER                                                           │
+│  PermissionsFragment → LoadingFragment → CameraFragment             │
+│  └ GalleryFragment · TtsSettingsFragment (secondary screens)       │
+├─────────────────────────────────────────────────────────────────────┤
+│  ORCHESTRATION                                                      │
+│  MainActivity ─── state machine + voice recognizer lifecycle       │
+│  CameraFragment ─ gesture handling, conversation-window watchdog   │
+│  VyzeCoreController ─ inference orchestration, watchdog, beeps     │
+│  DynamicPromptBuilder ─ prompt assembly + few-shot examples        │
+├─────────────────────────────────────────────────────────────────────┤
+│  DELEGATES &amp; MANAGERS                                               │
+│  CameraSetupDelegate (CameraX preview/capture/luminance/torch)     │
+│  GestureRouter + GestureDetectorHelper                             │
+│  TTSManager · OcrHelper (ML Kit) · ColorAnalyzer                    │
+│  FlashlightManager · HapticManager · ReportManager                 │
+│  BatteryMonitor · AnnouncementCoordinator · BrandDotsView          │
+├─────────────────────────────────────────────────────────────────────┤
+│  INFERENCE &amp; DATA                                                   │
+│  VlmEngineManager (LiteRT-LM / Gemma 4 E2B)                        │
+│  VyzeDatabase (Room): MedicineDao · MemoryDao · InteractionDao     │
+│  ScanDao · ErrorLogDao · EmbeddingEngine · MemoryRepository        │
+└─────────────────────────────────────────────────────────────────────┘</code></pre>
+<h3>4.1 Application lifecycle</h3>
+<p><code>VyzeApplication</code> is the composition root: it initializes the Room database (including pre-population of the medicine knowledge base), installs a <strong>global uncaught-exception handler</strong> that writes crash diagnostics to a local log file, prunes old error logs, and wires the shared <code>VyzeCoreController</code>.</p>
+<p>On launch the user passes through <code>PermissionsFragment</code> (camera + microphone + notifications), then <code>LoadingFragment</code>, where the model file is located and the VLM engine is initialized with spoken progress announcements ("Waking up… Opening my eyes… Getting my vision ready…", plus download/load milestones at 25/50/75/100%). The destination is <code>CameraFragment</code>, the main screen.</p>
+<h3>4.2 Camera screen state machine</h3>
+<p><code>VyzeCoreController</code> drives a small state machine that arbitrates all user actions:</p>
+<pre class="art"><code>            tap / voice query
+IDLE ─────────────────────────▶ ANALYZING ──▶ SPEAKING ──▶ IDLE
+  ▲                                                             │
+  └─────────────────────────────────────────────────────────────┘
+       (conversation window reopens mic ~600 ms after speech)</code></pre>
+<ul><li><strong>IDLE</strong> — camera preview live; microphone <strong>closed</strong>; waiting for a gesture.</li><li><strong>ANALYZING</strong> — a frame is captured and the VLM is running; microphone closed.</li><li><strong>SPEAKING</strong> — the answer is streamed through TTS; microphone closed.</li><li>After speech ends, if a <em>conversation window</em> is active, the mic silently reopens for follow-up questions.</li></ul>
+<h2><span class="no">5.</span> Interaction Model</h2>
+<h3>5.1 Gesture vocabulary</h3>
+<p>Vyze deliberately avoids a touchscreen UI for primary use. The entire gesture set is:</p>
+<table><thead><tr><th>Gesture</th><th>Action</th></tr></thead><tbody><tr><td><strong>Single tap</strong></td><td><em>Look</em> — describe the scene (tap position is passed as a spatial hint, e.g. "describe what is at this location").</td></tr><tr><td><strong>Double tap</strong></td><td><em>Ask</em> — open an on-demand voice session; the user speaks a question to the VLM.</td></tr><tr><td><strong>Long press</strong></td><td><em>Light check</em> — announce whether the environment is dark and engage the flashlight.</td></tr><tr><td><strong>Triple tap</strong></td><td><em>Color analysis</em> — announce the color of the object at the center of the frame.</td></tr><tr><td><strong>Triple tap + hold</strong></td><td><em>Emergency SOS</em> — after a 1.5 s delay, open the dialer to <strong>999</strong>.</td></tr><tr><td><strong>Voice commands</strong></td><td>While a voice session is open: "read this", "voice settings", "report…", and language/gesture commands.</td></tr></tbody></table>
+<p>Single-tap vs. double-tap disambiguation uses Android's standard ~250 ms gesture timeout; a legacy per-tap click fallback was deliberately removed so a double-tap cannot also trigger a scene analysis.</p>
+<h3>5.2 Microphone lifecycle — closed by default</h3>
+<p>The single most important power/noise decision: <strong>Vyze never listens while idle.</strong></p>
+<ul><li>The mic opens <strong>only</strong> inside an explicit voice session (started by double-tap or by report-mode capture).</li><li>Sessions are self-closing: recognized speech ends them, as do silence, errors, the 12-second conversation deadline, and the noise guard.</li><li>Previously the app auto-reopened the mic after every answer, onboarding step, and resume; all of those reopen paths were removed. Failed sessions (<code>NO_MATCH</code>, timeout, empty result) now end cleanly instead of looping — eliminating the "beep loop" and idle listening reported in early builds.</li></ul>
+<h3>5.3 Conversation window</h3>
+<p>A single double-tap starts a <strong>rolling hands-free conversation</strong>:</p>
+<ol><li>Double-tap → "Listening. Ask your question." → the mic opens ~700 ms after the cue (the cue is spoken to completion first so the app never hears its own voice).</li><li>The user asks; the answer is spoken.</li><li>~600 ms after the answer, the mic silently reopens — <strong>no gesture required</strong>.</li><li>Each accepted query resets a 12-second deadline (<code>CONVERSATION_WINDOW_MS</code>); the mic closes quietly when the user goes silent, returning to IDLE.</li></ol>
+<p>Any gesture barges in: single-tap <em>look</em> cancels the window, a second double-tap restarts a fresh session, and long-press runs the light check.</p>
+<h3>5.4 Noise robustness</h3>
+<p>Speech input passes a <strong>three-stage chatter filter</strong> in <code>MainActivity</code> before it can reach the model:</p>
+<ul><li><strong>Confidence</strong> — only recognitions above a confidence threshold are considered.</li><li><strong>Length</strong> — utterances too short or too long to be queries are dropped.</li><li><strong>Stability</strong> — the final text is compared against the last partial transcript (cleared per session) so stray or unstable recognitions are rejected.</li></ul>
+<p>If repeated ambient chatter is detected, Vyze announces <em>"The room is noisy. Tap or double tap to continue"</em> and pauses listening until an explicit gesture. The query-response beep uses <strong>adaptive backoff</strong>, and haptic patterns are one-shot (a historical bug passed repeat index <code>0</code> to the vibration API, causing endless vibration loops; patterns now use repeat <code>-1</code>).</p>
+<h2><span class="no">6.</span> Vision-Language Inference Stack</h2>
+<h3>6.1 Model</h3>
+<table><thead><tr><th>Parameter</th><th>Value</th></tr></thead><tbody><tr><td><strong>Model</strong></td><td>Gemma 4 E2B (<code>gemma-4-E2B-it.litertlm</code>)</td></tr><tr><td><strong>File size</strong></td><td>2.59 GB (local, user-downloaded to Downloads/ or app-scoped external storage)</td></tr><tr><td><strong>Format / runtime</strong></td><td>LiteRT-LM (<code>com.google.ai.edge.litertlm:litertlm-android:0.16.1</code>)</td></tr><tr><td><strong>Modality</strong></td><td>Multimodal — vision encoder + text decoder</td></tr><tr><td><strong>Acceleration</strong></td><td><strong>GPU only</strong> (OpenCL/Vulkan); CPU inference unsupported at this size</td></tr><tr><td><strong>Peak memory</strong></td><td>~3 GB (weights + KV-cache + image encoding)</td></tr></tbody></table>
+<p>The model file is resolved from well-known local locations (public <code>Download/</code> directory first, app-scoped external files second) and validated with a size sanity check. The APK itself stays small; the model is a first-run acquisition step with spoken progress announcements.</p>
+<h3>6.2 Initialization &amp; hardware fallback</h3>
+<ul><li><strong>Pre-flight RAM check</strong> — before the engine is created, the app triggers a GC, measures available heap, and rejects early (with a clear spoken error) when free memory is below the threshold: 1200 MB on standard devices, 800 MB on devices flagged low-RAM. This prevents mid-inference OOM crashes.</li><li><strong>NPU → GPU fallback chain</strong> — the engine tries NPU acceleration first and falls back to GPU. In practice the NPU path is unreliable on some SoCs (e.g. MediaTek Dimensity) and is skipped; GPU execution is the production path.</li><li><strong>Two-stage GPU warm-up</strong> — the text decoder is warmed with a text-only message first (running a full image warm-up at init previously caused a <code>SIGSEGV</code> in the native LiteRT-LM JNI layer), then a 1×1 dummy image pre-compiles the OpenCL/Vulkan kernels so the first real inference is fast.</li></ul>
+<h3>6.3 Prompt construction</h3>
+<p>Prompts follow Gemma 4's native turn format:</p>
+<pre class="art"><code>&lt;|turn|&gt;system [System Prompt]&lt;|end_of_turn|&gt;
+&lt;|turn|&gt;user [User / Image Context]&lt;|end_of_turn|&gt;
+&lt;|turn|&gt;model</code></pre>
+<p>Image patch tokens are bound natively by the LiteRT-LM engine when a <code>Bitmap</code> is passed — no literal image placeholder is required. A fixed system directive enforces the product's two behavioral contracts:</p>
+<ol><li><strong>Language mirroring</strong> — respond only in the language requested, without cross-translating.</li><li><strong>No internal reasoning chains</strong> — answers are direct and concise (the raw chain-of-thought of the base model is suppressed, both for latency and to avoid confusing narration).</li></ol>
+<p><code>DynamicPromptBuilder</code> assembles query-specific context: language identification, recent memory recall (see §8.3), and <strong>few-shot examples</strong> for specialized tasks such as reading medicine packaging:</p>
+<blockquote><em>"Input: what medicine is this? Image shows Diclac Retard box. Output: Diclac Retard, diclofenac sodium 100mg. Take one tablet daily after meals."</em></blockquote>
+<h3>6.4 Image preprocessing</h3>
+<ul><li>Frames are <strong>proportionally downscaled</strong> to a max dimension of 512 px — no rigid center-crop, because Gemma 4 handles dynamic aspect ratios natively.</li><li>JPEG compression at quality 75 for any intermediate encoding.</li><li>All scaled bitmaps are <strong>explicitly recycled</strong> after inference to prevent native memory leaks.</li></ul>
+<h3>6.5 Sampling &amp; output controls</h3>
+<table><thead><tr><th>Parameter</th><th>Value</th></tr></thead><tbody><tr><td>Temperature</td><td>0.1</td></tr><tr><td>Top-K</td><td>1 (greedy)</td></tr><tr><td>Top-P</td><td>1.0</td></tr><tr><td>Scene query tokens</td><td>96</td></tr><tr><td>Text/reading query tokens</td><td>160</td></tr></tbody></table>
+<p>Greedy decoding minimizes latency and hallucinated verbosity. Token caps were raised from earlier tight values (48/96) after real-device testing showed responses being truncated mid-sentence.</p>
+<h3>6.6 Inference timeouts &amp; watchdogs</h3>
+<ul><li>Per-inference timeout: <strong>180 s</strong> standard, <strong>60 s</strong> on low-RAM devices (fail fast instead of hanging through an OOM recovery).</li><li>GPU warm-up timeout: 60 s.</li><li><code>VyzeCoreController</code> runs a <strong>watchdog</strong> that force-resets the engine if inference hangs, and monitors heap pressure during inference, logging warnings when available memory drops below a low-RAM threshold.</li></ul>
+<h3>6.7 Streaming speech output</h3>
+<p>Answers are streamed token-by-token to TTS rather than spoken after full completion. Two details matter for perceived quality:</p>
+<ul><li><strong>First-chunk flush policy</strong> — the first chunk is only spoken once it forms a real phrase (2+ words or 8+ characters). An earlier implementation flushed as soon as the buffer held 1 word / 3 characters, which caused answers to begin with a stray spoken "A." from a leading model token.</li><li><strong>Audio drain tail</strong> — when generation completes, a silent tail is always queued so the TTS queue stays alive while the speaker drains, with a 600 ms drain-grace window so the final words are never clipped.</li></ul>
+<h2><span class="no">7.</span> Speech &amp; Audio Subsystems</h2>
+<h3>7.1 Speech recognition</h3>
+<p>Voice input uses the platform <code>android.speech.SpeechRecognizer</code> with <code>RecognizerIntent</code>, configured for the active language (English, Malay, or Chinese). Recognition availability is checked before use. The recognizer is only ever instantiated for an explicit session — matching the closed-mic-by-default policy. Partial results feed the stability gate described in §5.4.</p>
+<h3>7.2 Text-to-speech (TTS)</h3>
+<p>Vyze forces the <strong>Google TTS engine</strong> (<code>com.google.android.tts</code>) for consistency of voice quality and language support (falling back to the system default engine only if Google TTS is absent), and speaks through a streaming queue managed by <code>TTSManager</code>.</p>
+<p>Voice quality is a first-class concern because the perceived "human-ness" of the assistant is dominated by the installed voice pack, not by prosody settings:</p>
+<ul><li>The app <strong>auto-selects the best installed voice</strong> for the active language, ordered by the engine's reported quality score.</li><li>Users can <strong>audition and choose</strong> a voice per language, either from Voice Settings (Previous voice / Next voice / Use this voice buttons, each speaking a sample in the candidate voice) or <strong>fully hands-free by voice</strong>: double-tap → "voice settings" → hear each voice → say "next", "use this", or "cancel".</li><li>A <strong>weak-voice detector</strong> inspects the engine's reported quality and flags voices below the high-quality threshold. On first run, right after "Vyze is ready…", Vyze may say: <em>"Your current voice sounds basic. A better voice is available for free from Google. Say yes to open the voice installer, or say skip."</em> "Yes" launches the system voice-data installer (<code>ACTION_INSTALL_TTS_DATA</code>); on return the app re-verifies and confirms. The prompt is one-time and skippable.</li><li>Choices persist per language and are restored on every init and language switch.</li></ul>
+<h3>7.3 Haptics &amp; sound</h3>
+<p><code>HapticManager</code> provides distinct one-shot patterns (gesture acknowledgment, warnings). <code>AnnouncementCoordinator</code> serializes spoken announcements so TTS output never overlaps itself, and any user gesture <strong>barge-in</strong> immediately silences active speech.</p>
+<h2><span class="no">8.</span> Specialized Visual Capabilities</h2>
+<h3>8.1 OCR fast-path and medicine reading</h3>
+<p>Reading text through the full VLM is slow and error-prone, so Vyze implements a <strong>hybrid reading pipeline</strong>:</p>
+<ol><li>A spoken query is classified by reading keywords across English, Malay, and Chinese (e.g. "read", "label", "prescription", "baca", "读").</li><li>If it is a reading query, the frame goes through <strong>ML Kit Text Recognition</strong> (<code>TextRecognition</code> with Latin or Chinese recognizer options, chosen by the active language) — a dedicated on-device OCR model.</li><li>Extracted text is passed to a <strong>confidence-scored OCR path</strong>; high-confidence text is read out directly, often enriched by the <strong>medicine knowledge base</strong>: a Room database pre-populated at first launch (<code>MedicineDatabaseCallback</code>) with common medicines and their indications, dosages, and warnings. The VLM is used as the fallback or enrichment layer (prompted with few-shot examples) when OCR confidence is low or the query is a free-form question about the packaging.</li></ol>
+<p>The fast path cuts reading latency from seconds of VLM inference to milliseconds of OCR plus TTS.</p>
+<h3>8.2 Color analysis</h3>
+<p><code>ColorAnalyzer</code> samples the center of the frame, converts to HSV, and classifies the dominant hue/saturation/value into a color name (localized to the active language). This is the triple-tap action and is pure CPU — near-instant with no model inference.</p>
+<h3>8.3 Light sensing &amp; automatic flashlight</h3>
+<p><code>CameraSetupDelegate</code> runs a <strong>per-frame luminance analysis</strong> on the CameraX <code>ImageAnalysis</code> stream and maintains a dark-environment flag. <code>FlashlightManager</code> engages the torch automatically using <strong>dual-threshold hysteresis</strong> (ON below ~35 lux, OFF above ~65 lux) so the torch does not rapidly flicker at the boundary. Long-press ("light check") announces the environment state and forces the torch if it has not yet flipped.</p>
+<h3>8.4 Scan history</h3>
+<p>Every recognized artifact — scene summaries, OCR text, barcodes, currency denominations, colors — is persisted through <code>ScanRepository</code>/<code>ScanDao</code> into a Room-backed history that the user can revisit via <code>GalleryFragment</code>.</p>
+<h3>8.5 Emergency SOS</h3>
+<p>Triple-tap-and-hold is a deliberately hard-to-trigger gesture that opens the dialer to the emergency number <strong>999</strong> after a 1.5-second confirm delay, giving the user time to abort.</p>
+<h2><span class="no">9.</span> On-Device Data, Memory &amp; Personalization</h2>
+<p>All persistence is via <strong>Room</strong> (SQLite) inside the app sandbox. There is no cloud sync.</p>
+<h3>9.1 Database schema (VyzeDatabase)</h3>
+<table><thead><tr><th>Entity</th><th>Purpose</th></tr></thead><tbody><tr><td><code>MedicineEntity</code></td><td>Pre-populated medicine knowledge base (name, active ingredient, dose, warnings).</td></tr><tr><td><code>MemoryDao</code> / <code>VyzeMemoryEntity</code></td><td>Adaptive memory — preferences, environment observations, Q&amp;A interactions, with pruning of entries older than a retention cutoff.</td></tr><tr><td><code>InteractionDao</code> / <code>InteractionRecord</code></td><td>Full Q&amp;A history plus <strong>serialized 256-float image embeddings</strong> of the scene that prompted each interaction.</td></tr><tr><td><code>ScanDao</code> / <code>ScanEntity</code></td><td>Scan history by type (scene, OCR, barcode, currency, color).</td></tr><tr><td><code>ErrorLogDao</code> / <code>ErrorLogEntity</code></td><td>Local crash &amp; diagnostic logs (pruned on launch).</td></tr></tbody></table>
+<h3>9.2 Lightweight embeddings</h3>
+<p><code>EmbeddingEngine</code> produces a 256-float embedding from any frame by downscaling to a 16×16 grayscale grid and normalizing pixel intensities — ~1 ms on CPU, zero extra model weight. <code>MemoryRepository.findSimilar</code> ranks stored interactions by <strong>cosine similarity</strong> to the current scene and retrieves the top-k contextually similar past interactions, which <code>DynamicPromptBuilder</code> injects as "memory" so Vyze can adapt (e.g., recognizing that the user is in a room it has described before, or recalling previously read medicine). The authors document this as an intentional, lightweight proxy for visual similarity — not semantic understanding.</p>
+<h2><span class="no">10.</span> Multilingual Architecture</h2>
+<ul><li><strong>Recognition</strong> — the speech recognizer is configured for the active UI language.</li><li><strong>Detection</strong> — spoken input is scored for Malay using a <strong>multi-signal language detector</strong> (replacing an earlier fragile fixed phrase list), and mirrored back for English/Chinese.</li><li><strong>Mirroring</strong> — the VLM system directive (§6.3) enforces answering in the language of the query.</li><li><strong>TTS</strong> — per-language voice selection with persisted user choice (§7.2).</li><li><strong>Localization</strong> — UI strings, announcements, gesture teaching, color names, and reading keywords all exist in three locales (<code>values</code>, <code>values-ms</code>, <code>values-zh</code>).</li></ul>
+<h2><span class="no">11.</span> Battery &amp; Thermal Engineering</h2>
+<p>The dominant energy consumer is not the microphone or the screen — it is a 2.5 GB GPU-resident model. Battery strategy therefore focuses on <strong>minimizing GPU work and preventing idle subsystems</strong>:</p>
+<ol><li><strong>Mic closed at IDLE</strong> — the recognizer does not churn between actions (removes the second-largest continuous drain and the noise-trigger risk).</li><li><strong>On-demand inference</strong> — the GPU is used only for explicit look/ask gestures; continuous auto-snapshot mode exists but throttles itself (4 s snapshot cadence, automatic throttling after 3 minutes of continuous use).</li><li><strong>Thermal monitoring</strong> — a periodic thermal check (~every 8 s) plus watchdog-based recovery prevents sustained overheating from long inference runs.</li><li><strong>Battery monitor</strong> — <code>BatteryMonitor</code> warns on low levels; it is deliberately decoupled from the inference core so UI policy cannot corrupt engine state.</li><li><strong>Clean exit</strong> — the app kills its own process on exit, releasing the GPU context and native memory so the model does not linger in RAM after the user leaves.</li><li><strong>Failure fast-paths</strong> — RAM pre-flight checks and shorter low-RAM inference timeouts prevent OOM death spirals that would otherwise waste battery retrying.</li></ol>
+<h2><span class="no">12.</span> Privacy &amp; Security</h2>
+<ul><li><strong>No network requirement</strong> — core function (scene understanding, OCR, reading, color, light) runs with network access absent. There is no account and no telemetry.</li><li><strong>Images never leave the device</strong> — frames go from the camera directly into the local model, and are recycled after inference.</li><li><strong>User-initiated reporting only</strong> — the spoken "report…" command writes a local report file and, only if the user confirms, opens the user's email client to send it. Nothing is transmitted automatically.</li><li><strong>Data sandboxing</strong> — all memory, scan history, and logs live in app-private storage / Room.</li><li><strong>Model integrity</strong> — the model file is validated for size/location; the app documents an <code>adb push</code> path for sideloading, keeping the APK small while the model stays user-controlled.</li></ul>
+<h2><span class="no">13.</span> Reliability Engineering</h2>
+<p>Production lessons are encoded directly in the code:</p>
+<table><thead><tr><th>Failure mode</th><th>Mitigation</th></tr></thead><tbody><tr><td>Native SIGSEGV during init</td><td>Text-only warm-up before any image work; image warm-up removed</td></tr><tr><td>OOM during 2.5 GB model load</td><td>RAM pre-flight check + spoken early rejection</td></tr><tr><td>Hung inference</td><td>Per-inference timeouts + watchdog force-reset</td></tr><tr><td>Model file missing/corrupt</td><td>Multi-location resolution, size sanity check, human-readable setup instructions</td></tr><tr><td>Answer audio clipped</td><td>Always-queued drain tail + 600 ms grace</td></tr><tr><td>First chunk spoken alone</td><td>Phrase-aware first-chunk flush</td></tr><tr><td>Endless vibration loops</td><td>One-shot haptic patterns (repeat = -1)</td></tr><tr><td>Speech session loops ("beep loop")</td><td>Clean session termination on no-match/timeout; mic closed at IDLE</td></tr><tr><td>Background crashes</td><td>Global exception handler writing to <code>CrashLogFile</code>, logs pruned on launch</td></tr></tbody></table>
+<h2><span class="no">14.</span> Key Parameters Reference</h2>
+<table><thead><tr><th>Constant</th><th>Value</th></tr></thead><tbody><tr><td><code>CONVERSATION_WINDOW_MS</code></td><td>12,000 ms</td></tr><tr><td><code>CONVERSATION_WINDOW_TICK_MS</code></td><td>2,000 ms</td></tr><tr><td><code>VOICE_SESSION_OPEN_DELAY_MS</code></td><td>700 ms</td></tr><tr><td><code>FOLLOW_UP_OPEN_DELAY_MS</code></td><td>600 ms</td></tr><tr><td><code>AUDIO_DRAIN_GRACE_MS</code></td><td>600 ms</td></tr><tr><td>Inference timeout (std / low-RAM)</td><td>180 s / 60 s</td></tr><tr><td>GPU warm-up timeout</td><td>60 s</td></tr><tr><td>Free-RAM preflight (std / low-RAM)</td><td>1200 MB / 800 MB</td></tr><tr><td>Image max dimension</td><td>512 px</td></tr><tr><td>Sampling</td><td>temp 0.1, top-K 1</td></tr><tr><td>Scene / text token caps</td><td>96 / 160</td></tr><tr><td>Auto-torch hysteresis</td><td>ON &lt; 35 lux, OFF &gt; 65 lux</td></tr><tr><td>SOS dial delay</td><td>1.5 s (number 999)</td></tr><tr><td>Continuous snapshot</td><td>4 s cadence, throttled after 3 min</td></tr><tr><td>Thermal check interval</td><td>~8 s</td></tr></tbody></table>
+<h2><span class="no">15.</span> Limitations &amp; Future Work</h2>
+<p><strong>Known limitations</strong></p>
+<ul><li><strong>Hardware floor</strong> — requires a device with ~3 GB peak available RAM and a GPU-capable SoC; CPU-only and low-RAM devices are rejected early by design.</li><li><strong>Model size</strong> — the 2.59 GB model must be downloaded/staged outside the APK; first-run setup requires storage and a download.</li><li><strong>Malay/Chinese VLM depth</strong> — multilingual output depends on the underlying model's capability in those languages; OCR uses language-appropriate recognizers to compensate.</li><li><strong>Embedding memory</strong> is intentionally shallow (visual similarity only, no semantics) — a documented trade-off to keep it zero-cost.</li></ul>
+<p><strong>Future directions</strong></p>
+<ul><li><strong>Conversation-window tuning</strong> from real-device telemetry (window length is a single constant).</li><li>A semantic image-embedding model (e.g., MediaPipe Image Embedder) to upgrade memory recall from visual to conceptual similarity.</li><li>Bundled neural TTS voices (e.g., Kokoro/Piper-class, ~100–300 MB) for genuinely human speech in EN/ZH; Malay would continue on Google TTS until a quality open Malay voice exists.</li><li>Continuous-mode refinements with stricter thermal budgeting for sustained outdoor use.</li></ul>
+<h2><span class="no">16.</span> Dependency Snapshot</h2>
+<table><thead><tr><th>Component</th><th>Version / detail</th></tr></thead><tbody><tr><td>Language / toolchain</td><td>Kotlin 2.3.0, JVM 17</td></tr><tr><td>Async</td><td>kotlinx-coroutines 1.10.1</td></tr><tr><td>UI</td><td>AppCompat, Material, ConstraintLayout, Navigation (safe-args), DataBinding/ViewBinding</td></tr><tr><td>Camera</td><td>CameraX (core / camera2 / lifecycle / view)</td></tr><tr><td>VLM runtime</td><td>LiteRT-LM <code>litertlm-android:0.16.1</code></td></tr><tr><td>Model</td><td>Gemma 4 E2B <code>gemma-4-E2B-it.litertlm</code> (2.59 GB)</td></tr><tr><td>OCR</td><td>ML Kit Text Recognition (Latin + Chinese options)</td></tr><tr><td>Persistence</td><td>Room + KSP</td></tr><tr><td>Speech</td><td><code>android.speech.SpeechRecognizer</code> + Google TTS engine</td></tr><tr><td>ABIs</td><td><code>arm64-v8a</code></td></tr></tbody></table></main>
+</body>
+</html>

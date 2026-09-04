@@ -96,6 +96,10 @@ class CameraFragment : Fragment() {
     @Volatile
     private var pendingVoiceInstallConfirmation = false
 
+    /** True right after the user asked to open Accessibility Settings. */
+    @Volatile
+    private var pendingAccessibilityReturn = false
+
     /** True while the hands-free voice-selection audition is running. */
     @Volatile
     private var voiceAuditionActive = false
@@ -231,23 +235,24 @@ class CameraFragment : Fragment() {
                             if (coreController.isDuplicateDescription(response)) {
                                 Log.d(TAG, "Duplicate description — skipping TTS, returning to IDLE")
                                 appState = AppState.IDLE
-                                startFollowUpWindow(cue = false)
+                                maybeOpenFollowUpWindow()
                             } else if (coreController.isStreamingActive()) {
                                 Log.d(TAG, "Streaming active — waiting for TTS queue to drain")
                                 waitForTtsDrain {
                                     appState = AppState.IDLE
-                                    Log.d(TAG, "TTS drain complete — opening follow-up window")
-                                    startFollowUpWindow(cue = false)
+                                    Log.d(TAG, "TTS drain complete — post-answer state")
+                                    maybeOpenFollowUpWindow()
                                 }
                             } else {
                                 mainActivity.speakThenCallback(response) {
                                     appState = AppState.IDLE
-                                    Log.d(TAG, "Response spoken — opening follow-up window")
-                                    startFollowUpWindow(cue = false)
+                                    Log.d(TAG, "Response spoken — post-answer state")
+                                    maybeOpenFollowUpWindow()
                                 }
                             }
                         } else {
                             appState = AppState.IDLE
+                            endFollowUpWindow()
                         }
 
                         // SAFETY TIMEOUT: If TTS doesn't finish within 10 seconds,
@@ -305,8 +310,9 @@ class CameraFragment : Fragment() {
                         if (mainActivity != null && mainActivity.isTtsReady()) {
                             appState = AppState.IDLE
                             val talkBackHint = if (mainActivity.talkBackDetected) {
-                                " TalkBack detected. Vyze will handle all audio while open. " +
-                                "You may disable TalkBack in Android Settings for the best experience. "
+                                " TalkBack detected. Vyze needs the full screen to work: " +
+                                "hold both volume keys for three seconds to turn it off, " +
+                                "or say open accessibility settings and I will take you there. "
                             } else ""
                             mainActivity.speakThenCallback(
                                 "${talkBackHint}Vyze is ready. Tap once to describe what is in front of you. " +
@@ -330,8 +336,9 @@ class CameraFragment : Fragment() {
                     if (mainActivity != null && mainActivity.isTtsReady()) {
                         appState = AppState.IDLE
                         val talkBackHint = if (mainActivity.talkBackDetected) {
-                            " TalkBack detected. Vyze will handle all audio while open. " +
-                            "You may disable TalkBack in Android Settings for the best experience. "
+                            " TalkBack detected. Vyze needs the full screen to work: " +
+                            "hold both volume keys for three seconds to turn it off, " +
+                            "or say open accessibility settings and I will take you there. "
                         } else ""
                         mainActivity.speakThenCallback(
                             "${talkBackHint}Vyze is ready. Tap once to describe what is in front of you. " +
@@ -373,7 +380,13 @@ class CameraFragment : Fragment() {
         gestureRouter.onSingleTapAction = { x, y ->
             bargeInAndCapture(
                 "User tapped at position (${x.toInt()}, ${y.toInt()}). " +
-                "Describe what is in front of me and around me for navigation."
+                "Describe what is in front of me and around me for navigation. " +
+                "If the tapped object is a packaged product (packet, box, bottle, can), " +
+                "first say its BRAND name and product type exactly as printed " +
+                "(for example: Maggi instant noodle packet), then continue. " +
+                "If the tapped object has text on it (a label, box, or sign), " +
+                "read it aloud verbatim as whole words and sentences, never spelling letter by letter. " +
+                "Read the ENTIRE text on the object in reading order; do not stop halfway."
             )
         }
 
@@ -434,6 +447,7 @@ class CameraFragment : Fragment() {
 
         maybePromptBetterVoice()
         confirmVoiceInstallIfReturned()
+        confirmAccessibilityReturn()
     }
 
     override fun onPause() {
@@ -514,6 +528,17 @@ class CameraFragment : Fragment() {
         // Immediately set ANALYZING — blocks any concurrent triggers
         // (speech callbacks, second taps) from passing the guard.
         appState = AppState.ANALYZING
+
+        // ── TAP = TOUCH INPUT: end any hands-free follow-up window ──
+        // A tap is a deliberate gesture. Close the conversation mic (and
+        // revoke the mic grant in stopVoiceListening() so the cancelled
+        // recognizer's late error/results are dropped at the source) and
+        // mark this answer as one that must NOT reopen the mic on
+        // completion. Previously the follow-up window stayed open under
+        // tap analyses — its cancellation error surfaced as a phantom
+        // "I did not catch that" before every result.
+        keepMicOpenAfterAnswer = false
+        endFollowUpWindow()
 
         val mainActivity = activity as? MainActivity
         mainActivity?.stopListening()
@@ -664,10 +689,14 @@ class CameraFragment : Fragment() {
                 Log.i(TAG, "Speech result: \"$spokenText\" lang=$detectedLocale")
                 if (voiceAuditionActive) {
                     handleVoiceAuditionCommand(spokenText)
-                } else if (awaitingInstallVoiceAnswer && !isVoiceSettingsRequest(spokenText)) {
-                    // A voice-settings request always wins over the pending
-                    // "install a better voice?" yes/no question — the user is
-                    // asking about voices, so route them to the audition.
+                } else if (awaitingInstallVoiceAnswer &&
+                    !isVoiceSettingsRequest(spokenText) &&
+                    !isAccessibilitySettingsRequest(spokenText)
+                ) {
+                    // A voice-settings or accessibility-settings request always
+                    // wins over the pending "install a better voice?" yes/no
+                    // question — the user is asking for something else, so
+                    // route them to that instead of parsing a yes/no answer.
                     handleVoiceInstallAnswer(spokenText)
                 } else {
                     activity.interruptTts()
@@ -684,12 +713,16 @@ class CameraFragment : Fragment() {
                         }
                         // ── NORMAL VLM PIPELINE ──────────────────────
                         else -> {
-                            // ── VOICE SETTINGS COMMAND ───────────────
+                        // ── ACCESSIBILITY SETTINGS COMMAND ───────
+                        // "open accessibility settings" takes the user to
+                        // the system screen to disable TalkBack.
+                        if (isAccessibilitySettingsRequest(spokenText)) {
+                            openAccessibilitySettingsFlow()
+                        } else if (isVoiceSettingsRequest(spokenText)) {
                             // "voice settings" / "change your voice" starts
                             // the hands-free voice audition (no screen needed).
-                            if (isVoiceSettingsRequest(spokenText)) {
-                                startVoiceAudition()
-                            } else if (appState == AppState.ANALYZING || appState == AppState.SPEAKING) {
+                            startVoiceAudition()
+                        } else if (appState == AppState.ANALYZING || appState == AppState.SPEAKING) {
                                 // ── NOISE GATE ────────────────────────
                                 // The recognizer can transcribe other people's
                                 // conversation as a "query" in a noisy room.
@@ -699,6 +732,16 @@ class CameraFragment : Fragment() {
                                 // chat makes the response come back "lost" and
                                 // restarts the recognition beep loop.
                                 Log.d(TAG, "Speech result during $appState — dropping (possible ambient noise)")
+                            } else if (coreController.isTextOnlyQuery(spokenText)) {
+                                // ── TEXT-ONLY Q&A ────────────────────────
+                                // General-knowledge question ("what is
+                                // paracetamol used for?") — no camera frame
+                                // needed. Faster + cheaper than image inference.
+                                Log.d(TAG, "Text-only query: \"$spokenText\"")
+                                coreController.resetForNewCapture()
+                                appState = AppState.ANALYZING
+                                updateStatus("Answering...")
+                                coreController.triggerTextQuery(spokenText)
                             } else {
                                 coreController.resetForNewCapture()
                                 appState = AppState.IDLE
@@ -735,6 +778,14 @@ class CameraFragment : Fragment() {
                             mainHandler.postDelayed({ startVoiceListening() }, VOICE_SESSION_OPEN_DELAY_MS)
                         }
                     }
+                } else if (appState != AppState.LISTENING && appState != AppState.REPORTING) {
+                    // ── STALE-ERROR GUARD ──────────────────────────────
+                    // A recognizer error can arrive AFTER the listening session
+                    // it belonged to was superseded (a tap started an analysis,
+                    // an answer is speaking, the window already closed). Such an
+                    // error must never force state changes or speak "I did not
+                    // catch that" around a fresh result.
+                    Log.d(TAG, "Speech error during state=$appState — stale, ignoring")
                 } else {
                     // ── CONVERSATION WINDOW: a silent recognizer cycle inside
                     // the follow-up window just means the user paused. Quietly
@@ -743,7 +794,15 @@ class CameraFragment : Fragment() {
                     val pausedInWindow = inConversationWindow &&
                         (errorMsg.contains("No speech") || errorMsg.contains("timed out"))
                     if (pausedInWindow) {
-                        if (android.os.SystemClock.elapsedRealtime() < conversationDeadlineMs) {
+                        // NEVER clobber an in-flight tap/analysis/answer: if the
+                        // app is not actually LISTENING, this error belongs to a
+                        // stale cycle (e.g. the mic was cancelled by a tap that
+                        // started an analysis). Close the window state quietly
+                        // and let the analysis/answer finish on its own.
+                        if (appState != AppState.LISTENING) {
+                            Log.d(TAG, "Speech error during $appState — stale, closing window only")
+                            endFollowUpWindow()
+                        } else if (android.os.SystemClock.elapsedRealtime() < conversationDeadlineMs) {
                             appState = AppState.LISTENING
                             updateStatus("Listening...")
                             mainHandler.postDelayed({ startVoiceListening() }, FOLLOW_UP_RETRY_DELAY_MS)
@@ -908,6 +967,8 @@ class CameraFragment : Fragment() {
         if (!isCapturing.compareAndSet(false, true)) return
 
         appState = AppState.ANALYZING
+        // Continuous mode is touch/auto driven — never reopen the mic after it.
+        keepMicOpenAfterAnswer = false
         updateStatus("Scanning...")
 
         cameraSetup.takeSnapshot(
@@ -973,6 +1034,11 @@ class CameraFragment : Fragment() {
         if (!isAdded) return
         try {
             val activity = requireActivity() as? MainActivity ?: return
+            // Declare that the mic is genuinely wanted. MainActivity uses this
+            // grant to drop stale recognizer callbacks once the user aborts the
+            // session with a tap — otherwise the cancelled session's error would
+            // surface as phantom "I did not catch that" speech around answers.
+            activity.voiceSessionWanted = true
             activity.startListeningSafely()
         } catch (e: Throwable) {
             Log.w(TAG, "startVoiceListening failed: ${e.message}")
@@ -1004,9 +1070,11 @@ class CameraFragment : Fragment() {
         mainActivity.interruptTts()
         mainActivity.resumeAfterNoisePause()
 
-        // Open a fresh conversation session with a spoken cue. After each
-        // answer the mic reopens automatically (startFollowUpWindow) so
-        // follow-ups flow hands-free until the user goes quiet.
+        // Open a fresh conversation session with a spoken cue. Answers to
+        // voice queries reopen the mic automatically (maybeOpenFollowUpWindow)
+        // so follow-ups flow hands-free until the user goes quiet. Single taps
+        // flip this flag back to false — tap answers stay quiet at IDLE.
+        keepMicOpenAfterAnswer = true
         startFollowUpWindow(cue = true)
     }
 
@@ -1139,6 +1207,9 @@ class CameraFragment : Fragment() {
         try {
             val activity = requireActivity() as? MainActivity ?: return
             activity.stopListening()
+            // Revoke the mic grant: any recognizer callback still in flight
+            // from this session is now stale and must be dropped at the source.
+            activity.voiceSessionWanted = false
         } catch (e: Throwable) {
             Log.w(TAG, "stopVoiceListening failed: ${e.message}")
         }
@@ -1172,6 +1243,93 @@ class CameraFragment : Fragment() {
     }
 
     // ══════════════════════════════════════════════════════════════════
+    // Accessibility Settings Command (disable TalkBack flow)
+    // ══════════════════════════════════════════════════════════════════
+
+    /**
+     * True when the user asks to open the system Accessibility Settings
+     * ("open accessibility settings", "turn off talkback", …). Vyze can't
+     * pause TalkBack itself, so this is the guided path to disable it.
+     */
+    private fun isAccessibilitySettingsRequest(text: String): Boolean {
+        val t = text.trim().lowercase()
+        if (ACCESSIBILITY_SETTINGS_PHRASES.any { t.contains(it) }) return true
+
+        // Fallback — a talkback-word plus an intent-word anywhere
+        // ("talkback off", "turn talkback", "screen reader settings").
+        val hasTalkBackWord = listOf(
+            "talkback", "talk back", "screen reader", "screenreader",
+            "kebolehaksesan", "aksesibiliti", "辅助", "无障碍"
+        ).any { t.contains(it) }
+        val hasIntentWord = listOf(
+            "off", "disable", "turn", "stop", "close", "setting", "settings",
+            "tutup", "matikan", "buka", "设置", "关闭"
+        ).any { t.contains(it) }
+        if (hasTalkBackWord && hasIntentWord) return true
+
+        // Very short utterance that is basically the command itself
+        // ("talkback"), spoken right after the listening cue.
+        val wordCount = t.split(Regex("\\s+")).size
+        return wordCount <= 2 && hasTalkBackWord
+    }
+
+    /**
+     * Voice command handler: open the system Accessibility Settings screen
+     * so the user can turn TalkBack off (TalkBack still works there, so they
+     * can navigate it). On return, [confirmAccessibilityReturn] re-checks.
+     */
+    private fun openAccessibilitySettingsFlow() {
+        if (!isAdded) return
+        Log.i(TAG, "Voice command: opening Accessibility Settings")
+        stopVoiceAuditionIfActive()
+        stopVoiceListening()
+        endFollowUpWindow()
+        // Supersede the pending "install a better voice?" question if any.
+        awaitingInstallVoiceAnswer = false
+        coreController.resetForNewCapture()
+        hapticManager.vibrateTap()
+
+        val mainActivity = activity as? MainActivity ?: return
+        pendingAccessibilityReturn = true
+        if (mainActivity.openAccessibilitySettings()) {
+            ttsManager.speakQueued(
+                "Opening accessibility settings. Turn TalkBack off, then come back."
+            )
+        } else {
+            pendingAccessibilityReturn = false
+            ttsManager.speakQueued(
+                "Accessibility settings are not available on this device. " +
+                "Hold both volume keys for three seconds to turn TalkBack off."
+            )
+        }
+    }
+
+    /**
+     * After returning from Accessibility Settings, re-check TalkBack and
+     * confirm the outcome (or gently remind if still enabled).
+     */
+    private fun confirmAccessibilityReturn() {
+        if (!isAdded || !pendingAccessibilityReturn) return
+        pendingAccessibilityReturn = false
+        mainHandler.postDelayed({
+            try {
+                val mainActivity = activity as? MainActivity ?: return@postDelayed
+                if (!mainActivity.isTalkBackEnabled()) {
+                    mainActivity.clearTalkBackDetected()
+                    ttsManager.speakQueued("TalkBack is off. Enjoy hands-free use.")
+                } else {
+                    ttsManager.speakQueued(
+                        "TalkBack is still on. Hold both volume keys for three seconds " +
+                        "to turn it off, or say open accessibility settings to try again."
+                    )
+                }
+            } catch (e: Throwable) {
+                Log.w(TAG, "confirmAccessibilityReturn failed: ${e.message}")
+            }
+        }, ACCESSIBILITY_RETURN_RECHECK_DELAY_MS)
+    }
+
+    // ══════════════════════════════════════════════════════════════════
     // Hands-free Voice Audition (choose my voice by speaking)
     // ══════════════════════════════════════════════════════════════════
 
@@ -1200,6 +1358,9 @@ class CameraFragment : Fragment() {
         voiceAuditionActive = true
         appState = AppState.LISTENING
         updateStatus("Voice selection — say next / use this / cancel")
+        // The user has now used Voice Settings — the double-tap listening cue
+        // no longer needs to teach the command on every session.
+        markVoiceSettingsLearned()
 
         val mainActivity = activity as? MainActivity
         if (mainActivity == null) {
@@ -1259,6 +1420,7 @@ class CameraFragment : Fragment() {
                 else voiceAuditionVoices[voiceAuditionIndex - 1].name
                 requireContext().getSharedPreferences(TTSManager.PREFS_NAME, Context.MODE_PRIVATE)
                     .edit().putString(TTSManager.KEY_VOICE_NAME, name).apply()
+                markVoiceSettingsLearned()
                 voiceAuditionActive = false
                 appState = AppState.IDLE
                 updateStatus("Voice selected")
@@ -1320,11 +1482,13 @@ class CameraFragment : Fragment() {
     // ══════════════════════════════════════════════════════════════════
     // Conversation Window (hands-free follow-ups)
     // ══════════════════════════════════════════════════════════════════
-    // After a double-tap "ask" (or any completed answer), the mic reopens
-    // for CONVERSATION_WINDOW_MS so follow-up questions flow without
-    // repeating the gesture. Each accepted query resets the deadline; the
-    // window closes quietly after the deadline passes with no speech, or
-    // when a new action (tap/report) takes over.
+    // After a double-tap "ask", the mic reopens for CONVERSATION_WINDOW_MS
+    // so follow-up questions flow hands-free without repeating the gesture.
+    // Single-tap and continuous-mode answers deliberately do NOT reopen the
+    // mic — the user chose touch input, so the mic stays closed at IDLE.
+    // Each accepted query resets the deadline; the window closes quietly
+    // after the deadline passes with no speech, or when a new action
+    // (tap/report) takes over.
 
     /** True while the hands-free follow-up window is open. */
     @Volatile
@@ -1333,6 +1497,17 @@ class CameraFragment : Fragment() {
     /** Rolling deadline (elapsedRealtime) — extended on every accepted query. */
     @Volatile
     private var conversationDeadlineMs = 0L
+
+    /**
+     * True while the answer being produced came from a VOICE session
+     * (double-tap or a hands-free follow-up question). Only voice answers
+     * reopen the mic on completion. Tap/continuous answers keep the mic
+     * closed at IDLE — an open mic left running after a tap was what let the
+     * NEXT tap cancel an active recognizer, which surfaced its cancellation
+     * error as phantom "I did not catch that" speech before the real answer.
+     */
+    @Volatile
+    private var keepMicOpenAfterAnswer = false
 
     /** Periodically checks the deadline and closes the window when it expires. */
     private val conversationWatchdog = object : Runnable {
@@ -1364,13 +1539,17 @@ class CameraFragment : Fragment() {
         updateStatus("Listening...")
 
         if (cue) {
-            // Spoken cue that also teaches the voice-settings command, then
-            // opens the mic AFTER the cue finishes so it is never captured.
+            // Spoken cue. The voice-settings teaching hint is one-time: it
+            // only appears until the user has used Voice Settings once (the
+            // double-tap cue then stays short: "Listening. Ask your question.").
             val mainActivity = activity as? MainActivity
             if (mainActivity != null) {
+                val hint = if (hasLearnedVoiceSettings()) "" else
+                    ", or say voice settings to change how I sound"
                 mainActivity.speakThenCallback(
-                    "Listening. Ask your question, or say voice settings to change how I sound."
+                    "Listening. Ask your question$hint."
                 ) {
+                    // Open the mic AFTER the cue finishes so it is never captured.
                     mainHandler.postDelayed({ startVoiceListening() }, VOICE_SESSION_OPEN_DELAY_MS)
                 }
                 return
@@ -1395,6 +1574,46 @@ class CameraFragment : Fragment() {
         }
     }
 
+    /**
+     * After an answer finishes, reopen the hands-free follow-up mic ONLY for
+     * voice-session answers. Tap and continuous answers return to IDLE with
+     * the mic closed — the user is on touch input, and an open mic at rest is
+     * what made switching between gestures noisy (stray "I did not catch that"
+     * from cancelled listening sessions, ambient chat picked up after taps).
+     */
+    private fun maybeOpenFollowUpWindow() {
+        if (!isAdded) return
+        if (keepMicOpenAfterAnswer) {
+            Log.d(TAG, "Voice answer done — reopening follow-up window")
+            startFollowUpWindow(cue = false)
+        } else {
+            Log.d(TAG, "Tap answer done — staying IDLE, mic closed")
+            endFollowUpWindow()
+        }
+    }
+
+    /**
+     * True once the voice-settings hint is no longer needed: the user has
+     * opened Voice Settings at least once, OR already answered the one-time
+     * "better voice?" prompt (they know the voice can be changed).
+     */
+    private fun hasLearnedVoiceSettings(): Boolean {
+        return try {
+            val prefs = requireContext()
+                .getSharedPreferences(TTSManager.PREFS_NAME, Context.MODE_PRIVATE)
+            prefs.getBoolean(TTSManager.KEY_VOICE_SETTINGS_KNOWN, false) ||
+                prefs.getBoolean(TTSManager.KEY_VOICE_PROMPT_RESOLVED, false)
+        } catch (_: Throwable) { false }
+    }
+
+    /** Persist that the user has opened Voice Settings (dismisses the cue hint). */
+    private fun markVoiceSettingsLearned() {
+        try {
+            requireContext().getSharedPreferences(TTSManager.PREFS_NAME, Context.MODE_PRIVATE)
+                .edit().putBoolean(TTSManager.KEY_VOICE_SETTINGS_KNOWN, true).apply()
+        } catch (_: Throwable) {}
+    }
+
     // ══════════════════════════════════════════════════════════════════
     // Status Bar
     // ══════════════════════════════════════════════════════════════════
@@ -1414,6 +1633,18 @@ class CameraFragment : Fragment() {
          * hardware drain latency after onDone() fires.
          */
         private const val AUDIO_DRAIN_GRACE_MS = 600L
+
+        /** Spoken phrases that open Accessibility Settings (disable TalkBack). */
+        private val ACCESSIBILITY_SETTINGS_PHRASES = listOf(
+            "open accessibility settings", "accessibility settings", "accessibility setting",
+            "talkback settings", "talkback setting", "talk back settings",
+            "turn off talkback", "turn talkback off", "disable talkback",
+            "stop talkback", "close talkback", "turn off talk back",
+            "tetapan kebolehaksesan", "buka tetapan kebolehaksesan",
+            "tetapan aksesibiliti", "tutup talkback", "matikan talkback",
+            "辅助功能设置", "打开辅助功能设置", "无障碍设置", "关闭talkback",
+            "关闭语音播报", "talkback设置"
+        )
 
         /** Spoken phrases that open the voice audition ("double tap, then say…"). */
         private val VOICE_SETTINGS_PHRASES = listOf(
@@ -1487,5 +1718,8 @@ class CameraFragment : Fragment() {
 
         /** Delay before re-checking the voice after returning from the installer (ms). */
         private const val VOICE_INSTALL_RECHECK_DELAY_MS = 1_800L
+
+        /** Delay before re-checking TalkBack after returning from Accessibility Settings (ms). */
+        private const val ACCESSIBILITY_RETURN_RECHECK_DELAY_MS = 1_800L
     }
 }

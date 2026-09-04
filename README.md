@@ -16,13 +16,17 @@
 Vyze speaks what the camera sees — instantly, privately, offline.
 
 - **Scene Description** — "A wooden chair is directly ahead, about 3 steps away"
-- **Text Reading** — Reads labels, signs, prescriptions, menus aloud
-- **Handwriting Recognition** — Reads sticky notes, handwritten documents
+- **Text Reading** — Reads labels, signs, prescriptions, packaging and menus aloud — in whole sentences, in the text's original language, to the end
+- **Product & Brand Naming** — Identifies packaged goods by brand and product type as printed ("Maggi instant noodle packet"), then reads the rest
+- **Currency Reading** — Reads the value on banknotes and coins aloud, with a strict never-guess rule
+- **Medicine Lookup** — Cross-references OCR against a local drug database to answer "what medicine is this?"
 - **Multi-Language** — Auto-detects your spoken language and responds in it (English, Malay, Chinese, and more)
-- **Continuous Mode** — Point-and-describe loop for hands-free exploration
-- **Voice Control** — Ask questions naturally: "What medicine is this?"
+- **Text-Only Q&A** — Answers general-knowledge questions ("what is paracetamol used for?") without the camera
+- **Gesture Map** — Single tap: look · Double tap: ask by voice · Long press: light check · Triple tap: color · Triple tap + hold: SOS
+- **Hands-Free Voice Sessions** — After a double-tap question the mic stays open for follow-ups; pick your voice by voice ("voice settings")
+- **Noisy-Room Rescue** — When the recognizer gets lost in a crowd, Gemma's own audio encoder transcribes your repeat, fully offline
 - **Voice Bug Reporting** — Say "I want to make a report" to file issues hands-free
-- **Permanent Audio Focus** — Suppresses TalkBack during session for clean audio output
+- **Audio** — Speaks through the media stream at exactly your phone's volume, so the hardware volume buttons work normally
 
 ---
 
@@ -53,6 +57,7 @@ Camera Frame ──→ ML Kit OCR ──→ DynamicPromptBuilder
 | **CameraSetupDelegate** | `CameraSetupDelegate.kt` | CameraX frame extraction, snapshot capture |
 | **CameraFragment** | `CameraFragment.kt` | UI, speech callbacks, auto-snapshot loop |
 | **MemoryRepository** | `MemoryRepository.kt` | Vector similarity search, adaptive intelligence |
+| **AudioCapture** | `AudioCapture.kt` | 16 kHz mono float32 recorder for the model-native ASR rescue |
 | **MainActivity** | `MainActivity.kt` | Speech recognition, lifecycle, TTS orchestration |
 | **ReportManager** | `ReportManager.kt` | Voice-driven bug reporting via email |
 
@@ -67,10 +72,10 @@ All inference runs on-device. No cloud APIs, no data uploads, no subscriptions. 
 - **OCR fast-path**: ~150ms (ML Kit only — skips Gemma when confidence ≥ 85%)
 - **OCR + Gemma**: ~300-500ms (ML Kit text + Gemma interpretation)
 - **Scene queries**: ~1.5-2s (Gemma with trimmed prompts)
-- **First audio**: <3 characters (sentence-buffered streaming)
+- **First audio**: within ~3 characters of generated text (sentence-buffered streaming)
 
 ### Adaptive Memory
-Vyze remembers your environment. Uses Room DB + vector similarity search to recall past observations and provide spatial continuity.
+After every scan Vyze stores a lightweight visual fingerprint plus the scene description in a local Room database. Before analyzing a new frame it searches recent fingerprints; when a frame strongly matches a scan from the last 24 hours, the prior description is injected into the prompt as context — so the answer can open with "this looks like the box you scanned earlier" instead of describing from zero. Memory is context, never a substitute: every scan still analyzes the live frame fresh.
 
 ### Multi-Language
 Automatically detects your spoken language via SpeechRecognizer and mirrors it to both Gemma's output and the TTS voice. Supports English, Malay, Chinese, and any language with an installed TTS voice pack. No hardcoded language lists — uses Android's dynamic Locale resolution.
@@ -90,8 +95,20 @@ Point-and-describe loop with thermal safety — automatically throttles capture 
 ### Voice Bug Reporting
 Say "I want to make a report" (English/Malay/Chinese) to enter report mode. Speak your issue, and the app saves a device-annotated report file and pre-fills an email — one tap to send.
 
-### Permanent Audio Focus
-Like Google Lens and Be My Eyes, Vyze holds `AUDIOFOCUS_GAIN` for the entire session — suppressing TalkBack and other accessibility audio during active use. TalkBack resumes cleanly when the app closes.
+### Voice Settings by Voice
+Double tap, then say "voice settings" to audition every installed voice hands-free — "next" to hear the next voice, "use this" to keep it, "cancel" to stop. The choice persists per language. The teaching hint in the double-tap listening cue appears only until you have used Voice Settings once (or answered the one-time better-voice prompt).
+
+### Audio Focus & TalkBack
+Vyze holds audio focus for the whole session and speaks through the **media stream** at exactly the phone's volume, so the hardware volume buttons keep working and every utterance is stable. Android does not allow apps to duck or pause TalkBack, so Vyze detects TalkBack on launch, speaks a one-time advisory, and offers a guided voice command ("open accessibility settings") that takes the user straight to the TalkBack toggle — then re-checks and confirms on return.
+
+### Text-Only Q&A (no camera)
+Questions that don't reference the visual scene — "what is paracetamol used for?", "bagaimana cara mengikat tali?" — are answered by Gemma's text decoder alone: no camera capture, no image inference. Faster and cheaper, and it works without pointing the phone at anything. Any question mentioning "this / here / in front of me" is conservatively routed to the camera instead, so a pointing question is never stolen.
+
+### Noisy-Room Rescue (model-native ASR)
+When Android's recognizer gives up (no match, timeout, audio error — the classic "lost in a room full of people" case), Vyze speaks "Please say that again", records the repeat via `AudioCapture` (16 kHz mono float32 PCM), and transcribes it with Gemma 4 E2B's built-in audio encoder — fully offline, no Google services, one attempt per session, no beep loops.
+
+### Reading Whole Panels
+Tap or ask about dense packaging and the full text is read to the end: an adaptive output budget is sized to the OCR text actually found (up to ~800 words), the inference watchdog re-arms while tokens are still flowing so long reads are never cut off mid-way, and the prompt forbids letter-by-letter spelling and premature stops. Brand pronunciation is corrected before synthesis ("Maggi" is spoken MAY-ghee, not MAY-jee).
 
 ---
 
@@ -120,7 +137,7 @@ GPU kernels are pre-compiled during warm-up to eliminate first-inference cold-st
 | **OCR** | Google ML Kit Text Recognition (Latin + Chinese) |
 | **Camera** | CameraX 1.3.1 |
 | **TTS** | Google Android TTS (neural voice selection) |
-| **Speech Recognition** | Android SpeechRecognizer |
+| **Speech Recognition** | Android SpeechRecognizer + Gemma 4 E2B native ASR fallback (offline) |
 | **Database** | Room 2.7.0 (adaptive memory + vector search) |
 | **Coroutines** | kotlinx-coroutines 1.10.1 |
 | **Language** | Kotlin 2.3.0 |

@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.Color
 import android.os.Bundle
+import android.provider.Settings
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
@@ -21,6 +22,10 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.navigation.fragment.NavHostFragment
 import com.vyze.app.databinding.ActivityMainBinding
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 
 /**
  * Main entry point into the Vyze app. Single-activity pattern with
@@ -49,10 +54,27 @@ class MainActivity : AppCompatActivity() {
     var talkBackDetected = false
         private set
 
+    /** Clear the detected-TalkBack flag once the user confirms TalkBack is off. */
+    fun clearTalkBackDetected() {
+        talkBackDetected = false
+    }
+
     // ── Speech-to-Text ────────────────────────────────────────────
 
     private var speechRecognizer: SpeechRecognizer? = null
     private var isListening = false
+
+    /**
+     * True while the fragment WANTS the mic open (a voice session, the voice
+     * audition, report mode). Cleared the instant the user aborts with a tap
+     * or the session ends. When false, stale recognizer callbacks from the
+     * just-cancelled session are dropped at the source instead of reaching
+     * the fragment — this is what caused the phantom "I did not catch that"
+     * speech that used to precede tap results when switching between single
+     * tap and double tap.
+     */
+    @Volatile
+    var voiceSessionWanted = false
 
     // ── Noise Robustness (Tier 1) ────────────────────────────────
     // L1: Adaptive restart backoff — grows between failed recognition
@@ -72,6 +94,21 @@ class MainActivity : AppCompatActivity() {
 
     /** Cached intent for speech recognition sessions. */
     private var speechIntent: Intent? = null
+
+    // ── Tier 2: Model-Native ASR Rescue ──────────────────────────
+    // When Android's SpeechRecognizer fails in a noisy room (NO_MATCH,
+    // SPEECH_TIMEOUT, ERROR_AUDIO), Vyze rescues the query with Gemma 4
+    // E2B's NATIVE audio encoder: it records the user's speech directly
+    // and transcribes it fully offline — no Google services, no network.
+    private val asrScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /** Prevent fallback loops — only one model-ASR attempt per session. */
+    @Volatile
+    private var asrFallbackTried = false
+
+    /** Last locale Google's recognizer reported — reused for the model-ASR result. */
+    @Volatile
+    private var lastDetectedLocale: java.util.Locale? = null
 
     /** Callback invoked when speech recognition completes with final text + detected language. */
     var onSpeechResult: ((String, java.util.Locale?) -> Unit)? = null
@@ -232,23 +269,58 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Detect if TalkBack is enabled and warn the user once.
-     * Vyze holds permanent audio focus to suppress TalkBack, but if the user
-     * has TalkBack enabled, they should know they can disable it for the best
-     * experience (fewer audio conflicts).
+     * True when TalkBack (or another touch-exploration screen reader) is
+     * enabled. Touch exploration means the screen reader intercepts taps,
+     * which conflicts with Vyze's gesture map — the user should disable
+     * it while using Vyze.
      */
-    private fun detectTalkBack() {
-        try {
+    fun isTalkBackEnabled(): Boolean {
+        return try {
             val am = getSystemService(Context.ACCESSIBILITY_SERVICE) as? android.view.accessibility.AccessibilityManager
-            if (am != null && am.isEnabled && am.isTouchExplorationEnabled) {
-                Log.i(TAG, "TalkBack detected — announcing advisory")
-                CrashLogFile.log(TAG, "TalkBack enabled — advisory spoken")
-                // One-time advisory after model is ready (handled by CameraFragment onboarding)
-                // Store flag so CameraFragment can include the advisory in its onboarding message
-                talkBackDetected = true
-            }
+            am != null && am.isEnabled && am.isTouchExplorationEnabled
         } catch (e: Throwable) {
             Log.w(TAG, "TalkBack detection failed: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * Detect if TalkBack is enabled and warn the user once.
+     * Vyze cannot duck or pause TalkBack (Android forbids it), so if the user
+     * has TalkBack enabled we advise them to turn it off for the best
+     * experience — or open Accessibility Settings for them on request.
+     */
+    private fun detectTalkBack() {
+        if (isTalkBackEnabled()) {
+            Log.i(TAG, "TalkBack detected — announcing advisory")
+            CrashLogFile.log(TAG, "TalkBack enabled — advisory spoken")
+            // One-time advisory after model is ready (handled by CameraFragment onboarding)
+            // Store flag so CameraFragment can include the advisory in its onboarding message
+            talkBackDetected = true
+        }
+    }
+
+    /**
+     * Open the system Accessibility Settings screen so the user can toggle
+     * TalkBack off (TalkBack still works on that screen, so they can navigate
+     * it). Returns false if the screen is unavailable on this device.
+     */
+    fun openAccessibilitySettings(): Boolean {
+        return try {
+            val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            if (intent.resolveActivity(packageManager) != null) {
+                startActivity(intent)
+                Log.i(TAG, "Opened Accessibility Settings")
+                true
+            } else {
+                Log.w(TAG, "No Accessibility Settings screen available")
+                false
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "Failed to open Accessibility Settings: ${e.message}")
+            false
         }
     }
 
@@ -433,6 +505,92 @@ class MainActivity : AppCompatActivity() {
         rejectedCycleCount = 0
         resetRetryBackoff()
         Log.i(TAG, "Noise pause cleared — listening can resume")
+    }
+
+    // ── Tier 2: Model-Native ASR Rescue ────────────────────────────
+
+    /**
+     * Rescue a failed recognition with Gemma 4 E2B's NATIVE audio encoder.
+     *
+     * Called when Android's SpeechRecognizer gives up (NO_MATCH,
+     * SPEECH_TIMEOUT, ERROR_AUDIO) — the classic "query lost in a noisy
+     * room" case. Vyze speaks a short cue, records the user's repeat with
+     * [AudioCapture], and transcribes it fully offline via the model.
+     *
+     * @return true if the rescue path is running (caller must NOT end the
+     *         session); false if the rescue is unavailable and the caller
+     *         should fall through to normal error handling.
+     */
+    private fun attemptModelAsrRescue(originalError: String): Boolean {
+        if (asrFallbackTried) {
+            Log.d(TAG, "Model-ASR rescue already attempted this session — skipping")
+            return false
+        }
+        asrFallbackTried = true
+
+        val core = (application as? VyzeApplication)?.coreController
+        if (core == null || !core.isEngineReady() || core.isCurrentlyInferring()) {
+            Log.d(TAG, "Model-ASR rescue unavailable (core=${core != null}, " +
+                "ready=${core?.isEngineReady()}, inferring=${core?.isCurrentlyInferring()})")
+            return false
+        }
+
+        Log.i(TAG, "SpeechRecognizer failed — launching model-native ASR rescue")
+        CrashLogFile.log(TAG, "MODEL-ASR RESCUE: $originalError")
+
+        // Cue the user to repeat, then record + transcribe on the IO scope.
+        // speakThenCallback fires onDone on the UI thread.
+        speakThenCallback("Please say that again.") {
+            asrScope.launch {
+                try {
+                    val audio = AudioCapture.recordSpeech()
+                    if (audio == null) {
+                        Log.w(TAG, "Model-ASR rescue: audio capture failed")
+                        finishRescueWithError(originalError)
+                        return@launch
+                    }
+                    val transcription = core.transcribeAudio(audio)?.trim()
+                    if (transcription.isNullOrBlank()) {
+                        Log.w(TAG, "Model-ASR rescue: nothing understood")
+                        finishRescueWithError(originalError)
+                        return@launch
+                    }
+                    Log.i(TAG, "Model-ASR transcription: \"$transcription\"")
+                    CrashLogFile.log(TAG, "MODEL-ASR transcription: \"$transcription\"")
+                    runOnUiThread {
+                        // The user may have tapped away while the rescue was
+                        // recording (e.g. they chose a tap instead of repeating)
+                        // — a late transcription must not fire as a fresh query.
+                        if (!voiceSessionWanted) {
+                            Log.d(TAG, "Model-ASR transcription after session aborted — dropping")
+                            return@runOnUiThread
+                        }
+                        // Reuse the last Google-detected locale (or null → US)
+                        // so language mirroring keeps working.
+                        onSpeechResult?.invoke(transcription, lastDetectedLocale)
+                    }
+                } catch (e: Throwable) {
+                    Log.e(TAG, "Model-ASR rescue crashed: ${e.message}")
+                    finishRescueWithError(originalError)
+                }
+            }
+        }
+        return true
+    }
+
+    /** Fall through to the original speech error after a failed rescue. */
+    private fun finishRescueWithError(originalError: String) {
+        runOnUiThread {
+            // The user may have tapped away while the rescue was recording —
+            // then this error belongs to the dead session and must not reach
+            // the fragment (it would clobber the tap's analysis state).
+            if (!voiceSessionWanted) {
+                Log.d(TAG, "Model-ASR rescue failed after session aborted — dropping error")
+                return@runOnUiThread
+            }
+            onPartialSpeechResult?.invoke("")
+            onSpeechError?.invoke(originalError)
+        }
     }
 
     /** L2: decide whether a transcription is ambient conversation, not the user. */
@@ -709,6 +867,9 @@ class MainActivity : AppCompatActivity() {
      */
     private fun startListeningInternal() {
         try {
+            // Fresh voice session — allow one model-ASR rescue attempt
+            asrFallbackTried = false
+
             // Barge-in: stop TTS before opening the microphone
             if (ttsReady && ttsManager.isSpeaking()) {
                 Log.d(TAG, "Barge-in: stopping TTS before speech recognition")
@@ -794,6 +955,17 @@ class MainActivity : AppCompatActivity() {
 
             override fun onError(error: Int) {
                 isListening = false
+                // ── STALE-SESSION GATE ──────────────────────────────
+                // The user may have aborted this session (a tap/double-tap
+                // cancels the mic before the recognizer reports its result).
+                // In that case the error belongs to the dead session — do NOT
+                // restart the mic, do NOT run the model-ASR rescue, and do NOT
+                // surface the error to the fragment (it would speak "I did not
+                // catch that" right before the real answer arrives).
+                if (!voiceSessionWanted) {
+                    Log.d(TAG, "onError($error) after session aborted — dropping stale callback")
+                    return
+                }
                 val errorMsg = when (error) {
                     SpeechRecognizer.ERROR_NO_MATCH -> {
                         Log.d(TAG, "onError: NO_MATCH — no speech detected")
@@ -818,10 +990,19 @@ class MainActivity : AppCompatActivity() {
 
                 when (error) {
                     SpeechRecognizer.ERROR_NO_MATCH,
-                    SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> {
-                        // On-demand voice session — no speech was heard, so end
-                        // the session cleanly instead of auto-restarting the mic
-                        // (no beep loops, no idle listening).
+                    SpeechRecognizer.ERROR_SPEECH_TIMEOUT,
+                    SpeechRecognizer.ERROR_AUDIO -> {
+                        // ── TIER 2 RESCUE: model-native ASR ──────────────
+                        // The recognizer heard nothing useful (the classic
+                        // "query lost in a noisy room" case). Before ending
+                        // the session, let Gemma's own audio encoder listen:
+                        // record the user's speech and transcribe it offline.
+                        // Only one attempt per session — no beep loops.
+                        if (attemptModelAsrRescue(errorMsg)) {
+                            return
+                        }
+                        // Rescue failed / unavailable — end the session cleanly
+                        // (no auto-restart, no idle listening).
                         onPartialSpeechResult?.invoke("")
                         onSpeechError?.invoke(errorMsg)
                     }
@@ -842,6 +1023,15 @@ class MainActivity : AppCompatActivity() {
 
             override fun onResults(results: Bundle?) {
                 isListening = false
+                // ── STALE-SESSION GATE ──────────────────────────────
+                // A transcription can arrive AFTER the user already tapped
+                // away (SpeechRecognizer commits asynchronously). Re-queuing
+                // it as a fresh query would cancel the user's in-flight tap
+                // analysis — drop it instead.
+                if (!voiceSessionWanted) {
+                    Log.d(TAG, "onResults after session aborted — dropping stale transcription")
+                    return
+                }
                 val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                 val bestMatch = matches?.firstOrNull()
 
@@ -887,10 +1077,14 @@ class MainActivity : AppCompatActivity() {
 
                 Log.i(TAG, "onResults: \"$bestMatch\" lang=$finalLocale (bundle=$detectedLang)")
                 CrashLogFile.log(TAG, "Speech result: \"$bestMatch\" lang=$finalLocale")
+                lastDetectedLocale = finalLocale
                 onSpeechResult?.invoke(bestMatch, finalLocale)
             }
 
             override fun onPartialResults(partialResults: Bundle?) {
+                if (!voiceSessionWanted) {
+                    return // stale partial from an aborted session
+                }
                 val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                 val partial = matches?.firstOrNull()
                 if (!partial.isNullOrBlank()) {

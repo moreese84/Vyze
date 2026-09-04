@@ -9,6 +9,7 @@ import android.util.Log
 import com.vyze.app.data.InteractionDao
 import com.vyze.app.data.MemoryDao
 import com.vyze.app.memory.MemoryRepository
+import com.vyze.app.memory.SimilarInteraction
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -64,6 +65,19 @@ class VyzeCoreController(
 
     @Volatile
     private var activeSessionId: String = ""
+
+    /** True while the current snapshot is a currency query (banknote/coin). */
+    @Volatile
+    private var currencyModeActive = false
+
+    /**
+     * Timestamp of the last inference activity (token received). The
+     * watchdog re-arms itself while tokens are still flowing, so long
+     * read-back generations are never force-killed mid-sentence — but a
+     * genuinely hung inference (no tokens for the grace period) still resets.
+     */
+    @Volatile
+    private var lastInferenceActivityMs: Long = 0L
 
     // ── Debounce Cache ────────────────────────────────────────────
 
@@ -223,6 +237,10 @@ class VyzeCoreController(
                 // Stale token — SILENTLY DROP
             } else {
                 try {
+                    // ── WATCHDOG PROGRESS: tokens are flowing — reset the
+                    //    stall clock so long generations are never killed.
+                    lastInferenceActivityMs = System.currentTimeMillis()
+
                     // ── CONFIDENCE CHECK: abort if model is hedging ──────
                     // Track the first few tokens. If the model starts with
                     // hedging language ("I think", "maybe", "it looks like"),
@@ -276,6 +294,20 @@ class VyzeCoreController(
                         } catch (e: Throwable) {
                             CrashLogFile.logError(TAG, "Memory store failed: ${e.javaClass.simpleName}: ${e.message}", e)
                         }
+
+                        // ── CURRENCY SCAN HISTORY ─────────────────────
+                        // Persist a confident money read (banknote or coin)
+                        // into scan history via the existing CURRENCY type.
+                        if (currencyModeActive && fullResponse.isNotBlank()) {
+                            try {
+                                com.vyze.app.data.ScanRepository(context.applicationContext)
+                                    .saveCurrencyScan(fullResponse.take(120))
+                                CrashLogFile.log(TAG, "Currency scan saved: ${fullResponse.take(60)}")
+                            } catch (e: Throwable) {
+                                CrashLogFile.logError(TAG, "Currency scan save failed: ${e.message}", e)
+                            }
+                        }
+                        currencyModeActive = false
                     }
                     isInferring.set(false)
                     CrashLogFile.log(TAG, "isInferring set to false")
@@ -554,6 +586,7 @@ class VyzeCoreController(
         resetSentenceBuffer()
         lastDescribedObject = ""
         lastDescribedTime = 0L
+        currencyModeActive = false
     }
 
     // ── Snapshot Trigger ───────────────────────────────────────────
@@ -601,30 +634,53 @@ class VyzeCoreController(
         resetSentenceBuffer()
 
         // ── Dynamic Resolution Scaling ──────────────────────────
-        // Text-extraction queries ("read", "label", etc.) benefit from higher
+        // Text-extraction queries ("read", "label", etc.) and tap queries
+        // (which often land on objects with labels) benefit from higher
         // resolution (384x384) to capture fine-grained text details.
         // Standard scene queries use 256x256 for faster inference.
-        val targetDimension = if (isTextExtractionQuery(query)) {
+        val isTapQuery = query?.contains(TAP_POSITION_MARKER) == true
+        val currencyQuery = isCurrencyQuery(query)
+        currencyModeActive = currencyQuery
+        // Pointing questions ("what is this", "apa ini", "这是什么") point at a
+        // real object, usually packaged goods with labels — give them the
+        // high-resolution + OCR pre-pass so the brand and text are read from
+        // ground truth instead of a 256px guess.
+        val isTextQuery = isTextExtractionQuery(query) || isTapQuery || currencyQuery ||
+            isPointingQuery(query)
+        val targetDimension = if (isTextQuery) {
             TEXT_EXTRACTION_DIMENSION
         } else {
             SCENE_QUERY_DIMENSION
         }
-        CrashLogFile.log(TAG, "Target dimension: $targetDimension (query=\"${query?.take(40)}\")")
+        CrashLogFile.log(TAG, "Target dimension: $targetDimension (query=\"${query?.take(40)}\", tap=$isTapQuery)")
 
-        onStatusUpdate("Analyzing snapshot...")        // ── Watchdog Timer ───────────────────────────────────────
-        // If neither onComplete nor onError fires within WATCHDOG_TIMEOUT_MS,
-        // force-reset the pipeline and notify the user. Prevents indefinite
-        // ANALYZING state when the VLM hangs on GPU execution.
-        val watchdogRunnable = Runnable {
-            if (isInferring.get() && activeSessionId == currentSessionId) {
-                Log.e(TAG, "Watchdog: inference hung for ${WATCHDOG_TIMEOUT_MS}ms — force resetting")
-                CrashLogFile.log(TAG, "WATCHDOG FIRED — forcing pipeline reset")
-                isInferring.set(false)
-                cancelInference()
-                resetSentenceBuffer()
-                mainHandler.post {
-                    onStatusUpdate?.invoke("Inference timed out")
-                    onError?.invoke("Inference timed out. Please try again.")
+        onStatusUpdate("Analyzing snapshot...")
+
+        // ── Watchdog Timer (progress-aware) ────────────────────
+        // Safety net against a hung GPU inference. The runnable re-arms
+        // itself whenever tokens are still flowing (lastInferenceActivityMs
+        // updated on every received token), so a long text read-back is
+        // never force-killed mid-sentence — only a stall with NO output for
+        // WATCHDOG_TIMEOUT_MS triggers the force reset.
+        lastInferenceActivityMs = System.currentTimeMillis()
+        val watchdogRunnable = object : Runnable {
+            override fun run() {
+                if (isInferring.get() && activeSessionId == currentSessionId) {
+                    val idleMs = System.currentTimeMillis() - lastInferenceActivityMs
+                    if (idleMs < WATCHDOG_TIMEOUT_MS) {
+                        // Still making progress — re-arm and keep watching.
+                        mainHandler.postDelayed(this, WATCHDOG_TIMEOUT_MS)
+                    } else {
+                        Log.e(TAG, "Watchdog: no output for ${WATCHDOG_TIMEOUT_MS}ms — force resetting")
+                        CrashLogFile.log(TAG, "WATCHDOG FIRED — forcing pipeline reset")
+                        isInferring.set(false)
+                        cancelInference()
+                        resetSentenceBuffer()
+                        mainHandler.post {
+                            onStatusUpdate?.invoke("Inference timed out")
+                            onError?.invoke("Inference timed out. Please try again.")
+                        }
+                    }
                 }
             }
         }
@@ -681,13 +737,15 @@ class VyzeCoreController(
                     }
                 } else bitmap
 
-                // ── OCR PRE-PASS (text queries only) ──────────────
+                // ── OCR PRE-PASS (text + tap queries) ────────────
                 // ML Kit OCR is 10-30x faster than full VLM inference.
-                // For text queries, run OCR first, then feed clean text
-                // to Gemma for interpretation — skips character-level reading.
+                // For text and tap queries, run OCR first, then feed clean
+                // text to Gemma for interpretation — the model can read
+                // labels and boxes verbatim instead of guessing from a
+                // 256px downscale. A tap often lands on an object with
+                // text (medicine boxes, signs), so taps always OCR.
                 var ocrText: String? = null
                 var ocrConfidence = 0f
-                val isTextQuery = isTextExtractionQuery(query)
 
                 if (isTextQuery) {
                     CrashLogFile.log(TAG, "Text query detected — running ML Kit OCR...")
@@ -714,10 +772,11 @@ class VyzeCoreController(
                 }
 
                 // ── OCR FAST-PATH: skip Gemma if confidence is high ──
-                // If ML Kit returned clean, high-confidence text, there's no
-                // need to invoke the 3.66GB Gemma model. TTS reads OCR text
-                // directly — saves battery and reduces latency from ~5s to ~150ms.
-                if (isTextQuery && !ocrText.isNullOrBlank() && ocrConfidence >= OCR_FAST_PATH_CONFIDENCE) {
+                // Only for EXPLICIT text queries ("read this label") — the
+                // whole ask is the text, so reading it directly is correct.
+                // Tap queries keep Gemma in the loop (scene + object reading)
+                // and just benefit from the injected OCR text.
+                if (isTextExtractionQuery(query) && !ocrText.isNullOrBlank() && ocrConfidence >= OCR_FAST_PATH_CONFIDENCE) {
                     CrashLogFile.log(TAG, "OCR FAST-PATH: confidence=$ocrConfidence >= $OCR_FAST_PATH_CONFIDENCE — skipping Gemma")
                     isInferring.set(false)
                     mainHandler.removeCallbacks(watchdogRunnable)
@@ -737,13 +796,37 @@ class VyzeCoreController(
                     return@launch
                 }
 
+                // ── MEMORY CONTEXT (resolved in parallel with OCR above) ──
+                // If the current frame strongly matches a RECENT past scan, hand
+                // the prior description to the model as context. The model still
+                // analyzes the FRESH frame — memory never replaces the analysis,
+                // it only lets the answer confirm continuity ("same box you
+                // scanned earlier") instead of describing from zero.
+                val similarInteractions = try {
+                    similarInteractionsDeferred.await()
+                } catch (e: Throwable) {
+                    emptyList()
+                }
+                CrashLogFile.log(TAG, "Similar interactions resolved: ${similarInteractions.size} found")
+
+                val memoryContext = if (continuousMode || currencyModeActive || !ocrText.isNullOrBlank()) {
+                    null // scene memory adds nothing where OCR is already the ground truth
+                } else {
+                    buildMemoryContext(similarInteractions)
+                }
+                if (memoryContext != null) {
+                    CrashLogFile.log(TAG, "Memory context injected: ${memoryContext.take(80)}...")
+                }
+
                 CrashLogFile.log(TAG, "Building prompt...")
                 val basePrompt = promptBuilder.buildPrompt(
                     snapshotDescription = query ?: "User triggered a camera snapshot.",
                     queryOverride = query,
                     continuousMode = continuousMode,
                     userLocale = activeUserLocale,
-                    ocrText = ocrText
+                    ocrText = ocrText,
+                    currencyMode = currencyModeActive,
+                    memoryContext = memoryContext
                 )
                 CrashLogFile.log(TAG, "Base prompt built: ${basePrompt.length} chars")
 
@@ -754,9 +837,15 @@ class VyzeCoreController(
                 }
 
                 CrashLogFile.log(TAG, "Calling vlmEngine.analyzeImage()...")
-                // Text queries need more tokens (medicine labels, documents)
-                // Scene queries are concise (25 words max)
-                val inferenceMaxTokens = if (isTextQuery) TEXT_QUERY_MAX_TOKENS else SCENE_QUERY_MAX_TOKENS
+                // Scene queries are concise (25 words max). Text queries get an
+                // ADAPTIVE budget sized to the OCR text actually found — the
+                // model mostly echoes it back, so a dense back-panel gets a
+                // proportional budget instead of hitting a fixed cap.
+                val inferenceMaxTokens = if (isTextQuery) {
+                    textQueryTokenBudget(ocrText)
+                } else {
+                    SCENE_QUERY_MAX_TOKENS
+                }
                 val response = vlmEngine.analyzeImage(
                     bitmap = inferenceBitmap,
                     prompt = basePrompt,
@@ -774,13 +863,6 @@ class VyzeCoreController(
                 }
 
                 CrashLogFile.log(TAG, "analyzeImage() returned: ${response?.length ?: 0} chars")
-
-                val similarInteractions = try {
-                    similarInteractionsDeferred.await()
-                } catch (e: Throwable) {
-                    emptyList()
-                }
-                CrashLogFile.log(TAG, "Similar interactions resolved: ${similarInteractions.size} found")
 
                 if (response == null) {
                     // ALWAYS reset isInferring — prevents stuck ANALYZING state
@@ -854,6 +936,186 @@ class VyzeCoreController(
 
     fun triggerWithQuery(bitmap: Bitmap, query: String) {
         triggerSnapshot(bitmap, query)
+    }
+
+    // ── Text-Only Q&A (no camera needed) ──────────────────────────
+
+    /**
+     * Detect general-knowledge questions that need NO camera frame
+     * ("what is paracetamol used for?", "how do I tie a knot?"). These are
+     * answered by the model's text decoder alone — faster and cheaper than
+     * image inference, and they don't require pointing the phone.
+     *
+     * Conservative by design: if the query mentions anything visual
+     * (this, here, in front, see, look), it falls through to the normal
+     * camera pipeline — a missed text-only route is safe, a wrongly
+     * routed visual query is not.
+     */
+    fun isTextOnlyQuery(query: String?): Boolean {
+        if (query.isNullOrBlank()) return false
+        val lower = query.lowercase()
+        // Must contain a knowledge-question marker...
+        val hasKnowledgeMarker = TEXT_ONLY_QUERY_KEYWORDS.any { lower.contains(it) }
+        if (!hasKnowledgeMarker) return false
+        // ...and must NOT reference the visual scene.
+        val referencesScene = TEXT_ONLY_EXCLUDE_KEYWORDS.any { lower.contains(it) }
+        return !referencesScene
+    }
+
+    /**
+     * Run a text-only inference — no bitmap, no OCR, no memory fingerprint.
+     * Uses the model's text decoder directly for general-knowledge answers.
+     *
+     * The response streams through the same onTokenGenerated/onComplete
+     * callbacks and is spoken by the caller (CameraFragment) exactly like a
+     * scene answer.
+     */
+    fun triggerTextQuery(query: String) {
+        if (!engineReady) {
+            Log.w(TAG, "triggerTextQuery called but engine not ready")
+            return
+        }
+        if (!isInferring.compareAndSet(false, true)) {
+            Log.d(TAG, "Text inference already in progress — ignoring")
+            return
+        }
+
+        // Fresh session — stale callbacks from a previous inference are dropped
+        activeSessionId = UUID.randomUUID().toString()
+        val currentSessionId = activeSessionId
+        resetSentenceBuffer()
+
+        // Progress-aware watchdog — same protection as image inference
+        lastInferenceActivityMs = System.currentTimeMillis()
+        val watchdogRunnable = object : Runnable {
+            override fun run() {
+                if (isInferring.get() && activeSessionId == currentSessionId) {
+                    val idleMs = System.currentTimeMillis() - lastInferenceActivityMs
+                    if (idleMs < WATCHDOG_TIMEOUT_MS) {
+                        mainHandler.postDelayed(this, WATCHDOG_TIMEOUT_MS)
+                    } else {
+                        Log.e(TAG, "Watchdog: no text output for ${WATCHDOG_TIMEOUT_MS}ms — force resetting")
+                        isInferring.set(false)
+                        cancelInference()
+                        resetSentenceBuffer()
+                        mainHandler.post {
+                            onStatusUpdate?.invoke("Inference timed out")
+                            onError?.invoke("Inference timed out. Please try again.")
+                        }
+                    }
+                }
+            }
+        }
+        mainHandler.postDelayed(watchdogRunnable, WATCHDOG_TIMEOUT_MS)
+
+        inferenceJob = scope.launch {
+            try {
+                // ── CANCELLATION CHECK ──────────────────────────
+                if (!isActive) {
+                    Log.d(TAG, "Text job cancelled before start — aborting")
+                    return@launch
+                }
+
+                CrashLogFile.log(TAG, "Building text-only prompt...")
+                val basePrompt = promptBuilder.buildPrompt(
+                    snapshotDescription = query,
+                    queryOverride = query,
+                    continuousMode = false,
+                    userLocale = activeUserLocale,
+                    ocrText = null,
+                    currencyMode = false,
+                    memoryContext = null
+                )
+                CrashLogFile.log(TAG, "Text prompt built: ${basePrompt.length} chars")
+
+                // ── CANCELLATION CHECK ──────────────────────────
+                if (!isActive) {
+                    Log.d(TAG, "Text job cancelled before VLM call — aborting")
+                    return@launch
+                }
+
+                CrashLogFile.log(TAG, "Calling vlmEngine.analyzeText()...")
+                val response = vlmEngine.analyzeText(
+                    prompt = basePrompt,
+                    sessionId = currentSessionId,
+                    maxTokens = TEXT_ONLY_MAX_TOKENS
+                )
+
+                if (!isActive) {
+                    Log.d(TAG, "Text job cancelled after VLM call — discarding")
+                    return@launch
+                }
+
+                CrashLogFile.log(TAG, "analyzeText() returned: ${response?.length ?: 0} chars")
+
+                if (response == null) {
+                    isInferring.set(false)
+                    flushRemainingSentenceBuffer()
+                    if (currentSessionId == activeSessionId) {
+                        mainHandler.post {
+                            onStatusUpdate?.invoke("Inference returned empty response")
+                            onError?.invoke("No response from model")
+                        }
+                    }
+                } else {
+                    CrashLogFile.log(TAG, "Storing text interaction...")
+                    try {
+                        promptBuilder.storeInteraction(query, response)
+                    } catch (e: Throwable) {
+                        CrashLogFile.logError(TAG, "Text interaction store failed: ${e.message}", e)
+                    }
+                    // Completion (speak + IDLE) fires via the shared onComplete
+                    // callback with session gating — same as image responses.
+                }
+            } catch (e: Throwable) {
+                CrashLogFile.logError(TAG, "Text query FAILED: ${e.javaClass.simpleName}: ${e.message}", e)
+                isInferring.set(false)
+                flushRemainingSentenceBuffer()
+                if (currentSessionId == activeSessionId) {
+                    mainHandler.post {
+                        onStatusUpdate?.invoke("Error: ${e.message}")
+                        onError?.invoke("Inference crashed: ${e.message}")
+                    }
+                }
+            } finally {
+                // DEFENSIVE: never leave isInferring true
+                isInferring.set(false)
+                mainHandler.removeCallbacks(watchdogRunnable)
+                CrashLogFile.log(TAG, "=== TRIGGER TEXT QUERY DONE ===")
+            }
+        }
+    }
+
+    /**
+     * Transcribe speech with the model's NATIVE audio encoder — fully
+     * offline, no Google services. This is the noisy-room rescue path:
+     * when Android's SpeechRecognizer fails or hears ambient chatter,
+     * capture the user's speech with [AudioCapture] and feed it here.
+     *
+     * @param audioBytes Raw 16 kHz mono float32 PCM (from [AudioCapture])
+     * @return The transcription, or null if nothing was understood
+     */
+    suspend fun transcribeAudio(audioBytes: ByteArray): String? {
+        if (!engineReady) {
+            Log.w(TAG, "transcribeAudio called but engine not ready")
+            return null
+        }
+        // Gemma's ASR instruction — transcribe in the user's language. The
+        // language name is derived from the active locale so Malay/Chinese
+        // speech is transcribed natively, not through an English detour.
+        val langName = activeUserLocale.getDisplayLanguage(java.util.Locale.US)
+            .ifBlank { activeUserLocale.language }
+        val asrPrompt = "Transcribe the following speech segment in $langName into $langName text. " +
+            "Follow these specific instructions for formatting the answer: " +
+            "Only output the transcription, with no newlines. " +
+            "When transcribing numbers, write the digits, i.e. write 1.7 and not one point seven, " +
+            "and write 3 instead of three."
+        return vlmEngine.transcribeAudio(
+            audioBytes = audioBytes,
+            prompt = asrPrompt,
+            sessionId = "",
+            maxTokens = ASR_MAX_TOKENS
+        )
     }
 
     fun cancelInference() {
@@ -969,6 +1231,32 @@ class VyzeCoreController(
         return TEXT_KEYWORDS.any { keyword -> lower.contains(keyword) }
     }
 
+    /**
+     * Detect generic pointing questions ("what is this", "apa ini", "这是什么").
+     * The user is asking about the object in front of the camera. These get
+     * the text path (384px + OCR pre-pass) because pointed-at objects usually
+     * carry labels/packaging — OCR ground truth stops the model from guessing
+     * a brand from a downscaled frame. Malay/Chinese equivalents included.
+     */
+    private fun isPointingQuery(query: String?): Boolean {
+        if (query.isNullOrBlank()) return false
+        val lower = query.lowercase()
+        return POINTING_KEYWORDS.any { keyword -> lower.contains(keyword) }
+    }
+
+    // ── Currency Reading (banknotes + coins) ────────────────────────
+
+    /**
+     * Detect currency queries ("what money is this", "read this note",
+     * "berapa nilai duit ini"). These route through the high-resolution
+     * text path and add no-guessing money rules to the prompt.
+     */
+    private fun isCurrencyQuery(query: String?): Boolean {
+        if (query.isNullOrBlank()) return false
+        val lower = query.lowercase()
+        return CURRENCY_KEYWORDS.any { keyword -> lower.contains(keyword) }
+    }
+
     // ── Medicine Knowledge Base ──────────────────────────────────
 
     /**
@@ -1013,6 +1301,46 @@ class VyzeCoreController(
         return null
     }
 
+    /**
+     * Size the output-token budget to the text actually found by OCR.
+     * The model mostly echoes the OCR block (~1 token per 4 chars) plus a
+     * short intro, so a dense panel gets a proportionally large budget —
+     * effectively unlimited for the text on the object — while short reads
+     * and currency answers keep a small budget and finish fast.
+     */
+    private fun textQueryTokenBudget(ocrText: String?): Int {
+        if (ocrText.isNullOrBlank()) return TEXT_QUERY_MAX_TOKENS_BASE
+        val needed = TEXT_READING_OVERHEAD_TOKENS + (ocrText.length / OCR_CHARS_PER_OUTPUT_TOKEN)
+        return needed.coerceIn(TEXT_QUERY_MAX_TOKENS_BASE, TEXT_QUERY_MAX_TOKENS_CEILING)
+    }
+
+    /**
+     * Build a short "prior scene memory" snippet for prompt injection when the
+     * current frame strongly resembles a RECENT past scan.
+     *
+     * Pure context — the model still analyzes the fresh frame; the memory only
+     * adds continuity. Prefers the most RECENT eligible match, because a scene
+     * description from seconds ago is far more trustworthy than one from hours
+     * ago (the world may have changed).
+     *
+     * @return clipped prior description, or null when nothing is eligible.
+     */
+    private fun buildMemoryContext(similar: List<SimilarInteraction>): String? {
+        val now = System.currentTimeMillis()
+        val eligible = similar.filter {
+            it.similarityScore >= MEMORY_INJECT_MIN_SIMILARITY &&
+                (now - it.record.timestamp) <= MEMORY_INJECT_MAX_AGE_MS
+        }
+        val best = eligible.minByOrNull { now - it.record.timestamp } ?: return null
+        val prior = best.record.output.trim()
+        if (prior.length < 8) return null
+        return if (prior.length > MEMORY_CONTEXT_MAX_CHARS) {
+            prior.take(MEMORY_CONTEXT_MAX_CHARS).trimEnd() + "…"
+        } else {
+            prior
+        }
+    }
+
     companion object {
         private const val TAG = "VyzeCoreController"
 
@@ -1040,8 +1368,33 @@ class VyzeCoreController(
         // ── Dynamic Token Limits ────────────────────────────────
         /** Scene queries: concise descriptions (raised — avoids mid-sentence cutoffs). */
         private const val SCENE_QUERY_MAX_TOKENS = 96
-        /** Text queries: full label/document reading (raised for long labels). */
-        private const val TEXT_QUERY_MAX_TOKENS = 160
+
+        /**
+         * Floor for text queries with no OCR text found (scene tap with no
+         * readable text, blurry label, etc.). Generous but bounded.
+         */
+        private const val TEXT_QUERY_MAX_TOKENS_BASE = 192
+
+        /**
+         * Hard ceiling for text reads. The model context + engine limits
+         * (180s inference timeout) bound any real generation anyway, so this
+         * (~800 words of output) is as close to "unlimited" as the stack allows.
+         */
+        private const val TEXT_QUERY_MAX_TOKENS_CEILING = 1024
+
+        /** Rough output tokens needed to echo OCR text verbatim (~1 per 4 chars). */
+        private const val OCR_CHARS_PER_OUTPUT_TOKEN = 4
+
+        /** Extra output budget for the model's intro/outro around the read text. */
+        private const val TEXT_READING_OVERHEAD_TOKENS = 64
+
+        // ── Memory Context Injection ────────────────────────────
+        /** Similarity bar for treating a past scan as "the same scene". */
+        private const val MEMORY_INJECT_MIN_SIMILARITY = 0.6f
+        /** Only inject memories from scans within this window (24h). */
+        private const val MEMORY_INJECT_MAX_AGE_MS = 24L * 60L * 60L * 1000L
+        /** Cap injected snippet length to keep prompts lean. */
+        private const val MEMORY_CONTEXT_MAX_CHARS = 240
 
         // ── OCR Fast-Path ──────────────────────────────────────
         /** ML Kit confidence threshold to skip Gemma and read OCR text directly. */
@@ -1056,10 +1409,59 @@ class VyzeCoreController(
             "menu", "book", "paper", "note", "letter",
             "number", "phone", "address", "name",
             "price", "tag", "caption", "title", "heading",
+            "packaging", "package", "packet", "wrapper", "bottle", "jar",
+            // Spoken reading asks
+            "what does it say", "what does this say", "does it say",
+            "does this say", "what's written", "what is written",
+            "what is printed", "printed on", "written on", "on the label",
+            "on the packaging", "can you read", "read out", "read aloud",
             // Malay / Bahasa Melayu
             "baca", "harga", "ramuan", "resipi", "ubat",
             "dos", "arahan", "alamat", "telefon", "nota",
-            "menu", "surat", "tulisan", "nombor", "nama"
+            "menu", "surat", "tulisan", "nombor", "nama",
+            "tertulis", "ditulis", "bertulis", "ada tulis",
+            "bungkusan", "pembungkusan", "pekej", "botol", "tin",
+            // Chinese
+            "写的是什么", "写着什么", "上面写着", "上面写", "包装", "瓶", "罐"
+        )
+
+        /**
+         * Deictic pointing questions — the user is asking about the object in
+         * front of the camera ("what is this", "apa ini", "这是什么"). Only
+         * phrases with an explicit pointer (this/that/ini/itu/这/那/holding)
+         * qualify — a knowledge question like "what is paracetamol" must stay
+         * on the text-only path.
+         */
+        private val POINTING_KEYWORDS = listOf(
+            // English
+            "what is this", "what's this", "what is that", "what's that",
+            "what is this thing", "what's this thing", "what is this object",
+            "what is this item", "what is this packet", "what is this box",
+            "what is this bottle", "what is this can", "what is in my hand",
+            "what is in my hands", "what am i holding", "what am i looking at",
+            "this thing", "this object", "this item", "this packet", "this box",
+            // Malay / Bahasa Melayu
+            "ini apa", "apa ini", "ni apa", "itu apa", "apa itu",
+            "benda apa ini", "apa benda ini", "ini benda apa", "benda apa",
+            "barang apa ini", "apa barang ini", "apa yang saya pegang",
+            "apa yang saya ada", "saya pegang apa", "apa yang di tangan",
+            // Chinese
+            "这是什么", "这个是什么", "那是什么", "那个是什么", "前面是什么"
+        )
+
+        /** Marker in tap queries — "User tapped at position (x, y)". */
+        private const val TAP_POSITION_MARKER = "tapped at position"
+
+        /** Keywords that trigger currency reading (banknotes + coins). */
+        private val CURRENCY_KEYWORDS = listOf(
+            // English
+            "money", "banknote", "bank note", "banknotes", "cash",
+            "currency", "ringgit", "coin", "coins",
+            // Malay / Bahasa Melayu
+            "wang", "duit", "wang kertas", "wang syiling", "duit syiling",
+            "syiling", "koin",
+            // Chinese
+            "钱", "钞票", "纸币", "硬币", "钱币", "多少钱"
         )
 
         /** Keywords that trigger medicine database lookup. */
@@ -1080,5 +1482,47 @@ class VyzeCoreController(
             "hard to tell", "unclear", "difficult to determine",
             "not certain", "seems like", "i guess"
         )
+
+        // ── Text-Only Q&A ───────────────────────────────────────
+        /** Output cap for general-knowledge answers (concise for TTS). */
+        private const val TEXT_ONLY_MAX_TOKENS = 192
+
+        /**
+         * Knowledge-question markers that route to TEXT-ONLY inference.
+         * Multi-language: English + Malay + Chinese.
+         */
+        private val TEXT_ONLY_QUERY_KEYWORDS = listOf(
+            // English
+            "what is", "what are", "who is", "who are", "why is",
+            "why do", "how do", "how to", "how does", "when is",
+            "when do", "where is", "meaning of", "definition of",
+            "tell me about", "explain", "what does", "what's the difference",
+            // Malay / Bahasa Melayu
+            "apa itu", "apa maksud", "siapa", "kenapa", "bagaimana",
+            "bila", "di mana", "maksud", "ceritakan", "terangkan",
+            // Chinese
+            "是什么", "什么意思", "为什么", "怎么", "如何", "谁", "在哪里"
+        )
+
+        /**
+         * Scene-referencing words that FORCE the camera pipeline instead of
+         * text-only. If the user says "this", "here", "in front" etc., they
+         * are pointing at something — text-only would be wrong.
+         */
+        private val TEXT_ONLY_EXCLUDE_KEYWORDS = listOf(
+            // English
+            "this", "that", "these", "those", "here", "there",
+            "in front", "in front of me", "around me", "in the room",
+            "what is this", "what's this", "this thing", "this object",
+            "near me", "see", "look", "point", "show me",
+            // Malay / Bahasa Melayu
+            "ini", "itu", "di hadapan", "sekitar", "sini", "sana",
+            "benda ini", "objek ini", "lihat", "nampak",
+            // Chinese
+            "这个", "那个", "这里", "那里", "前面", "这个东西"
+        )
+
+        /** Output cap for model-native speech transcriptions (short). */
+        private const val ASR_MAX_TOKENS = 96
     }
 }

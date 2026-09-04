@@ -258,6 +258,9 @@ class VlmEngineManager(
                 modelPath = modelFile.absolutePath,
                 backend = backend,
                 visionBackend = backend,
+                // Audio encoder runs on CPU — Gemma 4 E2B's audio model is
+                // separate from the text/vision path and loads on demand.
+                audioBackend = Backend.CPU(),
                 cacheDir = context.cacheDir.path
             )
 
@@ -367,8 +370,125 @@ class VlmEngineManager(
             val formattedPrompt = buildGemmaTurnPrompt(userPayload, SYSTEM_DIRECTIVE)
             CrashLogFile.log(TAG, "Formatted prompt: ${formattedPrompt.take(120)}...")
 
-            // 4. Create conversation with empty system instruction
-            //    (the formatted prompt is sent as user content below)
+            // 4. Build multimodal contents — formatted prompt text + clamped bitmap.
+            //    The native engine binds image patch tokens from Content.ImageBytes
+            //    directly; no literal [IMAGE_TOKEN] placeholder is needed or allowed.
+            val contents = Contents.of(
+                Content.Text(formattedPrompt),
+                Content.ImageBytes(imageBytes)
+            )
+
+            // 5. Shared inference core — conversation lifecycle, streaming, and
+            //    interrupt-safe close all live in runConversation (one place for
+            //    the image, text-only, and audio paths).
+            val response = runConversation(contents, maxTokens, sessionId)
+            val elapsed = System.currentTimeMillis() - startTime
+            CrashLogFile.log(TAG, "analyzeImage total: ${elapsed}ms")
+            response
+
+        } catch (e: Throwable) {
+            Log.e(TAG, "Inference failed: ${e.javaClass.simpleName}: ${e.message}", e)
+            CrashLogFile.logError(TAG, "Inference failed", e)
+            onError?.invoke("Inference error: ${e.message}", sessionId)
+            null
+        } finally {
+            // Explicitly recycle the scaled bitmap to free memory after inference
+            try {
+                if (scaledBitmap != null && !scaledBitmap.isRecycled) {
+                    scaledBitmap.recycle()
+                    CrashLogFile.log(TAG, "Scaled bitmap recycled")
+                }
+            } catch (_: Throwable) {}
+        }
+    }
+
+    /**
+     * Analyze a TEXT-ONLY prompt — no image, no audio. Used for general
+     * knowledge questions ("what is paracetamol used for?") where a camera
+     * frame adds nothing. Text-only inference is faster and cheaper than
+     * image inference (no vision tokens) and reuses the same shared
+     * conversation core as [analyzeImage].
+     *
+     * @param prompt    The full formatted instruction (DynamicPromptBuilder output)
+     * @param sessionId Session gating ID for callbacks
+     * @param maxTokens Output token cap for the answer
+     * @return The complete model response, or null on error
+     */
+    suspend fun analyzeText(
+        prompt: String,
+        sessionId: String = "",
+        maxTokens: Int = TEXT_ONLY_MAX_TOKENS
+    ): String? = withContext(Dispatchers.Default) {
+        CrashLogFile.log(TAG, "=== ANALYZE TEXT (no image) ===")
+        val formattedPrompt = buildGemmaTurnPrompt(prompt, TEXT_ONLY_SYSTEM_DIRECTIVE)
+        runConversation(
+            contents = Contents.of(Content.Text(formattedPrompt)),
+            maxTokens = maxTokens,
+            sessionId = sessionId
+        )
+    }
+
+    /**
+     * Transcribe speech audio using the model's NATIVE audio encoder
+     * (Gemma 4 E2B audio input). Fully offline — no Google services,
+     * no network. This is Vyze's rescue path for noisy rooms where
+     * Android's SpeechRecognizer fails or hears ambient chatter: capture
+     * the user's speech with AudioRecord and feed it straight to the model.
+     *
+     * Per the Gemma audio spec the bytes must be raw mono 16 kHz float32
+     * PCM (samples in [-1, 1]) with NO WAV header. Audio is charged at
+     * 25 tokens per second against the context window (max 30s clip).
+     *
+     * @param audioBytes Raw 16 kHz mono float32 PCM audio
+     * @param prompt     ASR instruction ("Transcribe the following speech...")
+     * @param sessionId  Session gating ID for callbacks
+     * @param maxTokens  Output cap — transcriptions are short
+     * @return The transcription, or null on error
+     */
+    suspend fun transcribeAudio(
+        audioBytes: ByteArray,
+        prompt: String,
+        sessionId: String = "",
+        maxTokens: Int = ASR_MAX_TOKENS
+    ): String? = withContext(Dispatchers.Default) {
+        CrashLogFile.log(TAG, "=== TRANSCRIBE AUDIO (${audioBytes.size} bytes) ===")
+        val formattedPrompt = buildGemmaTurnPrompt(prompt, "")
+        runConversation(
+            contents = Contents.of(
+                Content.AudioBytes(audioBytes),
+                Content.Text(formattedPrompt)
+            ),
+            maxTokens = maxTokens,
+            sessionId = sessionId
+        )
+    }
+
+    /**
+     * Shared inference core for every content type (image, text, audio).
+     *
+     * Owns the Conversation lifecycle: creation, the callback-based streaming
+     * send, the timeout wait, the memory-pressure check, and the CRITICAL
+     * interrupt-safe close rules. Keeping this in ONE place means the
+     * SIGSEGV guard around Conversation.close() can never drift between the
+     * image / text / audio paths.
+     *
+     * @param contents  Multimodal contents to send
+     * @param maxTokens Output token cap for this conversation
+     * @param sessionId Session gating ID for callbacks
+     * @return The complete trimmed response, or null on error / interrupt
+     */
+    private suspend fun runConversation(
+        contents: Contents,
+        maxTokens: Int,
+        sessionId: String
+    ): String? {
+        val eng = engine
+        if (eng == null || !isInitialized) {
+            Log.e(TAG, "VLM not initialized — cannot run inference")
+            onError?.invoke("AI model not ready", sessionId)
+            return null
+        }
+        val result: String? = try {
             val conversationConfig = ConversationConfig(
                 maxOutputToken = maxTokens,
                 samplerConfig = SamplerConfig(
@@ -378,22 +498,14 @@ class VlmEngineManager(
                 )
             )
 
-            // 5. Create conversation — managed manually (NOT via use{}) so we can
-            //    prevent Conversation.close() when interrupted. Closing while the
-            //    native thread is still running causes SIGSEGV in liblitertlm_jni.so.
+            // Create conversation — managed manually (NOT via use{}) so we can
+            // prevent Conversation.close() when interrupted. Closing while the
+            // native thread is still running causes SIGSEGV in liblitertlm_jni.so.
             val conversation = eng.createConversation(conversationConfig)
             wasInterrupted = false  // Reset flag before starting new inference
 
             try {
-                // 6. Build multimodal contents — formatted prompt text + clamped bitmap.
-                //    The native engine binds image patch tokens from Content.ImageBytes
-                //    directly; no literal [IMAGE_TOKEN] placeholder is needed or allowed.
-                val contents = Contents.of(
-                    Content.Text(formattedPrompt),
-                    Content.ImageBytes(imageBytes)
-                )
-
-                // 7. Send via callback-based API (avoids SendChannel crash)
+                // Send via callback-based API (avoids SendChannel crash)
                 val responseBuilder = StringBuilder()
                 val latch = CountDownLatch(1)
                 activeLatch = latch  // Expose to interrupt() for cancellation
@@ -426,9 +538,9 @@ class VlmEngineManager(
 
                 conversation.sendMessageAsync(contents, callback)
 
-                // 8. Wait for completion (max 180s — Gemma 3n E2B int4 at 3.66GB)
-                //    On low-RAM devices, use a shorter timeout to fail fast instead of
-                //    hanging during an OOM recovery that may never complete.
+                // Wait for completion (max 180s — Gemma 3n E2B int4 at 3.66GB)
+                // On low-RAM devices, use a shorter timeout to fail fast instead of
+                // hanging during an OOM recovery that may never complete.
                 val timeoutSec = if (isLowRamDevice) LOW_RAM_INFERENCE_TIMEOUT_SEC else INFERENCE_TIMEOUT_SEC
                 val completed = latch.await(timeoutSec, TimeUnit.SECONDS)
 
@@ -448,7 +560,7 @@ class VlmEngineManager(
                 // SIGSEGV) and do NOT fire callbacks (stale session).
                 if (wasInterrupted) {
                     Log.i(TAG, "Inference interrupted externally — discarding stale result")
-                    return@withContext null
+                    return null
                 }
 
                 if (!completed) {
@@ -457,16 +569,15 @@ class VlmEngineManager(
                 }
 
                 val fullResponse = responseBuilder.toString().trim()
-                val elapsed = System.currentTimeMillis() - startTime
 
                 if (inferenceError != null && fullResponse.isEmpty()) {
                     Log.e(TAG, "Inference failed: $inferenceError")
                     CrashLogFile.logError(TAG, "Inference failed: $inferenceError")
                     onError?.invoke("Inference error: $inferenceError", sessionId)
-                    return@withContext null
+                    return null
                 }
 
-                Log.i(TAG, "Inference complete: ${fullResponse.length} chars in ${elapsed}ms [backend=$activeBackend]")
+                Log.i(TAG, "Inference complete: ${fullResponse.length} chars [backend=$activeBackend]")
                 CrashLogFile.log(TAG, "Response: ${fullResponse.take(200)}...")
 
                 onComplete?.invoke(fullResponse, sessionId)
@@ -490,21 +601,13 @@ class VlmEngineManager(
                     Log.d(TAG, "Skipping conversation.close() — native thread still running")
                 }
             }
-
         } catch (e: Throwable) {
             Log.e(TAG, "Inference failed: ${e.javaClass.simpleName}: ${e.message}", e)
             CrashLogFile.logError(TAG, "Inference failed", e)
             onError?.invoke("Inference error: ${e.message}", sessionId)
             null
-        } finally {
-            // Explicitly recycle the scaled bitmap to free memory after inference
-            try {
-                if (scaledBitmap != null && !scaledBitmap.isRecycled) {
-                    scaledBitmap.recycle()
-                    CrashLogFile.log(TAG, "Scaled bitmap recycled")
-                }
-            } catch (_: Throwable) {}
         }
+        return result
     }
 
     // ── Gemma 4 Prompt Formatting ─────────────────────────────────
@@ -808,6 +911,21 @@ class VlmEngineManager(
         const val TOP_K = 1
         const val TOP_P = 1.0
         const val MAX_TOKENS = 35
+
+        // Text-only Q&A and audio transcription caps
+        const val TEXT_ONLY_MAX_TOKENS = 192
+        const val ASR_MAX_TOKENS = 96
+
+        /**
+         * System directive for TEXT-ONLY inference (analyzeText) — a general
+         * knowledge assistant, NOT a scene describer. Keeps answers concise
+         * for spoken delivery and in the user's requested language.
+         */
+        private const val TEXT_ONLY_SYSTEM_DIRECTIVE =
+            "You are a concise, helpful assistant. Answer directly and briefly. " +
+            "Use clear punctuation (periods and commas) for spoken delivery. " +
+            "Respond only in the language requested by the user. Do not mention " +
+            "that you are an AI or offline."
 
         // Timeouts
         private const val INFERENCE_TIMEOUT_SEC = 180L  // 3 min for real inference

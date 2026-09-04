@@ -26,15 +26,16 @@ import java.util.concurrent.atomic.AtomicLong
  * 100% accurate, no polling, no transient false readings.
  *
  * ## Volume Stability
- * Queries and locks the accessibility stream volume at construction time.
- * All speak() calls use KEY_PARAM_VOLUME = 1.0f so every utterance outputs
- * at the identical, stable gain for the entire session.
+ * TTS plays through the MEDIA stream (USAGE_MEDIA) so it matches the
+ * phone's normal media volume exactly: the hardware volume buttons keep
+ * working as usual and every utterance outputs at the identical, stable
+ * gain for the entire session. The optional in-app volume setting is
+ * applied per-utterance via KEY_PARAM_VOLUME.
  *
  * ## Audio Focus
- * Requests AUDIOFOCUS_GAIN (permanent) for the entire app session — like
- * Google Lens and Be My Eyes. This suppresses TalkBack and other accessibility
- * audio while Vyze is active. Focus is held from app open to app close.
- * Never released per-utterance or on stop() — only on onDestroy().
+ * Requests AUDIOFOCUS_GAIN (permanent) for the entire app session.
+ * Focus is held from app open to app close. Never released per-utterance
+ * or on stop() — only on onDestroy().
  */
 class TTSManager(context: Context) : TextToSpeech.OnInitListener {
 
@@ -46,22 +47,9 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
     private var cachedVolume: Float = DEFAULT_VOLUME
     private val appContext: Context = context.applicationContext
 
-    // ── Audio Manager & Volume Baseline ───────────────────────────
+    // ── Audio Manager ─────────────────────────────────────────────
 
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-
-    private val lockedStreamVolume: Int = try {
-        audioManager.getStreamVolume(AudioManager.STREAM_ACCESSIBILITY)
-    } catch (e: Throwable) {
-        Log.w(TAG, "Failed to query accessibility stream volume: ${e.message}")
-        audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
-    }
-
-    private val streamMaxVolume: Int = try {
-        audioManager.getStreamMaxVolume(AudioManager.STREAM_ACCESSIBILITY)
-    } catch (e: Throwable) {
-        audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-    }
 
     // ── Audio Focus ───────────────────────────────────────────────
 
@@ -111,15 +99,18 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
      */
     fun hasPendingSpeech(): Boolean = pendingUtteranceIds.isNotEmpty()
 
-    // ── Audio Attributes (Accessibility — non-duckable) ───────────
+    // ── Audio Attributes (Media stream — follows the phone volume) ──
+    // USAGE_MEDIA routes TTS to STREAM_MUSIC, so Vyze speaks at exactly
+    // the phone's media volume and the hardware volume buttons work
+    // normally during speech (no hidden accessibility-stream slider).
 
     private val ttsAudioAttributes = AudioAttributes.Builder()
-        .setUsage(AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY)
+        .setUsage(AudioAttributes.USAGE_MEDIA)
         .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
         .build()
 
     private val focusAttributes = AudioAttributes.Builder()
-        .setUsage(AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY)
+        .setUsage(AudioAttributes.USAGE_MEDIA)
         .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
         .build()
 
@@ -158,8 +149,7 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
     // ── Initialization ────────────────────────────────────────────
 
     init {
-        Log.i(TAG, "TTSManager created — locked stream volume=$lockedStreamVolume " +
-            "max=$streamMaxVolume, stream=ACCESSIBILITY")
+        Log.i(TAG, "TTSManager created — stream=MEDIA (follows phone volume)")
         tts = try {
             TextToSpeech(appContext, this, GOOGLE_TTS_ENGINE)
         } catch (e: Throwable) {
@@ -216,7 +206,7 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
             tts?.setOnUtteranceProgressListener(globalUtteranceListener)
 
             Log.i(TAG, "TTS setup OK — locale=$currentLocale, engine=${tts?.defaultEngine}, " +
-                "lockedVolume=$lockedStreamVolume, pitch=$WARM_PITCH, rate=$WARM_RATE")
+                "pitch=$WARM_PITCH, rate=$WARM_RATE, volume=$cachedVolume")
 
             mainHandler.postDelayed({
                 isInitialized = true
@@ -333,8 +323,8 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
         lastSpeechTime = now
         lastSpokenText = text
 
-        // Enhance text with natural prosody pauses before synthesis
-        val enhancedText = enhanceForNaturalProsody(text)
+        // Enhance text with pronunciation overrides + natural prosody pauses
+        val enhancedText = enhanceForNaturalProsody(applyPronunciationOverrides(text))
 
         val id = utteranceId ?: nextUtteranceId()
         val params = buildSpeakParams()
@@ -376,8 +366,8 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
         lastSpeechTime = now
         lastSpokenText = text
 
-        // Enhance text with natural prosody pauses before synthesis
-        val enhancedText = enhanceForNaturalProsody(text)
+        // Enhance text with pronunciation overrides + natural prosody pauses
+        val enhancedText = enhanceForNaturalProsody(applyPronunciationOverrides(text))
 
         tts?.stop()
         pendingUtteranceIds.clear()
@@ -552,7 +542,9 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
 
     private fun buildSpeakParams(): Bundle {
         return Bundle().apply {
-            putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f)
+            // Apply the in-app volume setting (0-1 multiplier over the
+            // media stream volume). Default 1.0 = exactly the phone volume.
+            putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, cachedVolume)
         }
     }
 
@@ -646,6 +638,31 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
     }
 
     // ── Natural Prosody Enhancement ───────────────────────────────
+
+    /**
+     * Apply curated pronunciation overrides for brand/product names that
+     * generic TTS voices misread. Example: Google's English voice reads the
+     * noodle brand "Maggi" as "MAY-jee"; the respelling below forces the
+     * brand's real pronunciation "MAY-ghee" (ghee → hard g, /giː/).
+     *
+     * Whole-word, case-insensitive, and scoped to the ACTIVE voice language
+     * (Malay and Chinese voices already read these brands correctly, so the
+     * respellings are English-only — a Malay "Mayghee" would itself be wrong).
+     * Additions welcome: one entry per brand + language. Heuristic by nature:
+     * final accuracy depends on the installed engine voice.
+     */
+    private fun applyPronunciationOverrides(text: String): String {
+        if (text.isBlank()) return text
+        val overrides = when (currentLocale.language) {
+            "en" -> ENGLISH_PRONUNCIATION_OVERRIDES
+            else -> return text
+        }
+        var out = text
+        for ((from, to) in overrides) {
+            out = out.replace(Regex("(?i)\\b" + Regex.escape(from) + "\\b"), to)
+        }
+        return out
+    }
 
     private fun enhanceForNaturalProsody(text: String): String {
         if (text.isBlank()) return text
@@ -778,7 +795,7 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
         tts = null
         isInitialized = false
         speechBuffer.clear()
-        Log.d(TAG, "TTS destroyed — locked volume was $lockedStreamVolume")
+        Log.d(TAG, "TTS destroyed")
     }
 
     // ── Helpers ───────────────────────────────────────────────────
@@ -815,9 +832,12 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
         /** Set once the weak-voice install prompt has been answered/skipped. */
         const val KEY_VOICE_PROMPT_RESOLVED = "voice_prompt_resolved"
 
+        /** Set once the user has used Voice Settings (dismisses the cue hint). */
+        const val KEY_VOICE_SETTINGS_KNOWN = "voice_settings_known"
+
         const val DEFAULT_SPEECH_RATE = 1.0f
         const val DEFAULT_PITCH = 1.0f
-        const val DEFAULT_VOLUME = 0.8f
+        const val DEFAULT_VOLUME = 1.0f
 
         const val LANGUAGE_ENGLISH = "en"
         const val LANGUAGE_MALAY = "ms"
@@ -833,6 +853,19 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
         // ── Voice Quality & Prosody Constants ───────────────────────
 
         private const val GOOGLE_TTS_ENGINE = "com.google.android.tts"
+
+        /**
+         * English-voice respellings for brand names generic EN voices misread.
+         * Key: the word as printed on the product. Value: a respelling the
+         * engine speaks the way the brand is actually said.
+         *
+         * "Maggi" (instant noodles): Google EN reads it "MAY-jee"; the brand
+         * is said "MAY-ghee" (hard g). "Mayghee" produces exactly that.
+         * Malay/Chinese voices already read these brands correctly.
+         */
+        private val ENGLISH_PRONUNCIATION_OVERRIDES = mapOf(
+            "maggi" to "Mayghee"
+        )
 
         /**
          * Warmer pitch (-2%): eliminates flat, metallic synth tones.
