@@ -5,9 +5,10 @@
 | | |
 |---|---|
 | **Product** | Vyze (`com.vyze.app`) |
-| **Version** | 1.0 |
+| **Version** | 1.2 |
 | **Platform** | Android — minSdk 26 (Android 8.0), targetSdk 34, `arm64-v8a` |
 | **Status** | Production candidate |
+| **Revision** | September 2026 — reflects the on-device audio, text-Q&A, memory, and speech-quality subsystems added in v1.1–1.2 |
 
 ---
 
@@ -90,14 +91,15 @@ On launch the user passes through `PermissionsFragment` (camera + microphone + n
             tap / voice query
 IDLE ─────────────────────────▶ ANALYZING ──▶ SPEAKING ──▶ IDLE
   ▲                                                             │
+  │                    voice answer: reopen mic (~450 ms)      │
+  │                    tap answer:   stay closed at IDLE       │
   └─────────────────────────────────────────────────────────────┘
-       (conversation window reopens mic ~600 ms after speech)
 ```
 
 - **IDLE** — camera preview live; microphone **closed**; waiting for a gesture.
 - **ANALYZING** — a frame is captured and the VLM is running; microphone closed.
 - **SPEAKING** — the answer is streamed through TTS; microphone closed.
-- After speech ends, if a *conversation window* is active, the mic silently reopens for follow-up questions.
+- **After speech ends the exit path depends on how the query was asked.** Answers to *voice* questions (double-tap / hands-free follow-up) silently reopen the mic so the conversation continues without a gesture. Answers to *tap* queries return to IDLE with the mic firmly closed — the user chose touch input, so an open mic is never left running behind a tap. This split is what keeps "mic closed at IDLE" true while preserving hands-free conversation.
 
 ---
 
@@ -124,18 +126,18 @@ The single most important power/noise decision: **Vyze never listens while idle.
 
 - The mic opens **only** inside an explicit voice session (started by double-tap or by report-mode capture).
 - Sessions are self-closing: recognized speech ends them, as do silence, errors, the 12-second conversation deadline, and the noise guard.
-- Previously the app auto-reopened the mic after every answer, onboarding step, and resume; all of those reopen paths were removed. Failed sessions (`NO_MATCH`, timeout, empty result) now end cleanly instead of looping — eliminating the "beep loop" and idle listening reported in early builds.
+- Tap answers never reopen the mic (see §4.2) — an earlier build reopened after *every* answer, which left the recognizer running after taps; the next tap then cancelled a live recognizer and its cancellation error surfaced as phantom "I did not catch that" speech before every result. Reopen is now restricted to voice-originated answers, and stale recognizer callbacks from aborted sessions are dropped at the source (§7.1). Failed sessions (`NO_MATCH`, timeout, empty result) end cleanly instead of looping — eliminating the "beep loop" and idle listening reported in early builds.
 
 ### 5.3 Conversation window
 
 A single double-tap starts a **rolling hands-free conversation**:
 
-1. Double-tap → "Listening. Ask your question." → the mic opens ~700 ms after the cue (the cue is spoken to completion first so the app never hears its own voice).
-2. The user asks; the answer is spoken.
-3. ~600 ms after the answer, the mic silently reopens — **no gesture required**.
+1. Double-tap → a short spoken cue "Listening." → the mic opens ~500 ms after the cue ends. The cue is deliberately one word: a longer cue (which historically taught "or say voice settings…" on every session) delayed the mic by ~5 s, so users who spoke early lost their query and heard nothing back.
+2. The user asks; the answer is spoken as whole, flowing sentences (§6.7).
+3. ~450 ms after a *voice* answer, the mic silently reopens — **no gesture required**.
 4. Each accepted query resets a 12-second deadline (`CONVERSATION_WINDOW_MS`); the mic closes quietly when the user goes silent, returning to IDLE.
 
-Any gesture barges in: single-tap *look* cancels the window, a second double-tap restarts a fresh session, and long-press runs the light check.
+Any gesture barges in: single-tap *look* cancels the window and marks the tap answer as one that must not reopen the mic, a second double-tap restarts a fresh session, and long-press runs the light check.
 
 ### 5.4 Noise robustness
 
@@ -146,6 +148,15 @@ Speech input passes a **three-stage chatter filter** in `MainActivity` before it
 - **Stability** — the final text is compared against the last partial transcript (cleared per session) so stray or unstable recognitions are rejected.
 
 If repeated ambient chatter is detected, Vyze announces *"The room is noisy. Tap or double tap to continue"* and pauses listening until an explicit gesture. The query-response beep uses **adaptive backoff**, and haptic patterns are one-shot (a historical bug passed repeat index `0` to the vibration API, causing endless vibration loops; patterns now use repeat `-1`).
+
+### 5.5 Speech-session hygiene
+
+Because speech callbacks are asynchronous, a recognizer session that the user **aborted with a gesture** (tap, double-tap, audition, report) can still deliver late `onResults`/`onError` events. Before the fix below, those stale events reached the UI mid-analysis — restarting the mic, clobbering `ANALYZING`/`SPEAKING` state, or speaking "I did not catch that" right before the real answer. Two mechanisms now contain this:
+
+- **Session grant** — `MainActivity.voiceSessionWanted` is set true only while the fragment genuinely wants the mic open, and is revoked the instant the user taps or the session ends. All three recognizer callbacks (`onResults`, `onError`, `onPartialResults`) and the internal auto-restart paths check the grant first and drop the event if it was revoked. Auto-restarts on `ERROR_CLIENT`/`ERROR_RECOGNIZER_BUSY` therefore die as soon as the user moves on.
+- **State guards in the fragment** — `onSpeechError` ignores errors that arrive while the app is not in `LISTENING`/`REPORTING` (a tap or answer is in flight), and the in-window quiet-reopen path can no longer force `ANALYZING`/`SPEAKING` back to `LISTENING`.
+
+The model-ASR rescue (§7.4) follows the same rules: it only runs while the grant is held, its late transcription/error dispatch is also grant-gated, and its one-shot budget is restored on every fresh voice session.
 
 ---
 
@@ -158,7 +169,7 @@ If repeated ambient chatter is detected, Vyze announces *"The room is noisy. Tap
 | **Model** | Gemma 4 E2B (`gemma-4-E2B-it.litertlm`) |
 | **File size** | 2.59 GB (local, user-downloaded to Downloads/ or app-scoped external storage) |
 | **Format / runtime** | LiteRT-LM (`com.google.ai.edge.litertlm:litertlm-android:0.16.1`) |
-| **Modality** | Multimodal — vision encoder + text decoder |
+| **Modality** | Multimodal — vision encoder + audio encoder + text decoder (the audio encoder powers fully offline speech recognition, §7.4) |
 | **Acceleration** | **GPU only** (OpenCL/Vulkan); CPU inference unsupported at this size |
 | **Peak memory** | ~3 GB (weights + KV-cache + image encoding) |
 
@@ -185,15 +196,23 @@ Image patch tokens are bound natively by the LiteRT-LM engine when a `Bitmap` is
 1. **Language mirroring** — respond only in the language requested, without cross-translating.
 2. **No internal reasoning chains** — answers are direct and concise (the raw chain-of-thought of the base model is suppressed, both for latency and to avoid confusing narration).
 
-`DynamicPromptBuilder` assembles query-specific context: language identification, recent memory recall (see §8.3), and **few-shot examples** for specialized tasks such as reading medicine packaging:
+`DynamicPromptBuilder` assembles query-specific context: language identification, injected memory recall (see §9.2), OCR ground truth when present, and **few-shot examples** for specialized tasks such as reading medicine packaging:
 
 > *"Input: what medicine is this? Image shows Diclac Retard box. Output: Diclac Retard, diclofenac sodium 100mg. Take one tablet daily after meals."*
+> *"Input: what is this? Image shows a red packet. Output: This is a Maggi instant noodle packet…"*
+
+The builder adds three behavior contracts on top of the base rules, in every relevant branch:
+
+- **OCR as ground truth** — when the ML Kit pre-pass found text, the extracted block is injected verbatim with the rule *"The OCR text above is the ground truth. Read it as whole words and continuous sentences — never spell it letter by letter… read ALL of it in reading order."* This anchors reads to real pixels and stops the model from re-deriving (and mis-guessing) text from a downscaled image.
+- **Brand-first for packaged goods** — for packets, boxes, bottles, and cans the model must open with the *brand name and product type exactly as printed*, then continue. This is what lets Vyze tell apart two visually similar products by their labels.
+- **Never guess** — unreadable text is reported as "Text is unclear"; currency values and medicine names are never invented (see §8).
 
 ### 6.4 Image preprocessing
 
-- Frames are **proportionally downscaled** to a max dimension of 512 px — no rigid center-crop, because Gemma 4 handles dynamic aspect ratios natively.
+- Input resolution is **query-adaptive** (dynamic resolution scaling): text-reading, tap, currency, and pointing queries are downscaled to **384×384** so fine print survives; plain scene queries use **256×256** for speed; continuous-mode frames are center-cropped to 256. The VLM input itself is not rigidly center-cropped for non-continuous queries — Gemma 4 handles dynamic aspect ratios natively.
 - JPEG compression at quality 75 for any intermediate encoding.
 - All scaled bitmaps are **explicitly recycled** after inference to prevent native memory leaks.
+- A **tap-position marker** ("tapped at position (x, y)") and a **pointing-query classifier** ("what is this", "apa ini", "这是什么", …) route object-focused asks through the 384 px + OCR path, because pointed-at objects usually carry labels — and the spoken brand/reading answers depend on those pixels (§8).
 
 ### 6.5 Sampling & output controls
 
@@ -203,22 +222,32 @@ Image patch tokens are bound natively by the LiteRT-LM engine when a `Bitmap` is
 | Top-K | 1 (greedy) |
 | Top-P | 1.0 |
 | Scene query tokens | 96 |
-| Text/reading query tokens | 160 |
+| Text-only Q&A tokens | 192 |
+| ASR transcription tokens | 96 |
+| Text-reading tokens | **Adaptive** — 64 + (OCR chars ÷ 4), clamped to 192…1024 |
 
-Greedy decoding minimizes latency and hallucinated verbosity. Token caps were raised from earlier tight values (48/96) after real-device testing showed responses being truncated mid-sentence.
+Greedy decoding minimizes latency and hallucinated verbosity. Text reads use an **adaptive output budget sized to the OCR text actually found**: the model mostly *echoes* the injected OCR block (~1 token per 4 characters) plus a 64-token intro/outro allowance, so a dense back-panel (~2,000 characters) automatically gets ~560 tokens while a short label stays small. The 192 floor keeps short reads complete; the 1024 ceiling (~800 words) is the practical bound of the model context and the engine's 180 s inference wall — as close to "unlimited for text" as the on-device stack allows.
 
 ### 6.6 Inference timeouts & watchdogs
 
 - Per-inference timeout: **180 s** standard, **60 s** on low-RAM devices (fail fast instead of hanging through an OOM recovery).
 - GPU warm-up timeout: 60 s.
-- `VyzeCoreController` runs a **watchdog** that force-resets the engine if inference hangs, and monitors heap pressure during inference, logging warnings when available memory drops below a low-RAM threshold.
+- `VyzeCoreController` runs a **progress-aware watchdog** (15 s): every received token re-arms the stall clock, so a genuinely long read-back is never force-killed mid-sentence — only a stall with *no output at all* for 15 s triggers the force-reset. Heap pressure is monitored during inference with warnings below a low-RAM threshold.
 
 ### 6.7 Streaming speech output
 
-Answers are streamed token-by-token to TTS rather than spoken after full completion. Two details matter for perceived quality:
+Answers are streamed token-by-token to TTS rather than spoken after full completion. The flush policy determines perceived quality:
 
-- **First-chunk flush policy** — the first chunk is only spoken once it forms a real phrase (2+ words or 8+ characters). An earlier implementation flushed as soon as the buffer held 1 word / 3 characters, which caused answers to begin with a stray spoken "A." from a leading model token.
+- **Sentence-boundary flushing only** — the token buffer is spoken only at real sentence ends (`.`, `!`, `?`, newline). Commas and colons stay *inside* the sentence, and fragments shorter than 10 characters are held to join the next sentence. An earlier build flushed at commas (and even spoke the first 2–3 words instantly), which chopped one answer into many tiny utterances — each spoken with full-stop intonation and a dead-air gap, so users heard *"A red can. …(pause)… with a white label."* Whole sentences are now the natural spoken unit: the TTS voice renders internal commas as short natural pauses within one flowing utterance.
+- **Read-ahead ceiling** — if the model emits 200 characters without any sentence-ending punctuation (rare), the buffer is flushed anyway so speech never stalls mid-generation.
+- **First-utterance flush** — the first sentence flushes any leftover status speech ("Analyzing scene…") so the answer starts clean.
 - **Audio drain tail** — when generation completes, a silent tail is always queued so the TTS queue stays alive while the speaker drains, with a 600 ms drain-grace window so the final words are never clipped.
+
+### 6.8 Text-only question answering (no camera)
+
+Questions that do **not** reference the visual scene — *"what is paracetamol used for?", "bagaimana cara mengikat tali?", "为什么天是蓝色的"* — are answered by the model's **text decoder alone** through `VlmEngineManager.analyzeText()`. There is no camera capture and no image inference: it is faster, cheaper, and works without pointing the phone at anything.
+
+Classification (`VyzeCoreController.isTextOnlyQuery`) is deliberately conservative: the query must contain a knowledge marker ("what is", "how to", "apa itu", "怎么"…) **and no scene reference** ("this", "here", "in front", "ini", "这个"…). Any phrase that points at the world falls through to the camera pipeline — a missed text-only route is safe; a wrongly routed visual question is not. The prompt carries a dedicated rule set (answer from knowledge, never invent a scene, 1–3 sentences), output is capped at 192 tokens, and the answer streams through the same sentence-boundary TTS path.
 
 ---
 
@@ -226,7 +255,7 @@ Answers are streamed token-by-token to TTS rather than spoken after full complet
 
 ### 7.1 Speech recognition
 
-Voice input uses the platform `android.speech.SpeechRecognizer` with `RecognizerIntent`, configured for the active language (English, Malay, or Chinese). Recognition availability is checked before use. The recognizer is only ever instantiated for an explicit session — matching the closed-mic-by-default policy. Partial results feed the stability gate described in §5.4.
+Voice input uses the platform `android.speech.SpeechRecognizer` with `RecognizerIntent`, configured for the active language (English, Malay, or Chinese). Recognition availability is checked before use. The recognizer is only ever instantiated for an explicit session — matching the closed-mic-by-default policy. Partial results feed the stability gate described in §5.4. Every recognizer callback is guarded by the session grant (§5.5), and a `speechAttempted` flag (set on `onBeginningOfSpeech`) distinguishes "the user spoke but recognition failed" from "nobody spoke" — only the former is eligible for the model-native ASR rescue (§7.4), so silent pauses can never hijack a session.
 
 ### 7.2 Text-to-speech (TTS)
 
@@ -239,9 +268,22 @@ Voice quality is a first-class concern because the perceived "human-ness" of the
 - A **weak-voice detector** inspects the engine's reported quality and flags voices below the high-quality threshold. On first run, right after "Vyze is ready…", Vyze may say: *"Your current voice sounds basic. A better voice is available for free from Google. Say yes to open the voice installer, or say skip."* "Yes" launches the system voice-data installer (`ACTION_INSTALL_TTS_DATA`); on return the app re-verifies and confirms. The prompt is one-time and skippable.
 - Choices persist per language and are restored on every init and language switch.
 
+Because TTS engines read brand names by orthography, a **pronunciation override dictionary** is applied to text before synthesis — whole-word, case-insensitive, scoped to the active voice language. Example: Google's English voice reads the noodle brand "Maggi" as *MAY-jee*; the dictionary respells it "Mayghee", which the engine voices as *MAY-ghee* (the Malay voice already reads "Maggi" correctly and is left untouched). The map is a small curated constant, extensible per brand + language. The map is bypassed for Malay/Chinese voices, whose native orthography is already correct for the covered brands.
+
+Spoken cues are deliberately minimal: the double-tap voice session plays a single "Listening." (voice-settings teaching was removed from the cue after it proved to nag on every session — the command still works and is discoverable via the one-time voice-quality prompt and onboarding).
+
 ### 7.3 Haptics & sound
 
 `HapticManager` provides distinct one-shot patterns (gesture acknowledgment, warnings). `AnnouncementCoordinator` serializes spoken announcements so TTS output never overlaps itself, and any user gesture **barge-in** immediately silences active speech.
+
+### 7.4 Model-native ASR rescue (noisy rooms)
+
+The classic failure of hands-free assistants is the room full of people: Android's recognizer commits ambient conversation as the user's query, or gives up entirely (`NO_MATCH`, `SPEECH_TIMEOUT`, `ERROR_AUDIO`). Vyze answers with the model's own ears.
+
+- **Capability** — Gemma 4 E2B ships an audio encoder, and the installed LiteRT-LM 0.16.1 runtime exposes audio input (`Content.AudioBytes` + `EngineConfig(audioBackend = …)`). Speech recognition therefore does not depend on Google's recognizer.
+- **Capture** — a new `AudioCapture` helper records **16 kHz mono float32 PCM** (up to 8 s, with a short-speech rejection for anything under 0.25 s) — the exact byte format Gemma's audio encoder expects.
+- **Flow** — when the recognizer fails *after the user actually started speaking* (`speechAttempted`), Vyze speaks "Please say that again.", records the repeat, and transcribes it fully offline via `VlmEngineManager.transcribeAudio()` (cap 96 tokens, output mirrored to the user's language). The transcription then enters the normal query pipeline.
+- **Guardrails** — one rescue attempt per conversation (budget restored on each fresh double-tap session); never fires on pure silence; suppressed while the voice audition is playing; late rescue results are dropped if the user has already tapped away. The result: no beep loops, no "please repeat" nagging during pauses, and a genuine offline escape hatch when the platform recognizer fails in noise.
 
 ---
 
@@ -251,11 +293,13 @@ Voice quality is a first-class concern because the perceived "human-ness" of the
 
 Reading text through the full VLM is slow and error-prone, so Vyze implements a **hybrid reading pipeline**:
 
-1. A spoken query is classified by reading keywords across English, Malay, and Chinese (e.g. "read", "label", "prescription", "baca", "读").
+1. A spoken query is classified by reading keywords across English, Malay, and Chinese (e.g. "read", "label", "prescription", "baca", "读") — or by the pointing-query classifier ("what is this", "apa ini", "这是什么") and any tap, since taps usually land on objects with text.
 2. If it is a reading query, the frame goes through **ML Kit Text Recognition** (`TextRecognition` with Latin or Chinese recognizer options, chosen by the active language) — a dedicated on-device OCR model.
 3. Extracted text is passed to a **confidence-scored OCR path**; high-confidence text is read out directly, often enriched by the **medicine knowledge base**: a Room database pre-populated at first launch (`MedicineDatabaseCallback`) with common medicines and their indications, dosages, and warnings. The VLM is used as the fallback or enrichment layer (prompted with few-shot examples) when OCR confidence is low or the query is a free-form question about the packaging.
 
 The fast path cuts reading latency from seconds of VLM inference to milliseconds of OCR plus TTS.
+
+**Reading whole panels.** Dense packaging (a box back panel full of indications) previously stopped halfway for two compounding reasons: a fixed 160-token cap truncated long reads, and a fixed 15 s watchdog could force-kill a generation that was still producing output. Today the output budget adapts to the OCR text found (up to ~800 words, §6.5), the watchdog re-arms on every token, and the prompt demands reading *the entire text in reading order — never stop halfway or summarize*. Brand names are spoken correctly via the TTS pronunciation dictionary (§7.2).
 
 ### 8.2 Color analysis
 
@@ -272,6 +316,14 @@ Every recognized artifact — scene summaries, OCR text, barcodes, currency deno
 ### 8.5 Emergency SOS
 
 Triple-tap-and-hold is a deliberately hard-to-trigger gesture that opens the dialer to the emergency number **999** after a 1.5-second confirm delay, giving the user time to abort.
+
+### 8.6 Currency reading (banknotes & coins)
+
+A dedicated classifier (`isCurrencyQuery`; "what money is this", "read this note", "berapa nilai duit ini", "多少钱") routes money scans through the high-resolution text path with a dedicated prompt rule set: identify the VALUE from the large numerals and printed text, state value + currency + dominant color, and **never guess** — an unreadable note is reported as "I cannot read this clearly", never assigned a denomination. Confident reads are persisted to scan history as a currency entry. The no-guess rule is absolute here because a wrong denomination is worse than no answer for a blind user.
+
+### 8.7 Pointing questions & packaged-brand identification
+
+"What is this?" is the most common real-world question, and it is *not* a text-only knowledge question — it points at an object. Vyze treats pointing phrases (English, Malay, Chinese deictics plus "what am I holding"-style phrasings) as object-focused asks and routes them through the 384 px + OCR path (§6.4) so the answer is grounded in what is actually printed. Combined with the brand-first prompt rule (§6.3), scanning two visually similar products (e.g. two white instant-noodle packets from different brands) yields the printed brand and product name rather than a guess from a downscaled frame.
 
 ---
 
@@ -291,7 +343,15 @@ All persistence is via **Room** (SQLite) inside the app sandbox. There is no clo
 
 ### 9.2 Lightweight embeddings
 
-`EmbeddingEngine` produces a 256-float embedding from any frame by downscaling to a 16×16 grayscale grid and normalizing pixel intensities — ~1 ms on CPU, zero extra model weight. `MemoryRepository.findSimilar` ranks stored interactions by **cosine similarity** to the current scene and retrieves the top-k contextually similar past interactions, which `DynamicPromptBuilder` injects as "memory" so Vyze can adapt (e.g., recognizing that the user is in a room it has described before, or recalling previously read medicine). The authors document this as an intentional, lightweight proxy for visual similarity — not semantic understanding.
+`EmbeddingEngine` produces a 256-float embedding from any frame by downscaling to a 16×16 grayscale grid and normalizing pixel intensities — ~1 ms on CPU, zero extra model weight. `MemoryRepository.findSimilar` ranks stored interactions by **cosine similarity** to the current scene.
+
+The recall side is wired as **context injection, not replay** — an important distinction:
+
+- Every scan still analyzes the fresh frame; memory never substitutes for inference (the model is instructed to confirm continuity, or to describe only what it now sees if the scene changed).
+- A past scan qualifies as context only when its similarity is **≥ 0.6** and it is **younger than 24 hours**; the *most recent* qualifying match wins, and the injected snippet is capped at 240 characters.
+- Memory is suppressed entirely when OCR text is present (OCR is already the ground truth), in currency mode, and in continuous mode.
+
+The authors document the 16×16 whole-frame fingerprint as an intentional, lightweight proxy for visual similarity — not semantic understanding; the similarity threshold is a tunable constant pending on-device calibration.
 
 ---
 
@@ -336,12 +396,17 @@ Production lessons are encoded directly in the code:
 |---|---|
 | Native SIGSEGV during init | Text-only warm-up before any image work; image warm-up removed |
 | OOM during 2.5 GB model load | RAM pre-flight check + spoken early rejection |
-| Hung inference | Per-inference timeouts + watchdog force-reset |
+| Hung inference | Per-inference timeouts + progress-aware watchdog force-reset |
 | Model file missing/corrupt | Multi-location resolution, size sanity check, human-readable setup instructions |
 | Answer audio clipped | Always-queued drain tail + 600 ms grace |
-| First chunk spoken alone | Phrase-aware first-chunk flush |
+| Long text reads cut off halfway | Adaptive token budget + progress-aware watchdog (§8.1) |
+| Mid-sentence pauses in spoken answers | Sentence-boundary TTS flush; no comma splits; 200-char read-ahead ceiling (§6.7) |
+| Phantom "I did not catch that" before results | Session grant + stale-callback drop; state-guarded error handling (§5.5) |
+| Rescue firing on ordinary silence pauses | Rescue gated on speech-attempt flag; budget per conversation (§7.4) |
+| Wrong brand pronunciation | Per-language pronunciation dictionary applied pre-synthesis (§7.2) |
 | Endless vibration loops | One-shot haptic patterns (repeat = -1) |
 | Speech session loops ("beep loop") | Clean session termination on no-match/timeout; mic closed at IDLE |
+| Recorder clip of early speech | One-word "Listening." cue + 500 ms mic-open delay (§5.3) |
 | Background crashes | Global exception handler writing to `CrashLogFile`, logs pruned on launch |
 
 ---
@@ -350,20 +415,27 @@ Production lessons are encoded directly in the code:
 
 | Constant | Value |
 |---|---|
-| `CONVERSATION_WINDOW_MS` | 12,000 ms |
+| `CONVERSATION_WINDOW_MS` | 12,000 ms (rolling) |
 | `CONVERSATION_WINDOW_TICK_MS` | 2,000 ms |
-| `VOICE_SESSION_OPEN_DELAY_MS` | 700 ms |
-| `FOLLOW_UP_OPEN_DELAY_MS` | 600 ms |
+| `VOICE_SESSION_OPEN_DELAY_MS` | 500 ms |
+| `FOLLOW_UP_OPEN_DELAY_MS` | 450 ms |
 | `AUDIO_DRAIN_GRACE_MS` | 600 ms |
 | Inference timeout (std / low-RAM) | 180 s / 60 s |
+| Progress-aware watchdog | 15 s with no output → force-reset |
 | GPU warm-up timeout | 60 s |
 | Free-RAM preflight (std / low-RAM) | 1200 MB / 800 MB |
-| Image max dimension | 512 px |
+| Image dimension (text/tap/currency) | 384 px |
+| Image dimension (scene / continuous) | 256 px |
 | Sampling | temp 0.1, top-K 1 |
-| Scene / text token caps | 96 / 160 |
+| Token caps | scene 96 · text-only Q&A 192 · ASR 96 · text reads adaptive 192–1024 (64 + OCR chars ÷ 4) |
+| OCR fast-path confidence | ≥ 0.85 (skips the VLM for pure text reads) |
+| Memory injection | similarity ≥ 0.6, age ≤ 24 h, snippet ≤ 240 chars |
+| Chatter filter | confidence ≥ 0.35 · single words ≥ 5 chars · 5 rejected cycles → noise pause |
+| Sentence flush | sentence terminators only; read-ahead ceiling 200 chars |
+| Model-ASR capture | 16 kHz mono float32 PCM, ≤ 8 s |
 | Auto-torch hysteresis | ON < 35 lux, OFF > 65 lux |
 | SOS dial delay | 1.5 s (number 999) |
-| Continuous snapshot | 4 s cadence, throttled after 3 min |
+| Continuous snapshot | 4 s cadence, throttled to 8 s after 3 min |
 | Thermal check interval | ~8 s |
 
 ---
@@ -375,14 +447,18 @@ Production lessons are encoded directly in the code:
 - **Hardware floor** — requires a device with ~3 GB peak available RAM and a GPU-capable SoC; CPU-only and low-RAM devices are rejected early by design.
 - **Model size** — the 2.59 GB model must be downloaded/staged outside the APK; first-run setup requires storage and a download.
 - **Malay/Chinese VLM depth** — multilingual output depends on the underlying model's capability in those languages; OCR uses language-appropriate recognizers to compensate.
-- **Embedding memory** is intentionally shallow (visual similarity only, no semantics) — a documented trade-off to keep it zero-cost.
+- **Handwriting** — ML Kit OCR is trained for printed text, and no handwriting-specific path exists yet. Large neat block capitals sometimes read; cursive and small writing mostly do not, and Vyze's honesty rules make it say so rather than guess. A tap-point crop + handwriting-aware prompt branch is the planned offline remedy.
+- **Video input & function calling** — the installed runtime (LiteRT-LM 0.16.1) supports audio input but exposes **no video content type**, and Google gates tool-calling to FunctionGemma-class models; the shipped model is not one. True video (motion, "is that car moving?") therefore requires a runtime + model upgrade, and routing stays keyword-based by design.
+- **Embedding memory** is intentionally shallow — a 16×16 whole-frame grayscale fingerprint captures scene layout, not object identity, and similarity thresholds remain to be calibrated on device.
 
 **Future directions**
 
-- **Conversation-window tuning** from real-device telemetry (window length is a single constant).
+- **Tap-region fingerprints** — embed the crop around the tap point instead of the whole frame, so "same object" recall survives angle/distance changes and similar-looking products stop colliding.
+- **Handwriting branch** — upscale crop + handwriting-aware prompt ("this may be handwritten; read word by word; say exactly what you cannot read").
 - A semantic image-embedding model (e.g., MediaPipe Image Embedder) to upgrade memory recall from visual to conceptual similarity.
 - Bundled neural TTS voices (e.g., Kokoro/Piper-class, ~100–300 MB) for genuinely human speech in EN/ZH; Malay would continue on Google TTS until a quality open Malay voice exists.
-- Continuous-mode refinements with stricter thermal budgeting for sustained outdoor use.
+- **Conversation-window tuning** from real-device telemetry (window length is a single constant).
+- A LiteRT-LM + model upgrade unlocking video input, and evaluation of FunctionGemma-class tool calling for robust command routing.
 
 ---
 
@@ -398,5 +474,6 @@ Production lessons are encoded directly in the code:
 | Model | Gemma 4 E2B `gemma-4-E2B-it.litertlm` (2.59 GB) |
 | OCR | ML Kit Text Recognition (Latin + Chinese options) |
 | Persistence | Room + KSP |
-| Speech | `android.speech.SpeechRecognizer` + Google TTS engine |
+| Speech | `android.speech.SpeechRecognizer` + Gemma 4 E2B native audio encoder (model-ASR rescue) + Google TTS engine |
+| Audio capture | `android.media.AudioRecord` — 16 kHz mono, `ENCODING_PCM_FLOAT`, ≤ 8 s |
 | ABIs | `arm64-v8a` |
