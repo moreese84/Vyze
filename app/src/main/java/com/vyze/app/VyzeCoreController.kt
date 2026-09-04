@@ -1070,7 +1070,7 @@ class VyzeCoreController(
         return vlmEngine.transcribeAudio(
             audioBytes = audioBytes,
             prompt = asrPrompt,
-            sessionId = "",
+            sessionId = ASR_SESSION_TAG,
             maxTokens = ASR_MAX_TOKENS
         )
     }
@@ -1480,6 +1480,16 @@ class VyzeCoreController(
             // Chinese
             "这个", "那个", "这里", "那里", "前面", "这个东西"
         )
+
+        /**
+         * Session tag for model-native ASR transcriptions. A DISTINCT,
+         * non-empty id that can never collide with a real query session UUID:
+         * the session-gated token/complete/error handlers drop any callback
+         * whose id differs from activeSessionId, so a rescue transcription
+         * must NOT be passed as "" (empty ids slip through the gate and would
+         * stream / speak the raw transcription as if it were the VLM answer).
+         */
+        private const val ASR_SESSION_TAG = "vyze-model-asr-rescue"
 
         /** Output cap for model-native speech transcriptions (short). */
         private const val ASR_MAX_TOKENS = 96

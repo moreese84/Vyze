@@ -11,6 +11,7 @@ import android.os.Environment
 import android.provider.Settings
 import android.util.Log
 import com.google.ai.edge.litertlm.Backend
+import com.google.ai.edge.litertlm.Conversation
 import com.google.ai.edge.litertlm.ConversationConfig
 import com.google.ai.edge.litertlm.Content
 import com.google.ai.edge.litertlm.Contents
@@ -19,11 +20,15 @@ import com.google.ai.edge.litertlm.EngineConfig
 import com.google.ai.edge.litertlm.MessageCallback
 import com.google.ai.edge.litertlm.Message
 import com.google.ai.edge.litertlm.SamplerConfig
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import com.vyze.app.memory.MemoryRepository
 import com.vyze.app.memory.SimilarInteraction
 import java.io.ByteArrayOutputStream
@@ -126,6 +131,32 @@ class VlmEngineManager(
      */
     @Volatile
     private var wasInterrupted = false
+
+    /**
+     * Conversation whose native generation is currently running. Exposed to
+     * [interrupt] so it can call [Conversation.cancelProcess] — releasing only
+     * the Java-side latch leaves the native thread generating to the end, which
+     * keeps the engine busy and makes the NEXT sendMessageAsync fail with
+     * "Failed to start nativeSendMessageAsync".
+     */
+    @Volatile
+    private var activeConversation: Conversation? = null
+
+    /**
+     * Serializes native generation. LiteRT-LM runs ONE generation at a time —
+     * two overlapping [runConversation] calls make the engine reject the second
+     * sendMessageAsync. Guarded by [generationMutex]; the bounded drain in
+     * [runConversation] additionally waits for an abandoned native thread.
+     */
+    private val generationMutex = Mutex()
+
+    /**
+     * Completes when the CURRENT (possibly abandoned) native generation has
+     * fully ended. Starts completed — the engine is idle at boot. Replaced by
+     * each new run; the terminal onDone/onError callback of that run completes
+     * its own deferred, so a following inference can drain-wait on it.
+     */
+    private var generationFinished = CompletableDeferred<Unit>().apply { complete(Unit) }
 
     // ── Storage Permission Check ──────────────────────────────────
 
@@ -386,6 +417,11 @@ class VlmEngineManager(
             CrashLogFile.log(TAG, "analyzeImage total: ${elapsed}ms")
             response
 
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            // A cancelled inference must end SILENTLY — never surface it as an
+            // "Inference error" (the new generation-drain in runConversation is
+            // a real suspension point, so job cancellation can now land here).
+            throw e
         } catch (e: Throwable) {
             Log.e(TAG, "Inference failed: ${e.javaClass.simpleName}: ${e.message}", e)
             CrashLogFile.logError(TAG, "Inference failed", e)
@@ -488,6 +524,62 @@ class VlmEngineManager(
             onError?.invoke("AI model not ready", sessionId)
             return null
         }
+
+        // ── Serialize native generation ─────────────────────────────
+        // LiteRT-LM runs ONE native generation at a time. Two overlapping
+        // runConversation calls (a follow-up query while the previous answer
+        // still streams, a model-ASR rescue during a snapshot) make the engine
+        // reject the second sendMessageAsync with "Failed to start
+        // nativeSendMessageAsync: UNKNOWN:ERROR:". The mutex serializes our
+        // side, and the bounded drain additionally waits for a PREVIOUS
+        // generation that interrupt() abandoned — its native thread keeps
+        // generating until cancelProcess() stops it, and the engine stays busy
+        // until that finishes.
+        return generationMutex.withLock {
+            withTimeoutOrNull(GENERATION_DRAIN_TIMEOUT_MS) { generationFinished.await() }
+
+            val turnFinished = CompletableDeferred<Unit>()
+            generationFinished = turnFinished
+
+            try {
+                runConversationLocked(contents, maxTokens, sessionId, turnFinished)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                // Job cancelled while waiting on the drain (or during setup) —
+                // propagate so the inference ends silently, and leave
+                // turnFinished incomplete: if a native generation did start it
+                // will complete it via its terminal callback.
+                throw e
+            } catch (e: Throwable) {
+                // Setup / exception path — no native generation started for this
+                // turn, so never leave the next inference waiting on it.
+                turnFinished.complete(Unit)
+                Log.e(TAG, "Inference failed: ${e.javaClass.simpleName}: ${e.message}", e)
+                CrashLogFile.logError(TAG, "Inference failed", e)
+                onError?.invoke("Inference error: ${e.message}", sessionId)
+                null
+            }
+        }
+    }
+
+    /**
+     * Locked body of [runConversation] — runs under [generationMutex] with the
+     * previous generation already drained. [turnFinished] completes when the
+     * NATIVE side of this turn reports done (onDone / onError), so a following
+     * inference knows the engine is truly free — even when this turn was
+     * abandoned by [interrupt] and its close() was skipped.
+     */
+    private suspend fun runConversationLocked(
+        contents: Contents,
+        maxTokens: Int,
+        sessionId: String,
+        turnFinished: CompletableDeferred<Unit>
+    ): String? {
+        val eng = engine
+        if (eng == null || !isInitialized) {
+            Log.e(TAG, "VLM not initialized — cannot run inference")
+            onError?.invoke("AI model not ready", sessionId)
+            return null
+        }
         val result: String? = try {
             val conversationConfig = ConversationConfig(
                 maxOutputToken = maxTokens,
@@ -502,6 +594,7 @@ class VlmEngineManager(
             // prevent Conversation.close() when interrupted. Closing while the
             // native thread is still running causes SIGSEGV in liblitertlm_jni.so.
             val conversation = eng.createConversation(conversationConfig)
+            activeConversation = conversation  // Expose to interrupt() for cancelProcess()
             wasInterrupted = false  // Reset flag before starting new inference
 
             try {
@@ -526,12 +619,14 @@ class VlmEngineManager(
 
                     override fun onDone() {
                         Log.d(TAG, "sendMessageAsync onDone")
+                        turnFinished.complete(Unit)  // Native generation fully ended — engine free
                         latch.countDown()
                     }
 
                     override fun onError(throwable: Throwable) {
                         Log.e(TAG, "sendMessageAsync onError: ${throwable.message}", throwable)
                         inferenceError = throwable.message
+                        turnFinished.complete(Unit)  // Native generation fully ended — engine free
                         latch.countDown()
                     }
                 }
@@ -566,6 +661,13 @@ class VlmEngineManager(
                 if (!completed) {
                     Log.w(TAG, "Inference timed out after ${INFERENCE_TIMEOUT_SEC}s")
                     inferenceError = "Inference timed out"
+                    // Stop the native generation so the engine frees up for the
+                    // next query (same mechanism as interrupt()).
+                    try {
+                        conversation.cancelProcess()
+                    } catch (e: Throwable) {
+                        Log.w(TAG, "cancelProcess on timeout error: ${e.message}")
+                    }
                 }
 
                 val fullResponse = responseBuilder.toString().trim()
@@ -585,12 +687,14 @@ class VlmEngineManager(
 
                 fullResponse
             } finally {
+                activeConversation = null
                 // CRITICAL: Only close the Conversation if it was NOT interrupted.
                 // When interrupted, the native thread is still running inside
                 // sendMessageAsync → onDone. Closing the Conversation here frees
                 // the JNI pointer while the native thread references it → SIGSEGV.
-                // The Conversation will be garbage-collected when the native thread
-                // finishes and releases its reference.
+                // interrupt() calls cancelProcess(), so the native thread stops and
+                // fires onDone/onError shortly — which completes turnFinished and
+                // lets the NEXT inference's drain proceed.
                 if (!wasInterrupted) {
                     try {
                         conversation.close()
@@ -602,6 +706,9 @@ class VlmEngineManager(
                 }
             }
         } catch (e: Throwable) {
+            // A synchronous sendMessageAsync failure means no native generation
+            // started for this turn — release the next inference immediately.
+            turnFinished.complete(Unit)
             Log.e(TAG, "Inference failed: ${e.javaClass.simpleName}: ${e.message}", e)
             CrashLogFile.logError(TAG, "Inference failed", e)
             onError?.invoke("Inference error: ${e.message}", sessionId)
@@ -777,6 +884,21 @@ class VlmEngineManager(
         if (latch != null) {
             Log.i(TAG, "interrupt: releasing active inference latch")
             wasInterrupted = true   // Signal analyzeImage to skip close + callbacks
+            // Stop the NATIVE generation too. Releasing only the Java latch
+            // leaves the native thread generating to completion, so the engine
+            // stays busy and rejects the NEXT sendMessageAsync with
+            // "Failed to start nativeSendMessageAsync" — every quick follow-up
+            // after an interrupt would fail. cancelProcess() is the LiteRT-LM
+            // API for this and is safe to call from any thread.
+            val conversation = activeConversation
+            if (conversation != null) {
+                try {
+                    Log.d(TAG, "interrupt: cancelling native process")
+                    conversation.cancelProcess()
+                } catch (e: Throwable) {
+                    Log.w(TAG, "interrupt: cancelProcess error: ${e.message}")
+                }
+            }
             latch.countDown()       // Unblocks await() — coroutine resumes immediately
             activeLatch = null
         } else {
@@ -931,6 +1053,13 @@ class VlmEngineManager(
         private const val INFERENCE_TIMEOUT_SEC = 180L  // 3 min for real inference
         private const val LOW_RAM_INFERENCE_TIMEOUT_SEC = 60L  // 1 min on low-RAM devices — fail fast
         private const val WARMUP_TIMEOUT_SEC = 60L       // 60s for GPU warm-up (mid-tier may need longer)
+
+        /**
+         * Max time to wait for a previous (cancelled) native generation to fully
+         * stop before starting a new one. Bounded so a truly hung native thread
+         * degrades to the normal send error instead of blocking forever.
+         */
+        private const val GENERATION_DRAIN_TIMEOUT_MS = 20_000L
 
         /**
          * Gemma 4 system directive — injected as <|turn|>system block.

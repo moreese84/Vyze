@@ -580,6 +580,22 @@ class MainActivity : AppCompatActivity() {
                         finishRescueWithError(originalError)
                         return@launch
                     }
+                    // ── RE-CHECK BEFORE TRANSCRIBING ──────────────
+                    // The readiness guard above ran BEFORE the spoken cue and the
+                    // multi-second recording. A tap analysis or continuous
+                    // snapshot may have started since — transcribing now would
+                    // collide with the running inference (the engine runs one
+                    // native generation at a time). Also bail if the user tapped
+                    // away while we were recording.
+                    if (!voiceSessionWanted) {
+                        Log.d(TAG, "Model-ASR rescue: session aborted during recording — dropping")
+                        return@launch
+                    }
+                    if (core.isCurrentlyInferring()) {
+                        Log.d(TAG, "Model-ASR rescue: inference started during recording — aborting rescue")
+                        finishRescueWithError(originalError)
+                        return@launch
+                    }
                     val transcription = core.transcribeAudio(audio)?.trim()
                     if (transcription.isNullOrBlank()) {
                         Log.w(TAG, "Model-ASR rescue: nothing understood")
