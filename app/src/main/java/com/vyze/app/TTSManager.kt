@@ -596,6 +596,21 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
     fun getCurrentVoiceName(): String? = tts?.voice?.name
 
     /**
+     * True when at least one INSTALLED voice exists for the given language
+     * code ("en" / "ms" / "zh"). Uninstalled packs are excluded, so this is
+     * the safe pre-check before switching the language — setLanguage() would
+     * otherwise fall back to English AND persist that fallback as the choice.
+     */
+    fun hasInstalledVoicesFor(language: String): Boolean {
+        val engine = tts ?: return false
+        val voices = engine.voices ?: return false
+        return voices.any { v ->
+            v.locale.language == language &&
+                !v.features.contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED)
+        }
+    }
+
+    /**
      * Select a voice by name ("" or [VOICE_AUTO] → auto-pick the best
      * installed voice). No-op if the name is no longer installed.
      */
@@ -844,6 +859,23 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
         const val LANGUAGE_CHINESE = "zh"
 
         val SUPPORTED_LANGUAGES = listOf(LANGUAGE_ENGLISH, LANGUAGE_MALAY, LANGUAGE_CHINESE)
+
+        /**
+         * The language the user DECLARED in Vyze's voice settings (persisted),
+         * mapped to a Locale (US by default). This drives the speech-recognition
+         * language and the prompt output language from launch — not just after
+         * the first spoken exchange — so a Malay-speaking user on an English
+         * phone gets Malay recognition and Malay voice output consistently.
+         */
+        fun storedLanguageLocale(context: android.content.Context): Locale {
+            val key = context.getSharedPreferences(PREFS_NAME, android.content.Context.MODE_PRIVATE)
+                .getString(KEY_LANGUAGE, LANGUAGE_ENGLISH) ?: LANGUAGE_ENGLISH
+            return when (key) {
+                LANGUAGE_MALAY -> Locale("ms", "MY")
+                LANGUAGE_CHINESE -> Locale.SIMPLIFIED_CHINESE
+                else -> Locale.US
+            }
+        }
 
         const val DEBOUNCE_MS = 1500L
         const val ENGINE_SETTLE_DELAY_MS = 200L

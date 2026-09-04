@@ -92,9 +92,6 @@ class MainActivity : AppCompatActivity() {
     @Volatile
     private var lastPartialText: String = ""
 
-    /** Cached intent for speech recognition sessions. */
-    private var speechIntent: Intent? = null
-
     // ── Tier 2: Model-Native ASR Rescue ──────────────────────────
     // When Android's SpeechRecognizer fails in a noisy room (NO_MATCH,
     // SPEECH_TIMEOUT, ERROR_AUDIO), Vyze rescues the query with Gemma 4
@@ -907,6 +904,24 @@ class MainActivity : AppCompatActivity() {
 
     fun isTtsSpeaking(): Boolean = ttsReady && ttsManager.isSpeaking()
 
+    /**
+     * Which language the recognizer should listen for, when known:
+     * 1. A Malay or Chinese voice chosen in Vyze's voice settings — the user
+     *    DECLARED that language, so recognition must match it even when the
+     *    phone itself is English (the device default otherwise hears Malay as
+     *    garbage / NO_MATCH).
+     * 2. Otherwise the language most recently recognized this session, once it
+     *    is Malay or Chinese (adaptive — a Malay speaker recognized once keeps
+     *    getting Malay recognition for the rest of the session).
+     * English (declared or detected) returns null → the recognizer uses its
+     * own device default, which is English on English phones.
+     */
+    private fun resolveRecognitionLocale(): java.util.Locale? {
+        val stored = TTSManager.storedLanguageLocale(this)
+        if (stored.language == "ms" || stored.language == "zh") return stored
+        return lastDetectedLocale?.takeIf { it.language == "ms" || it.language == "zh" }
+    }
+
     // ── Internal Listening ────────────────────────────────────────
 
     /**
@@ -936,15 +951,34 @@ class MainActivity : AppCompatActivity() {
 
     private fun startListeningAfterTtsStop() {
         try {
-            // Reuse cached intent or create new one
-            val intent = speechIntent ?: Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            // Fresh intent EVERY session — the recognition language follows the
+            // user. Relying on the device default (English phone) made Malay and
+            // Chinese queries fail with NO_MATCH or low-confidence garbage that
+            // the chatter filter then silently dropped.
+            val recognitionLocale = resolveRecognitionLocale()
+            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                 putExtra(
                     RecognizerIntent.EXTRA_LANGUAGE_MODEL,
                     RecognizerIntent.LANGUAGE_MODEL_FREE_FORM
                 )
-                // Do NOT set EXTRA_LANGUAGE — let the device use its default language.
-                // This allows the recognizer to handle English, Malay, Chinese, etc.
-                // based on what the user actually speaks.
+                if (recognitionLocale != null) {
+                    // Strong hint: listen for the user's actual language
+                    // (Malay ms-MY / Chinese zh-CN on an English phone).
+                    putExtra(
+                        RecognizerIntent.EXTRA_LANGUAGE,
+                        recognitionLocale.toLanguageTag()
+                    )
+                    Log.d(TAG, "Recognition language forced to ${recognitionLocale.toLanguageTag()}")
+                } else {
+                    // First contact before any language is known — hint the
+                    // recognizer at the supported set and let it follow what
+                    // the user actually says (honored by Google's recognizer;
+                    // ignored harmlessly by engines that don't support it).
+                    putExtra(
+                        RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE,
+                        SUPPORTED_RECOGNITION_LANGUAGES
+                    )
+                }
                 putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
                 putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
 
@@ -960,7 +994,7 @@ class MainActivity : AppCompatActivity() {
                     RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS,
                     1000L
                 )
-            }.also { speechIntent = it }
+            }
 
             isListening = true
             // Fresh session — clear the partial stream so the L2 stability
@@ -1160,6 +1194,13 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val TAG = "MainActivity"
+
+        /**
+         * Comma-separated BCP-47 languages hinted to the recognizer before any
+         * user language is known — lets a Malay/Chinese speaker on an
+         * English-default phone be heard on the very first session.
+         */
+        private const val SUPPORTED_RECOGNITION_LANGUAGES = "en-US,ms-MY,zh-CN"
 
         // ── Tier 1: Noise Robustness ──────────────────────────────
         /** L1: restart delays after failed recognition cycles (ms). */

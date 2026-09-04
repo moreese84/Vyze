@@ -104,6 +104,16 @@ class CameraFragment : Fragment() {
     @Volatile
     private var voiceAuditionActive = false
 
+    /**
+     * True while the audition is asking which LANGUAGE to use (English / Malay /
+     * Chinese). The voice cycle itself can only list voices of the CURRENT
+     * language — so if the user is stuck on the English voice (e.g. English
+     * phone default), there is no way to reach the Malay voice without first
+     * switching the language. This step closes that gap hands-free.
+     */
+    @Volatile
+    private var voiceAuditionLangStep = false
+
     /** Candidate voices for the audition — entry 0 is "automatic". */
     private val voiceAuditionVoices = ArrayList<android.speech.tts.Voice>()
     private var voiceAuditionIndex = 0
@@ -380,10 +390,12 @@ class CameraFragment : Fragment() {
         gestureRouter.onSingleTapAction = { x, y ->
             bargeInAndCapture(
                 "User tapped at position (${x.toInt()}, ${y.toInt()}). " +
-                "Describe what is in front of me and around me for navigation. " +
+                "Describe what is in front of me and around me for navigation, in 1-2 " +
+                "dense sentences — what each key object is plus color, size, material, " +
+                "and state, not lengthy prose. " +
                 "If the tapped object is a packaged product (packet, box, bottle, can), " +
                 "first say its BRAND name and product type exactly as printed " +
-                "(for example: Maggi instant noodle packet), then continue. " +
+                "(for example: Maggi instant noodle packet), then its details, then continue. " +
                 "If the tapped object has text on it (a label, box, or sign), " +
                 "read it aloud verbatim as whole words and sentences, never spelling letter by letter. " +
                 "Read the ENTIRE text on the object in reading order; do not stop halfway."
@@ -774,7 +786,12 @@ class CameraFragment : Fragment() {
                     // user didn't answer — re-hint and keep listening.
                     val mainActivity = activity as? MainActivity
                     if (mainActivity != null) {
-                        mainActivity.speakThenCallback("Say next, use this, or cancel.") {
+                        val hint = if (voiceAuditionLangStep) {
+                            "Say English, Malay, or Chinese, or say cancel."
+                        } else {
+                            "Say next, use this, or cancel."
+                        }
+                        mainActivity.speakThenCallback(hint) {
                             mainHandler.postDelayed({ startVoiceListening() }, VOICE_SESSION_OPEN_DELAY_MS)
                         }
                     }
@@ -1352,30 +1369,82 @@ class CameraFragment : Fragment() {
         coreController.resetForNewCapture()
         hapticManager.vibrateTap()
 
-        voiceAuditionVoices.clear()
-        voiceAuditionVoices.addAll(ttsManager.getInstalledVoicesForCurrentLanguage())
-        voiceAuditionIndex = 0 // 0 = automatic (best available)
         voiceAuditionActive = true
         appState = AppState.LISTENING
-        updateStatus("Voice selection — say next / use this / cancel")
         // The model-ASR rescue's "Please say that again" cue must never
         // interrupt the audition samples.
         (activity as? MainActivity)?.modelAsrRescueAllowed = false
 
-        val mainActivity = activity as? MainActivity
-        if (mainActivity == null) {
+        // A non-English language is already in effect — the user is refining
+        // THAT voice, so go straight to the voice cycle. An English language is
+        // ambiguous (it is usually the device default, not a deliberate choice),
+        // so ASK first: the audition can only list voices of the current
+        // language, and without this step a Malay speaker stuck on the English
+        // voice could never reach the Malay voice hands-free.
+        if (ttsManager.getCurrentLanguageKey() != TTSManager.LANGUAGE_ENGLISH) {
+            auditionStartVoiceCycle()
+        } else {
+            auditionAskLanguage()
+        }
+    }
+
+    /**
+     * Ask which language the user speaks, then run the voice cycle in that
+     * language. Choosing a language PERSISTS it (KEY_LANGUAGE), which also
+     * drives speech-recognition language and prompt output language.
+     */
+    private fun auditionAskLanguage() {
+        if (!isAdded) return
+        Log.d(TAG, "Audition: asking for language")
+        voiceAuditionLangStep = true
+        appState = AppState.LISTENING
+        updateStatus("Voice settings — choose language")
+        val mainActivity = activity as? MainActivity ?: run {
             voiceAuditionActive = false
             return
         }
+        mainActivity.speakThenCallback(
+            "Voice settings. Which language should I speak? Say English, Malay, or Chinese."
+        ) {
+            mainHandler.postDelayed({ startVoiceListening() }, VOICE_SESSION_OPEN_DELAY_MS)
+        }
+    }
+
+    /**
+     * Start the classic voice cycle for the CURRENT language — entry 0 is
+     * "automatic" (best available), then each installed voice in turn.
+     */
+    private fun auditionStartVoiceCycle() {
+        if (!isAdded) return
+        val mainActivity = activity as? MainActivity ?: run {
+            voiceAuditionActive = false
+            return
+        }
+        voiceAuditionLangStep = false
+        voiceAuditionVoices.clear()
+        voiceAuditionVoices.addAll(ttsManager.getInstalledVoicesForCurrentLanguage())
+        voiceAuditionIndex = 0 // 0 = automatic (best available)
+        appState = AppState.LISTENING
+        updateStatus("Voice selection — say next / use this / cancel")
+
         val total = voiceAuditionVoices.size + 1
         ttsManager.setVoiceByName(TTSManager.VOICE_AUTO)
-        mainActivity.speakThenCallback(
-            "Voice selection. ${total} choices, including automatic. " +
-            "I will speak a sample in each voice. Say next for the next voice, " +
-            "use this to keep the voice you just heard, or cancel to stop."
-        ) {
+        mainActivity.speakThenCallback(auditionIntroText(total)) {
             mainHandler.postDelayed({ if (voiceAuditionActive) auditionSpeakCurrent() }, 300L)
         }
+    }
+
+    /** Audition intro prompt — localized so commands are given in the chosen language. */
+    private fun auditionIntroText(total: Int): String = when (ttsManager.getCurrentLanguageKey()) {
+        TTSManager.LANGUAGE_MALAY ->
+            "Pemilihan suara. $total pilihan, termasuk automatik. Saya akan sebut contoh dalam setiap suara. " +
+            "Sebut seterusnya untuk suara berikut, guna ini untuk kekalkan suara, atau batal untuk berhenti."
+        TTSManager.LANGUAGE_CHINESE ->
+            "选择语音。共 $total 个选项，包括自动。我将用每种声音朗读示例。说 下一个 听下一种声音，" +
+            "说 用这个 保留当前声音，说 取消 停止。"
+        else ->
+            "Voice selection. $total choices, including automatic. I will speak a sample in each voice. " +
+            "Say next for the next voice, use this to keep the voice you just heard, or cancel to stop."
     }
 
     /** Speak the current candidate's sample (in its own voice), then listen. */
@@ -1406,13 +1475,113 @@ class CameraFragment : Fragment() {
         }
     }
 
+    /**
+     * Parse the user's spoken answer to the language question. Choosing a
+     * language whose voice pack is not installed opens the installer instead
+     * of silently falling back to English (setLanguage would persist that
+     * fallback as the "choice").
+     */
+    private fun handleVoiceAuditionLangCommand(t: String) {
+        when {
+            // "next" / "skip" at the language question = keep the CURRENT
+            // language and go straight to its voices (skip must NOT cancel —
+            // it is in AUDITION_CANCEL_PHRASES, so it is checked first).
+            containsAny(t, AUDITION_NEXT_PHRASES) || containsAny(t, listOf("skip", "teruskan")) -> {
+                auditionStartVoiceCycle()
+            }
+            containsAny(t, AUDITION_CANCEL_PHRASES) -> {
+                stopVoiceListening()
+                voiceAuditionActive = false
+                voiceAuditionLangStep = false
+                (activity as? MainActivity)?.modelAsrRescueAllowed = true
+                appState = AppState.IDLE
+                updateStatus("Ready")
+                try {
+                    ttsManager.speakImmediate("Voice selection cancelled.")
+                } catch (_: Throwable) {}
+            }
+            else -> {
+                val key = languageKeyForSpoken(t)
+                val mainActivity = activity as? MainActivity
+                if (key == null || mainActivity == null) {
+                    mainActivity?.speakThenCallback(
+                        "I did not catch that. Say English, Malay, or Chinese, or say cancel."
+                    ) {
+                        mainHandler.postDelayed({ startVoiceListening() }, VOICE_SESSION_OPEN_DELAY_MS)
+                    }
+                    return
+                }
+
+                if (!ttsManager.hasInstalledVoicesFor(key)) {
+                    // No voice pack for that language — the app cannot speak it.
+                    // Open the engine's voice installer instead of choosing a
+                    // language the TTS engine will silently fall back from.
+                    Log.i(TAG, "Audition: no installed voice for '$key' — opening voice installer")
+                    stopVoiceListening()
+                    voiceAuditionActive = false
+                    voiceAuditionLangStep = false
+                    (activity as? MainActivity)?.modelAsrRescueAllowed = true
+                    appState = AppState.IDLE
+                    updateStatus("Ready")
+                    val langDisplay = when (key) {
+                        TTSManager.LANGUAGE_MALAY -> "Malay"
+                        TTSManager.LANGUAGE_CHINESE -> "Chinese"
+                        else -> "English"
+                    }
+                    if (mainActivity.openTtsVoiceInstaller()) {
+                        ttsManager.speakQueued(
+                            "The $langDisplay voice is not installed yet. Opening the voice installer. " +
+                            "After it finishes, say voice settings again and choose $langDisplay."
+                        )
+                    } else {
+                        ttsManager.speakQueued(
+                            "The $langDisplay voice is not installed and the installer is unavailable. " +
+                            "You can add voices in Android text to speech settings."
+                        )
+                    }
+                    return
+                }
+
+                // Persist the language (drives TTS voice + recognition + prompts),
+                // auto-pick its best voice, then audition the voices of that language.
+                Log.i(TAG, "Audition: language chosen = $key")
+                ttsManager.setLanguage(key, requireContext())
+                ttsManager.setVoiceByName(TTSManager.VOICE_AUTO)
+                ttsManager.speakImmediate(auditionSampleText())
+                auditionStartVoiceCycle()
+            }
+        }
+    }
+
+    /** Map a spoken language answer to a language key (en / ms / zh), or null. */
+    private fun languageKeyForSpoken(t: String): String? {
+        return when {
+            containsAny(t, listOf("bahasa inggeris", "english", "inggeris", "英语", "英文", "英式")) -> TTSManager.LANGUAGE_ENGLISH
+            containsAny(t, listOf("bahasa melayu", "bahasa malaysia", "bahasa", "melayu", "malay", "malaysia", "马来语")) -> TTSManager.LANGUAGE_MALAY
+            containsAny(t, listOf("chinese", "mandarin", "中文", "华语", "普通话", "汉语", "国语", "中国话")) -> TTSManager.LANGUAGE_CHINESE
+            else -> null
+        }
+    }
+
     /** Parse the user's spoken command during the audition. */
     private fun handleVoiceAuditionCommand(text: String) {
         if (!voiceAuditionActive) return
         val t = text.trim().lowercase()
+
+        // Language-selection step has its own command set.
+        if (voiceAuditionLangStep) {
+            handleVoiceAuditionLangCommand(t)
+            return
+        }
+
         val total = voiceAuditionVoices.size + 1
 
         when {
+            containsAny(t, AUDITION_CHANGE_LANGUAGE_PHRASES) -> {
+                // "change language" returns to the language question so the
+                // user can switch back (e.g. Malay → English) hands-free.
+                auditionAskLanguage()
+            }
             containsAny(t, AUDITION_USE_PHRASES) -> {
                 // Save the currently auditioned voice (or automatic)
                 stopVoiceListening()
@@ -1462,6 +1631,7 @@ class CameraFragment : Fragment() {
     private fun stopVoiceAuditionIfActive() {
         if (voiceAuditionActive) {
             voiceAuditionActive = false
+            voiceAuditionLangStep = false
             stopVoiceListening()
             (activity as? MainActivity)?.modelAsrRescueAllowed = true
             if (appState == AppState.LISTENING) {
@@ -1658,6 +1828,14 @@ class CameraFragment : Fragment() {
         private val AUDITION_CANCEL_PHRASES = listOf(
             "cancel", "stop", "exit", "quit", "back", "skip", "done", "finish",
             "batal", "tamat", "取消", "停止", "退出", "完成"
+        )
+
+        /** Voice cycle: go back to the language question (switch language). */
+        private val AUDITION_CHANGE_LANGUAGE_PHRASES = listOf(
+            "change language", "switch language", "choose language",
+            "language settings", "another language", "other language",
+            "tukar bahasa", "ubah bahasa", "ganti bahasa", "pilih bahasa",
+            "换语言", "更换语言", "改语言", "选择语言", "语言设置", "切换语言"
         )
 
         /** Interval (ms) between auto-snapshot captures in continuous mode. */

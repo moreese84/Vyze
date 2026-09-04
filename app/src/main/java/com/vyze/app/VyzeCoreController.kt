@@ -127,6 +127,13 @@ class VyzeCoreController(
     private val announcedMilestones = java.util.concurrent.ConcurrentHashMap.newKeySet<Int>()
 
     fun initialize() {
+        // Seed the prompt output language from the user's DECLARED Vyze voice
+        // (persisted). Without this, single-tap/reading answers stay in English
+        // until the user happens to speak once — taps have no speech to detect
+        // a language from, so the chosen voice language is the only signal that
+        // a Malay user reads Malay labels.
+        activeUserLocale = TTSManager.storedLanguageLocale(context)
+
         // Reset milestone tracker for this download session
         announcedMilestones.clear()
 
@@ -821,7 +828,24 @@ class VyzeCoreController(
 
                 CrashLogFile.log(TAG, "analyzeImage() returned: ${response?.length ?: 0} chars")
 
-                if (response == null) {
+                // ── OCR FALLBACK ─────────────────────────────────
+                // A READING query (tap on a label/box/panel, pointing question,
+                // explicit read ask) must never end in silence when the model
+                // itself produced nothing — Gemma is weak in Malay, so a Malay
+                // back-panel read can come back blank/empty even though ML Kit
+                // already extracted the ground truth. Deliver the OCR text
+                // verbatim instead.
+                if (response.isNullOrBlank() && isTextQuery && !ocrText.isNullOrBlank()) {
+                    isInferring.set(false)
+                    flushRemainingSentenceBuffer()
+                    CrashLogFile.log(TAG, "VLM response blank but OCR text exists — using OCR fallback")
+                    if (currentSessionId == activeSessionId) {
+                        mainHandler.post {
+                            onInferenceComplete?.invoke(ocrText)
+                            onStatusUpdate?.invoke("Ready [OCR fallback]")
+                        }
+                    }
+                } else if (response == null) {
                     // ALWAYS reset isInferring — prevents stuck ANALYZING state
                     isInferring.set(false)
                     flushRemainingSentenceBuffer()
@@ -910,7 +934,25 @@ class VyzeCoreController(
      */
     fun isTextOnlyQuery(query: String?): Boolean {
         if (query.isNullOrBlank()) return false
-        val lower = query.lowercase()
+        val lower = query.lowercase().trim()
+
+        // Malay knowledge form — "apa itu <noun>?" (what is <noun>?) is a
+        // question ABOUT the noun, not a pointer at a scene object. The bare
+        // forms ("apa itu?", "itu apa?") point at something and must stay on
+        // the camera path. Scene extras (holding / in front / see) keep it on
+        // the camera path too ("apa itu yang saya pegang" = what am I holding).
+        val wordCount = lower.split(Regex("\\s+")).size
+        val malayKnowledgeWithSubject =
+            (lower.contains("apa itu") || lower.contains("apa ini")) &&
+                wordCount >= 3 &&
+                !lower.contains("pegang") &&
+                !lower.contains("tangan") &&
+                !lower.contains("hadapan") &&
+                !lower.contains("depan") &&
+                !lower.contains("nampak") &&
+                !lower.contains("lihat")
+        if (malayKnowledgeWithSubject) return true
+
         // Must contain a knowledge-question marker...
         val hasKnowledgeMarker = TEXT_ONLY_QUERY_KEYWORDS.any { lower.contains(it) }
         if (!hasKnowledgeMarker) return false
@@ -1326,7 +1368,7 @@ class VyzeCoreController(
 
         // ── Dynamic Token Limits ────────────────────────────────
         /** Scene queries: concise descriptions (raised — avoids mid-sentence cutoffs). */
-        private const val SCENE_QUERY_MAX_TOKENS = 96
+        private const val SCENE_QUERY_MAX_TOKENS = 128
 
         /**
          * Floor for text queries with no OCR text found (scene tap with no

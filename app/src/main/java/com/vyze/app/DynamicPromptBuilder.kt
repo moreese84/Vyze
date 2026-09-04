@@ -178,34 +178,41 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
          * NAVIGATION MODE — used for generic taps and automatic spatial descriptions.
          */
         private const val BASE_RULES_NAVIGATION =
-            "Describe what you see. No filler phrases. " +
-            "Use left/center/right + distance. " +
+            "Describe the scene in 1-2 DENSE sentences — more useful detail per word, never wordy prose. " +
+            "For each key object say what it is plus the details you can ACTUALLY SEE: " +
+            "color, size, material, and state (open/closed, full/empty, lying/standing). " +
+            "Add left/center/right + distance when it places the object for the user. " +
             "For a packaged product (packet, box, bottle, can), first say its BRAND name " +
-            "and product type exactly as printed, then describe/read the rest. " +
-            "Read text in ORIGINAL language as whole words and sentences — never spell letter by letter. " +
-            "Use clear punctuation: periods to end sentences, commas to separate list items and clauses. " +
+            "and product type exactly as printed, then its details. " +
+            "Read printed text verbatim in ORIGINAL language as whole words — never spell letter by letter. " +
+            "No filler phrases ('there is', 'I see', 'in the image', 'it appears'). " +
+            "Use clear punctuation: periods to end sentences, commas to separate details. " +
             "If unsure about an object, say 'not clearly visible'. Do NOT guess or hallucinate. " +
             "Mirrors/glass: describe the surface itself.\n" +
             "Examples:\n" +
-            "Input: door in front. Output: Wooden door, center, about 2 steps ahead.\n" +
+            "Input: door in front. Output: Brown wooden door, closed, center, about 2 steps ahead.\n" +
             "Input: person nearby. Output: Person on your left, about 1 step away.\n" +
+            "Input: sofa scene. Output: Grey fabric sofa, soft cushions, about 3 steps ahead. Low wooden table in front of it.\n" +
+            "Input: bottle on table. Output: Clear glass water bottle, half full, on the table about 1 step ahead.\n" +
             "Input: dark room. Output: Dark room. No obstacles detected within 3 steps.\n" +
-            "Input: red packet on table. Output: Maggi instant noodle packet, red, on the table about 1 step ahead."
+            "Input: red packet on table. Output: Small red Maggi instant noodle packet, closed, on the table about 1 step ahead — label reads Maggi Kari."
 
         private const val BASE_RULES_DIRECT_QUERY =
-            "Answer directly in first sentence. " +
-            "If the user asks what an object is and it is a packaged product " +
-            "(packet, box, bottle, can), first say its BRAND name and product type " +
-            "exactly as printed on it, then continue. " +
+            "Answer directly in the first sentence. " +
+            "Name the object and give compact, useful details — size, color, material, " +
+            "state (open/closed, full/empty) — only what you can ACTUALLY see, never long prose. " +
+            "If it is a packaged product (packet, box, bottle, can), first say its BRAND name and product type " +
+            "exactly as printed on it, then its details. " +
             "Read text verbatim in ORIGINAL language as whole words and sentences — never spell letter by letter. " +
             "When asked to read text, read the ENTIRE text in reading order; never stop halfway or summarize. " +
-            "Use clear punctuation: periods to end sentences, commas for pauses between items. " +
+            "Keep the whole answer to 1-3 short spoken sentences. " +
+            "Use clear punctuation: periods to end sentences, commas for pauses between details. " +
             "If text is blurry or unreadable, say 'Text is unclear' — NEVER guess. " +
             "If no text visible, say 'No text visible'. " +
             "Only what you see in THIS image.\n" +
             "Examples:\n" +
-            "Input: what is this? Image shows a red packet. Output: This is a Maggi instant noodle packet, red packet. It contains a block of instant noodles and seasoning sachets.\n" +
-            "Input: what medicine is this? Image shows Diclac Retard box. Output: Diclac Retard, diclofenac sodium 100mg. Take one tablet daily after meals.\n" +
+            "Input: what is this? Image shows a red packet. Output: Small red Maggi instant noodle packet, closed. Label reads Maggi Kari — noodles and seasoning sachets inside.\n" +
+            "Input: what medicine is this? Image shows Diclac Retard box. Output: Diclac Retard, diclofenac sodium 100 milligram. Take one tablet daily after meals.\n" +
             "Input: read this label. Image shows price tag RM12.90. Output: Price is 12 Ringgit and 90 sen.\n" +
             "Input: what does this sign say? Image blurry. Output: Text is unclear."
 
