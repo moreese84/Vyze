@@ -106,6 +106,24 @@ class MainActivity : AppCompatActivity() {
     @Volatile
     private var asrFallbackTried = false
 
+    /**
+     * True once the recognizer heard the user BEGIN speaking in the current
+     * session (onBeginningOfSpeech). The model-ASR rescue is ONLY allowed for
+     * speech that was attempted but failed (the noisy-room case). Pure silence
+     * timeouts must never trigger the "Please say that again" rescue — doing so
+     * hijacked quiet pauses and made double-tap sessions appear dead.
+     */
+    @Volatile
+    private var speechAttempted = false
+
+    /**
+     * False while the hands-free voice audition is running — the rescue's
+     * "Please say that again" cue must never interrupt audition samples.
+     * Toggled by the fragment when the audition starts/stops.
+     */
+    @Volatile
+    var modelAsrRescueAllowed = true
+
     /** Last locale Google's recognizer reported — reused for the model-ASR result. */
     @Volatile
     private var lastDetectedLocale: java.util.Locale? = null
@@ -507,6 +525,15 @@ class MainActivity : AppCompatActivity() {
         Log.i(TAG, "Noise pause cleared — listening can resume")
     }
 
+    /**
+     * Restore the one-shot model-ASR rescue budget. Called when a fresh
+     * hands-free voice session opens (double tap / voice audition / report), so
+     * each conversation gets one offline rescue when genuine speech fails.
+     */
+    fun resetModelAsrBudget() {
+        asrFallbackTried = false
+    }
+
     // ── Tier 2: Model-Native ASR Rescue ────────────────────────────
 
     /**
@@ -522,6 +549,10 @@ class MainActivity : AppCompatActivity() {
      *         should fall through to normal error handling.
      */
     private fun attemptModelAsrRescue(originalError: String): Boolean {
+        if (!modelAsrRescueAllowed) {
+            Log.d(TAG, "Model-ASR rescue suppressed (e.g. voice audition active)")
+            return false
+        }
         if (asrFallbackTried) {
             Log.d(TAG, "Model-ASR rescue already attempted this session — skipping")
             return false
@@ -917,8 +948,10 @@ class MainActivity : AppCompatActivity() {
 
             isListening = true
             // Fresh session — clear the partial stream so the L2 stability
-            // check never compares against a previous session's text.
+            // check never compares against a previous session's text, and
+            // reset the speech-attempt flag (no speech heard yet).
             lastPartialText = ""
+            speechAttempted = false
             speechRecognizer?.startListening(intent)
             Log.i(TAG, "Speech recognition started — waiting for voice input")
             CrashLogFile.log(TAG, "Speech recognition started")
@@ -942,6 +975,10 @@ class MainActivity : AppCompatActivity() {
 
             override fun onBeginningOfSpeech() {
                 Log.d(TAG, "onBeginningOfSpeech")
+                // The user started talking — if recognition then fails, that is
+                // a genuine "lost in noise" case (eligible for the model-ASR
+                // rescue), not a silence pause.
+                speechAttempted = true
             }
 
             override fun onRmsChanged(rmsdB: Float) {}
@@ -998,11 +1035,18 @@ class MainActivity : AppCompatActivity() {
                         // the session, let Gemma's own audio encoder listen:
                         // record the user's speech and transcribe it offline.
                         // Only one attempt per session — no beep loops.
-                        if (attemptModelAsrRescue(errorMsg)) {
+                        //
+                        // GATE: the rescue only runs when the user actually
+                        // ATTEMPTED speech (onBeginningOfSpeech fired). Pure
+                        // silence pauses inside the follow-up window must end
+                        // quietly (the fragment reopens the mic) — running the
+                        // rescue on every quiet pause spoke "Please say that
+                        // again" unprompted and consumed the session.
+                        if (speechAttempted && attemptModelAsrRescue(errorMsg)) {
                             return
                         }
-                        // Rescue failed / unavailable — end the session cleanly
-                        // (no auto-restart, no idle listening).
+                        // Rescue failed / unavailable / not attempted — end the
+                        // session cleanly (no auto-restart, no idle listening).
                         onPartialSpeechResult?.invoke("")
                         onSpeechError?.invoke(errorMsg)
                     }

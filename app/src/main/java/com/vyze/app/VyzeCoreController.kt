@@ -105,9 +105,6 @@ class VyzeCoreController(
 
     private val SENTENCE_TERMINATORS = charArrayOf('.', '!', '?', '\n')
 
-    /** Early flush at commas/colons for faster TTFT — no min char threshold. */
-    private val EARLY_FLUSH_TERMINATORS = charArrayOf(',', ':')
-
     private val minFlushChars = 10
 
     /** Monotonically increasing counter for unique utterance IDs per session. */
@@ -411,80 +408,38 @@ class VyzeCoreController(
             val text = sentenceBuffer.toString()
             if (text.isEmpty()) return
 
-            // ── Ultra-fast path: first chunk of response ─────────
-            // Flush once a real phrase has arrived (2+ words or ≥8 chars).
-            // Requiring this prevents stray single-token artifacts from the
-            // model/tokenizer ("A", "The", "\n") from being spoken aloud
-            // as the start of every answer.
-            if (!firstChunkSent) {
-                val trimmed = text.trim()
-                if (trimmed.isNotEmpty()) {
-                    val wordCount = trimmed.split(Regex("\\s+")).size
-                    if (wordCount >= FIRST_CHUNK_MIN_WORDS || trimmed.length >= FIRST_CHUNK_MIN_CHARS) {
-                        chunk = sanitizeForTts(trimmed)
-                        sentenceBuffer.setLength(0)
-                        if (chunk.isNotEmpty()) {
-                            mainHandler.post {
-                                try {
-                                    val chunkId = "${activeSessionId}_chunk_${chunkCounter.incrementAndGet()}"
-                                    ttsManager.speak(chunk, TextToSpeech.QUEUE_FLUSH, utteranceId = chunkId)
-                                    firstChunkSent = true
-                                    CrashLogFile.log(TAG, "First-chunk flush (id=$chunkId): ${chunk.take(60)}...")
-                                } catch (e: Throwable) {
-                                    Log.w(TAG, "TTS first-chunk error: ${e.message}")
-                                }
-                            }
-                            return
-                        }
-                    }
-                }
-            }
-
-            // ── Fast path: early punctuation flush (commas, colons) ──
-            var earlyTerminator = -1
-            for (i in text.length - 1 downTo 0) {
-                if (text[i] in EARLY_FLUSH_TERMINATORS) {
-                    earlyTerminator = i
-                    break
-                }
-            }
-            if (earlyTerminator >= 0 && earlyTerminator + 1 >= MIN_EARLY_FLUSH_CHARS) {
-                val raw = text.substring(0, earlyTerminator + 1)
-                chunk = sanitizeForTts(raw)
-                sentenceBuffer.delete(0, earlyTerminator + 1)
-                while (sentenceBuffer.isNotEmpty() && sentenceBuffer[0] == ' ') {
-                    sentenceBuffer.deleteCharAt(0)
-                }
-                if (chunk.isNotEmpty()) {
-                    mainHandler.post {
-                        try {
-                            val chunkId = "${activeSessionId}_chunk_${chunkCounter.incrementAndGet()}"
-                            ttsManager.speak(chunk, TextToSpeech.QUEUE_ADD, utteranceId = chunkId)
-                            CrashLogFile.log(TAG, "Early flush (id=$chunkId): ${chunk.take(60)}...")
-                        } catch (e: Throwable) {
-                            Log.w(TAG, "TTS flush error: ${e.message}")
-                        }
-                    }
-                    return
-                }
-            }
-
-            // ── Slow path: full sentence terminator check ──────────
-            var lastTerminator = -1
+            // ── Sentence-boundary flushing only ─────────────────────
+            // Flush ONLY at real sentence ends (., !, ?, newline). Commas and
+            // colons stay INSIDE the sentence. Previously the buffer also
+            // flushed at commas (and even spoke the first 2-3 words instantly),
+            // which chopped one sentence into many tiny utterances — each one
+            // spoken with a full-stop intonation and a dead-air gap, so users
+            // heard "A red can. …(seconds of silence)… with a white label."
+            // Whole sentences are the natural spoken unit: buffer until one
+            // completes, then speak it in one flowing utterance (the TTS voice
+            // renders internal commas as short natural pauses).
+            var cut = -1
             for (i in text.length - 1 downTo 0) {
                 if (text[i] in SENTENCE_TERMINATORS) {
-                    lastTerminator = i
+                    cut = i
                     break
                 }
             }
 
-            if (lastTerminator < 0) return
-            if (lastTerminator + 1 < minFlushChars) return
+            // ── Hard ceiling ───────────────────────────────────────
+            // If the model emits a long run without sentence punctuation
+            // (rare), flush anyway so speech never stalls for seconds.
+            if (cut < 0 && text.length >= MAX_FLUSH_READ_AHEAD_CHARS) {
+                cut = text.length - 1
+            }
+            if (cut < 0) return
+            // Keep buffering tiny fragments ("Yes.") so a one-word sentence
+            // doesn't become its own clipped utterance — it joins the next one.
+            if (cut + 1 < minFlushChars) return
 
-            val raw = text.substring(0, lastTerminator + 1)
-            chunk = sanitizeForTts(raw)
+            chunk = sanitizeForTts(text.substring(0, cut + 1))
 
-            sentenceBuffer.delete(0, lastTerminator + 1)
+            sentenceBuffer.delete(0, cut + 1)
             while (sentenceBuffer.isNotEmpty() && sentenceBuffer[0] == ' ') {
                 sentenceBuffer.deleteCharAt(0)
             }
@@ -494,6 +449,8 @@ class VyzeCoreController(
             mainHandler.post {
                 try {
                     val chunkId = "${activeSessionId}_chunk_${chunkCounter.incrementAndGet()}"
+                    // First utterance flushes any leftover status speech
+                    // ("Analyzing scene...") so the answer starts clean.
                     if (!firstChunkSent) {
                         ttsManager.speak(chunk, TextToSpeech.QUEUE_FLUSH, utteranceId = chunkId)
                         firstChunkSent = true
@@ -1353,9 +1310,11 @@ class VyzeCoreController(
 
         /** Max dimension for continuous mode bitmap downsampling. */
         private const val CONTINUOUS_MAX_DIM = 256
-        private const val MIN_EARLY_FLUSH_CHARS = 12
-        private const val FIRST_CHUNK_MIN_WORDS = 2
-        private const val FIRST_CHUNK_MIN_CHARS = 8
+        /**
+         * If the model emits this many characters without sentence-ending
+         * punctuation, flush anyway so speech never stalls mid-generation.
+         */
+        private const val MAX_FLUSH_READ_AHEAD_CHARS = 200
 
         // ── Dynamic Resolution Constants ──────────────────────────
 

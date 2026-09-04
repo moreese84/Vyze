@@ -1358,9 +1358,9 @@ class CameraFragment : Fragment() {
         voiceAuditionActive = true
         appState = AppState.LISTENING
         updateStatus("Voice selection — say next / use this / cancel")
-        // The user has now used Voice Settings — the double-tap listening cue
-        // no longer needs to teach the command on every session.
-        markVoiceSettingsLearned()
+        // The model-ASR rescue's "Please say that again" cue must never
+        // interrupt the audition samples.
+        (activity as? MainActivity)?.modelAsrRescueAllowed = false
 
         val mainActivity = activity as? MainActivity
         if (mainActivity == null) {
@@ -1420,8 +1420,8 @@ class CameraFragment : Fragment() {
                 else voiceAuditionVoices[voiceAuditionIndex - 1].name
                 requireContext().getSharedPreferences(TTSManager.PREFS_NAME, Context.MODE_PRIVATE)
                     .edit().putString(TTSManager.KEY_VOICE_NAME, name).apply()
-                markVoiceSettingsLearned()
                 voiceAuditionActive = false
+                (activity as? MainActivity)?.modelAsrRescueAllowed = true
                 appState = AppState.IDLE
                 updateStatus("Voice selected")
                 try {
@@ -1441,6 +1441,7 @@ class CameraFragment : Fragment() {
             containsAny(t, AUDITION_CANCEL_PHRASES) -> {
                 stopVoiceListening()
                 voiceAuditionActive = false
+                (activity as? MainActivity)?.modelAsrRescueAllowed = true
                 appState = AppState.IDLE
                 updateStatus("Ready")
                 try {
@@ -1462,6 +1463,7 @@ class CameraFragment : Fragment() {
         if (voiceAuditionActive) {
             voiceAuditionActive = false
             stopVoiceListening()
+            (activity as? MainActivity)?.modelAsrRescueAllowed = true
             if (appState == AppState.LISTENING) {
                 appState = AppState.IDLE
                 updateStatus("Ready")
@@ -1539,16 +1541,19 @@ class CameraFragment : Fragment() {
         updateStatus("Listening...")
 
         if (cue) {
-            // Spoken cue. The voice-settings teaching hint is one-time: it
-            // only appears until the user has used Voice Settings once (the
-            // double-tap cue then stays short: "Listening. Ask your question.").
             val mainActivity = activity as? MainActivity
             if (mainActivity != null) {
-                val hint = if (hasLearnedVoiceSettings()) "" else
-                    ", or say voice settings to change how I sound"
-                mainActivity.speakThenCallback(
-                    "Listening. Ask your question$hint."
-                ) {
+                // Fresh conversation session — restore the one-shot model-ASR
+                // rescue budget and re-enable it (it is consumed when a
+                // noisy-room rescue runs, and disabled during the audition).
+                mainActivity.resetModelAsrBudget()
+                mainActivity.modelAsrRescueAllowed = true
+                // Short spoken cue, then the mic opens right after it ends so
+                // the cue is never captured. Kept to one word on purpose: a
+                // long cue (e.g. the old "...or say voice settings..." hint)
+                // delayed the mic by ~5s, so users who spoke early lost their
+                // query and heard nothing back.
+                mainActivity.speakThenCallback("Listening.") {
                     // Open the mic AFTER the cue finishes so it is never captured.
                     mainHandler.postDelayed({ startVoiceListening() }, VOICE_SESSION_OPEN_DELAY_MS)
                 }
@@ -1590,28 +1595,6 @@ class CameraFragment : Fragment() {
             Log.d(TAG, "Tap answer done — staying IDLE, mic closed")
             endFollowUpWindow()
         }
-    }
-
-    /**
-     * True once the voice-settings hint is no longer needed: the user has
-     * opened Voice Settings at least once, OR already answered the one-time
-     * "better voice?" prompt (they know the voice can be changed).
-     */
-    private fun hasLearnedVoiceSettings(): Boolean {
-        return try {
-            val prefs = requireContext()
-                .getSharedPreferences(TTSManager.PREFS_NAME, Context.MODE_PRIVATE)
-            prefs.getBoolean(TTSManager.KEY_VOICE_SETTINGS_KNOWN, false) ||
-                prefs.getBoolean(TTSManager.KEY_VOICE_PROMPT_RESOLVED, false)
-        } catch (_: Throwable) { false }
-    }
-
-    /** Persist that the user has opened Voice Settings (dismisses the cue hint). */
-    private fun markVoiceSettingsLearned() {
-        try {
-            requireContext().getSharedPreferences(TTSManager.PREFS_NAME, Context.MODE_PRIVATE)
-                .edit().putBoolean(TTSManager.KEY_VOICE_SETTINGS_KNOWN, true).apply()
-        } catch (_: Throwable) {}
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -1696,7 +1679,7 @@ class CameraFragment : Fragment() {
         private const val THERMALTHROTTLE_INTERVAL_MS = 8000L
 
         /** Delay (ms) between the "Listening" cue and opening the mic. */
-        private const val VOICE_SESSION_OPEN_DELAY_MS = 700L
+        private const val VOICE_SESSION_OPEN_DELAY_MS = 500L
 
         /** Hands-free follow-up window: mic stays open this long after each answer. */
         private const val CONVERSATION_WINDOW_MS = 12_000L
@@ -1708,7 +1691,7 @@ class CameraFragment : Fragment() {
         private const val FOLLOW_UP_RETRY_DELAY_MS = 500L
 
         /** Delay before the mic opens after an answer ends (ms). */
-        private const val FOLLOW_UP_OPEN_DELAY_MS = 600L
+        private const val FOLLOW_UP_OPEN_DELAY_MS = 450L
 
         /** Delay between the better-voice prompt and opening the mic (ms). */
         private const val VOICE_INSTALL_PROMPT_GAP_MS = 600L

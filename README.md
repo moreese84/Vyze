@@ -96,7 +96,7 @@ Point-and-describe loop with thermal safety — automatically throttles capture 
 Say "I want to make a report" (English/Malay/Chinese) to enter report mode. Speak your issue, and the app saves a device-annotated report file and pre-fills an email — one tap to send.
 
 ### Voice Settings by Voice
-Double tap, then say "voice settings" to audition every installed voice hands-free — "next" to hear the next voice, "use this" to keep it, "cancel" to stop. The choice persists per language. The teaching hint in the double-tap listening cue appears only until you have used Voice Settings once (or answered the one-time better-voice prompt).
+Double tap, then say "voice settings" to audition every installed voice hands-free — "next" to hear the next voice, "use this" to keep it, "cancel" to stop. The choice persists per language. The double-tap cue stays a short "Listening." so it never delays the mic or nags.
 
 ### Audio Focus & TalkBack
 Vyze holds audio focus for the whole session and speaks through the **media stream** at exactly the phone's volume, so the hardware volume buttons keep working and every utterance is stable. Android does not allow apps to duck or pause TalkBack, so Vyze detects TalkBack on launch, speaks a one-time advisory, and offers a guided voice command ("open accessibility settings") that takes the user straight to the TalkBack toggle — then re-checks and confirms on return.
