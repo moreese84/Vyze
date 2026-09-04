@@ -439,6 +439,22 @@ class VyzeCoreController(
             if (cut < 0 && text.length >= MAX_FLUSH_READ_AHEAD_CHARS) {
                 cut = text.length - 1
             }
+
+            // ── FIRST-UTTERANCE FAST START ────────────────────────
+            // ONLY for the very first flush: if the model is still mid-sentence
+            // but has already emitted a long-enough lead-in (dense descriptions
+            // often run 60+ chars before the first period), speak the
+            // word-aligned prefix immediately instead of making the user wait
+            // for the entire first sentence. This moves first speech forward by
+            // ~1s at the cost of ONE brief mid-sentence pause at the very
+            // start. Every later flush stays strictly sentence-boundary, so the
+            // "A red can…" choppiness cannot come back.
+            if (cut < 0 && !firstChunkSent && text.length >= FAST_START_CHARS) {
+                val spaceIdx = text.lastIndexOf(' ', FAST_START_CHARS - 1)
+                if (spaceIdx >= FAST_START_MIN_CHARS) {
+                    cut = spaceIdx
+                }
+            }
             if (cut < 0) return
             // Keep buffering tiny fragments ("Yes.") so a one-word sentence
             // doesn't become its own clipped utterance — it joins the next one.
@@ -600,7 +616,8 @@ class VyzeCoreController(
         // ── Dynamic Resolution Scaling ──────────────────────────
         // Text-extraction queries ("read", "label", etc.) and tap queries
         // (which often land on objects with labels) benefit from higher
-        // resolution (384x384) to capture fine-grained text details.
+        // resolution to capture fine-grained text details (512px when OCR
+        // actually finds text — see the post-OCR dimension decision below).
         // Standard scene queries use 256x256 for faster inference.
         val isTapQuery = query?.contains(TAP_POSITION_MARKER) == true
         val currencyQuery = isCurrencyQuery(query)
@@ -611,12 +628,6 @@ class VyzeCoreController(
         // ground truth instead of a 256px guess.
         val isTextQuery = isTextExtractionQuery(query) || isTapQuery || currencyQuery ||
             isPointingQuery(query)
-        val targetDimension = if (isTextQuery) {
-            TEXT_EXTRACTION_DIMENSION
-        } else {
-            SCENE_QUERY_DIMENSION
-        }
-        CrashLogFile.log(TAG, "Target dimension: $targetDimension (query=\"${query?.take(40)}\", tap=$isTapQuery)")
 
         onStatusUpdate("Analyzing snapshot...")
 
@@ -735,12 +746,35 @@ class VyzeCoreController(
                     }
                 }
 
+                // ── VLM DIMENSION — decided AFTER OCR ────────────
+                // Pay the full 512px prefill only when OCR actually found text
+                // for the model to echo; a tap/pointing query with no readable
+                // text needs only 384px, and pure scene queries stay at 256px.
+                // Keeps small-text accuracy where it matters while shaving
+                // prefill latency on textless captures.
+                val targetDimension = when {
+                    isTextQuery && !ocrText.isNullOrBlank() -> TEXT_EXTRACTION_DIMENSION
+                    // Textless visual object (tap / "what is this" with nothing
+                    // readable): treat it like a scene query — 256px prefill is
+                    // the fastest the GPU can do, and there is no text to gain
+                    // from a bigger image.
+                    isTapQuery || isPointingQuery(query) -> SCENE_QUERY_DIMENSION
+                    isTextQuery -> TEXT_EXTRACTION_NO_OCR_DIMENSION
+                    else -> SCENE_QUERY_DIMENSION
+                }
+                CrashLogFile.log(TAG, "VLM dimension: $targetDimension (ocrChars=${ocrText?.length ?: 0})")
+
                 // ── OCR FAST-PATH: skip Gemma if confidence is high ──
-                // Only for EXPLICIT text queries ("read this label") — the
-                // whole ask is the text, so reading it directly is correct.
-                // Tap queries keep Gemma in the loop (scene + object reading)
-                // and just benefit from the injected OCR text.
-                if (isTextExtractionQuery(query) && !ocrText.isNullOrBlank() && ocrConfidence >= OCR_FAST_PATH_CONFIDENCE) {
+                // Only for EXPLICIT spoken reading queries ("read this label",
+                // "baca teks ini") — the whole ask IS the text, so reading it
+                // directly is correct. Taps are excluded on purpose: a tap on a
+                // product must keep Gemma in the loop, because the fast path
+                // would otherwise commit Latin-only OCR at high confidence and
+                // never give the model a chance to read small/mixed script the
+                // OCR missed (e.g. tiny Chinese glyphs on a small bottle).
+                if (!isTapQuery && isTextExtractionQuery(query) &&
+                    !ocrText.isNullOrBlank() && ocrConfidence >= OCR_FAST_PATH_CONFIDENCE
+                ) {
                     CrashLogFile.log(TAG, "OCR FAST-PATH: confidence=$ocrConfidence >= $OCR_FAST_PATH_CONFIDENCE — skipping Gemma")
                     isInferring.set(false)
                     mainHandler.removeCallbacks(watchdogRunnable)
@@ -1358,10 +1392,31 @@ class VyzeCoreController(
          */
         private const val MAX_FLUSH_READ_AHEAD_CHARS = 200
 
+        /**
+         * Fast-start: speak the first word-aligned fragment once the lead-in
+         * reaches this many characters (before the first sentence ends), so
+         * first speech begins sooner. Must be long enough that the fragment
+         * reads naturally as an opening clause.
+         */
+        private const val FAST_START_CHARS = 44
+        /** Minimum length of the fast-start fragment (avoids "Yes."-style clips). */
+        private const val FAST_START_MIN_CHARS = 20
+
         // ── Dynamic Resolution Constants ──────────────────────────
 
-        /** Higher resolution for text extraction (384x384 captures fine text details). */
-        private const val TEXT_EXTRACTION_DIMENSION = 384
+        /**
+         * Higher resolution for text extraction (512px captures fine text details,
+         * e.g. tiny Chinese glyphs on small bottles; capped by the engine's own
+         * MAX_INPUT_DIMENSION of 512). Only used when OCR actually found text.
+         */
+        private const val TEXT_EXTRACTION_DIMENSION = 512
+
+        /**
+         * Text queries where OCR found nothing readable — still needs a little
+         * more than the 256px scene budget for object-level reading attempts,
+         * but paying 512px here would only slow prefill with no text to gain.
+         */
+        private const val TEXT_EXTRACTION_NO_OCR_DIMENSION = 384
 
         /** Standard resolution for scene queries (256x256 for fast inference). */
         private const val SCENE_QUERY_DIMENSION = 256

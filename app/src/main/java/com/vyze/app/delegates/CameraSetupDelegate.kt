@@ -7,9 +7,8 @@ import android.graphics.ImageFormat
 import android.graphics.Matrix
 import android.graphics.Rect
 import android.graphics.YuvImage
-import android.os.Handler
-import android.os.Looper
 import android.util.Log
+import android.util.Size
 import android.view.Display
 import androidx.camera.core.AspectRatio
 import androidx.camera.core.Camera
@@ -56,14 +55,14 @@ class CameraSetupDelegate {
     /** Latest decoded frame from the camera — updated by ImageAnalysis.Analyzer. */
     private val latestFrame = AtomicReference<Bitmap?>(null)
 
+    /** Counts frames the analyzer examined, to throttle expensive decodes. */
+    private var decodeTick = 0
+
     /** Lock to prevent concurrent frame extraction + recycling. */
     private val frameLock = AtomicBoolean(false)
 
     /** Analysis executor — single thread to avoid frame drops. */
     private var analysisExecutor: ExecutorService = Executors.newSingleThreadExecutor()
-
-    /** Main handler for posting callbacks. */
-    private val mainHandler = Handler(Looper.getMainLooper())
 
     /** Reference to PreviewView for fallback frame extraction. */
     private var previewViewRef: PreviewView? = null
@@ -95,10 +94,24 @@ class CameraSetupDelegate {
     private var isDarkEnvironment = false
 
     companion object {
-        /** How long to poll for a fresh frame before giving up (ms). */
-        private const val FRAME_WAIT_TIMEOUT_MS = 300L
         /** Polling interval when waiting for a frame (ms). */
         private const val FRAME_POLL_INTERVAL_MS = 20L
+
+        /**
+         * Decode only every Nth analyzed frame to ARGB. At high analysis
+         * resolution each decoded frame is several MB; decoding every frame
+         * churns memory and can starve the capture path on mid-tier devices.
+         */
+        private const val DECODE_THROTTLE = 2
+
+        /**
+         * Capture attempts before reporting failure — the first attempt can
+         * lose a race with the analyzer recycling the frame, or a copy can
+         * fail under memory pressure; retrying with a fresh frame recovers.
+         */
+        private const val CAPTURE_ATTEMPTS = 3
+        /** Extra wait per attempt for a genuinely new frame (ms). */
+        private const val CAPTURE_FRAME_WAIT_MS = 150L
 
         // ── Auto-Torch Luminance Thresholds ─────────────────────
         /** Average Y-plane brightness below this → torch ON (0-255). */
@@ -159,8 +172,17 @@ class CameraSetupDelegate {
 
         // ImageAnalysis — delivers frames in RAM at camera framerate.
         // No disk I/O, no JPEG encode/decode round-trip.
+        //
+        // An explicit high target resolution is CRITICAL for OCR: without it
+        // CameraX falls back to a low default (~640x480), and small print on
+        // tiny products (a 2ml bottle's Chinese label, fine-print panels) drops
+        // below what ML Kit can detect. 960x720 keeps ~2.2x the default's pixel
+        // density while halving the memory pressure of 1280x960 — combined with
+        // the decode throttle below, capture stays reliable on mid-tier devices.
+        // NOTE: must NOT be combined with setTargetAspectRatio on the same
+        // use case — CameraX throws IllegalArgumentException.
         val imageAnalysis = ImageAnalysis.Builder()
-            .setTargetAspectRatio(AspectRatio.RATIO_4_3)
+            .setTargetResolution(Size(960, 720))
             .setTargetRotation(previewView.display.rotation)
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
             .build()
@@ -170,7 +192,17 @@ class CameraSetupDelegate {
 
         imageAnalysis.setAnalyzer(analysisExecutor) { imageProxy ->
             try {
-                val bitmap = imageProxyToBitmap(imageProxy)
+                // ── DECODE THROTTLE ─────────────────────────────
+                // At high analysis resolution each decoded ARGB frame is ~2.5MB;
+                // decoding every delivered frame churns memory hard on mid-tier
+                // devices and can starve the capture path. Decode every Nth
+                // frame — KEEP_ONLY_LATEST still keeps the rolling frame fresh
+                // for takeSnapshot while allocation pressure is halved.
+                val bitmap = if (decodeTick++ % DECODE_THROTTLE == 0) {
+                    imageProxyToBitmap(imageProxy)
+                } else {
+                    null
+                }
                 if (bitmap != null) {
                     // Swap in the new frame — old one is recycled below.
                     // CRITICAL: Acquire frameLock before recycling so takeSnapshot()
@@ -226,67 +258,78 @@ class CameraSetupDelegate {
         onError: (String) -> Unit
     ) {
         val counterAtQuery = frameCounter
-        var foundFrame: Bitmap? = null
-        var waited = 0L
-        val pollInterval = 10L
-        val maxWait = 300L
+        var lastError = "Camera frame unavailable"
 
-        while (waited < maxWait) {
-            val candidate = latestFrame.get()
-            if (candidate != null && !candidate.isRecycled) {
-                // Ideal condition: a new frame arrived post-query
-                if (frameCounter > counterAtQuery) {
-                    foundFrame = candidate
-                    break
+        for (attempt in 0 until CAPTURE_ATTEMPTS) {
+            var candidate = latestFrame.get()?.takeIf { !it.isRecycled }
+
+            if (candidate == null) {
+                // No decoded frame yet (cold start) — wait for the analyzer.
+                val waitUntil = System.currentTimeMillis() + CAPTURE_FRAME_WAIT_MS
+                while (System.currentTimeMillis() < waitUntil) {
+                    candidate = latestFrame.get()?.takeIf { !it.isRecycled }
+                    if (candidate != null) break
+                    Thread.sleep(FRAME_POLL_INTERVAL_MS)
+                }
+            } else if (attempt > 0 && frameCounter <= counterAtQuery) {
+                // A previous attempt hit a recycled/failed frame — this time
+                // wait briefly for a genuinely NEWER frame to retry against.
+                val waitUntil = System.currentTimeMillis() + CAPTURE_FRAME_WAIT_MS
+                while (System.currentTimeMillis() < waitUntil) {
+                    val fresh = latestFrame.get()?.takeIf { !it.isRecycled }
+                    if (frameCounter > counterAtQuery) {
+                        candidate = fresh
+                        break
+                    }
+                    Thread.sleep(FRAME_POLL_INTERVAL_MS)
+                }
+                if (frameCounter <= counterAtQuery) {
+                    candidate = latestFrame.get()?.takeIf { !it.isRecycled }
                 }
             }
-            Thread.sleep(pollInterval)
-            waited += pollInterval
+            // Attempt 0 with a valid frame: the rolling frame is updated
+            // continuously (≤ ~130ms old with the decode throttle), so it is
+            // used IMMEDIATELY — the happy path adds no wait at all.
+
+            if (candidate != null) {
+                val copy = copyFrameSafely(candidate)
+                if (copy != null) {
+                    onBitmap(copy)
+                    return
+                }
+                // The frame was recycled or the copy failed (e.g. allocation
+                // under memory pressure) — retry with a fresh frame instead of
+                // reporting "capture failed" on the first transient miss.
+                lastError = "Failed to copy camera frame"
+                Log.w(TAG, "takeSnapshot: attempt $attempt copy failed — retrying")
+            } else {
+                lastError = "Camera frame unavailable"
+            }
+            Thread.sleep(FRAME_POLL_INTERVAL_MS)
         }
 
-        // FALLBACK: If no strictly newer frame arrived within 300ms, use the latest valid frame
-        if (foundFrame == null) {
-            foundFrame = latestFrame.get()?.takeIf { !it.isRecycled }
-        }
-
-        if (foundFrame != null) {
-            extractFrameCopy(foundFrame, onBitmap, onError)
-        } else {
-            onError("Camera frame unavailable")
-        }
+        Log.e(TAG, "takeSnapshot failed after $CAPTURE_ATTEMPTS attempts: $lastError")
+        onError(lastError)
     }
 
     /**
-     * Extract a deep copy of the frame on the analysis thread.
-     * Shared by both the instant-path and the polled-path.
+     * Deep-copy the latest frame under [frameLock] so the analyzer cannot
+     * recycle it mid-copy. Returns null if the frame died or the copy
+     * allocation failed — the caller retries with a fresh frame.
      */
-    private fun extractFrameCopy(
-        frame: Bitmap,
-        onBitmap: (Bitmap) -> Unit,
-        onError: (String) -> Unit
-    ) {
-        analysisExecutor.execute {
-            try {
-                while (!frameLock.compareAndSet(false, true)) {
-                    Thread.sleep(1)
-                }
-                try {
-                    if (frame.isRecycled) {
-                        mainHandler.post { onError("Frame recycled before extraction") }
-                        return@execute
-                    }
-                    val copy = frame.copy(Bitmap.Config.ARGB_8888, true)
-                    if (copy != null && !copy.isRecycled) {
-                        mainHandler.post { onBitmap(copy) }
-                    } else {
-                        mainHandler.post { onError("Failed to copy camera frame") }
-                    }
-                } finally {
-                    frameLock.set(false)
-                }
-            } catch (e: Throwable) {
-                mainHandler.post { onError("Frame extraction failed: ${e.message}") }
-            }
+    private fun copyFrameSafely(frame: Bitmap): Bitmap? {
+        while (!frameLock.compareAndSet(false, true)) {
+            Thread.sleep(1)
+        }
+        try {
+            if (frame.isRecycled) return null
+            val copy = frame.copy(Bitmap.Config.ARGB_8888, true)
+            return if (copy != null && !copy.isRecycled) copy else null
+        } catch (e: Throwable) {
+            Log.w(TAG, "copyFrameSafely error: ${e.message}")
+            return null
+        } finally {
+            frameLock.set(false)
         }
     }
 
