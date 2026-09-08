@@ -51,7 +51,6 @@
                 app:indicatorColor="@color/vyze_yellow"
                 app:trackColor="#33333322"
                 app:trackThickness="12dp"
-                app:indicatorTrackGapSize="0dp"
                 tools:progress="45" />
 
             <TextView
