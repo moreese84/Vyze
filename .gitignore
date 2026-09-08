@@ -47,6 +47,8 @@ Thumbs.db
 
 # Node modules (pitch deck tools)
 node_modules/
+package.json
+package-lock.json
 
 # Python cache
 __pycache__/
