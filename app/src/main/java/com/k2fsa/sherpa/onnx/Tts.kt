@@ -204,7 +204,7 @@ class OfflineTtsModelConfig(
  * OfflineTtsConfig wraps OfflineTtsModelConfig plus global settings.
  */
 class OfflineTtsConfig(
-    @JvmField val modelConfig: OfflineTtsModelConfig = OfflineTtsModelConfig(),
+    @JvmField val model: OfflineTtsModelConfig = OfflineTtsModelConfig(),
     @JvmField val ruleFsts: String = "",
     @JvmField val ruleFars: String = "",
     @JvmField val maxNumSentences: Int = 1,
@@ -220,7 +220,7 @@ class OfflineTtsConfig(
         numThreads: Int = 2,
         debug: Boolean = false
     ) : this(
-        modelConfig = OfflineTtsModelConfig(
+        model = OfflineTtsModelConfig(
             kokoro = OfflineTtsKokoroModelConfig(
                 model = model,
                 tokens = tokens
