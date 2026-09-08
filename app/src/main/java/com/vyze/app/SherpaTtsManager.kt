@@ -305,9 +305,11 @@ class SherpaTtsManager(private val context: Context) {
         }
 
         try {
+            val modelDir = modelFile.parentFile?.absolutePath ?: ""
             val config = OfflineTtsConfig(
                 model = modelFile.absolutePath,
                 tokens = tokensFile.absolutePath,
+                dataDir = modelDir,
                 numThreads = 2,
                 debug = false
             )
@@ -336,9 +338,11 @@ class SherpaTtsManager(private val context: Context) {
         }
 
         try {
+            val modelDir = modelFile.parentFile?.absolutePath ?: ""
             val config = OfflineTtsConfig(
                 model = modelFile.absolutePath,
                 tokens = tokensFile.absolutePath,
+                dataDir = modelDir,
                 numThreads = 2,
                 debug = false
             )

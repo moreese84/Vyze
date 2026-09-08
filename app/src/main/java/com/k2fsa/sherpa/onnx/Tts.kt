@@ -217,13 +217,15 @@ class OfflineTtsConfig(
     constructor(
         model: String = "",
         tokens: String = "",
+        dataDir: String = "",
         numThreads: Int = 2,
         debug: Boolean = false
     ) : this(
         model = OfflineTtsModelConfig(
             kokoro = OfflineTtsKokoroModelConfig(
                 model = model,
-                tokens = tokens
+                tokens = tokens,
+                dataDir = dataDir
             ),
             numThreads = numThreads,
             debug = debug,
