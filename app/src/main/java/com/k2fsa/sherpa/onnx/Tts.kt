@@ -124,7 +124,8 @@ class OfflineTtsKokoroModelConfig(
     @JvmField val dataDir: String = "",
     @JvmField val lengthScale: Float = 1.0f,
     @JvmField val lexicon: String = "",
-    @JvmField val lang: String = ""
+    @JvmField val lang: String = "",
+    @JvmField val dictDir: String = ""
 )
 
 // ── Model Config (ZipVoice) ──────────────────────────────────────────
