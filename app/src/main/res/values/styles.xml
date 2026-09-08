@@ -26,6 +26,13 @@
 
     </style>
 
+    <!-- Bridge theme for Material widgets inside the AppCompat-based app. -->
+    <style name="Theme.Vyze.MaterialOverlay" parent="Theme.Material3.Light.NoActionBar">
+        <item name="colorPrimary">@color/vyze_yellow</item>
+        <item name="colorOnPrimary">@color/vyze_black</item>
+        <item name="colorOnSurface">@color/vyze_black</item>
+    </style>
+
     <!-- Splash Screen theme — applied as the starting theme in the manifest.
          Off-white background matches the adaptive icon palette.
          Must be set BEFORE installSplashScreen() in the Activity. -->

@@ -1,9 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
     xmlns:tools="http://schemas.android.com/tools"
     android:id="@+id/loading_container"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
+    android:theme="@style/Theme.Vyze.MaterialOverlay"
     android:contentDescription="Vyze loading screen">
 
     <!-- Animated brand dots background (red + yellow on white) -->
@@ -38,26 +40,30 @@
             android:layout_marginTop="48dp"
             android:clipChildren="false">
 
-            <ProgressBar
+            <com.google.android.material.progressindicator.LinearProgressIndicator
                 android:id="@+id/progress_bar"
-                style="@android:style/Widget.ProgressBar.Horizontal"
                 android:layout_width="match_parent"
-                android:layout_height="8dp"
+                android:layout_height="12dp"
                 android:layout_gravity="center_vertical"
                 android:max="100"
                 android:progress="0"
+                app:trackCornerRadius="6dp"
+                app:indicatorColor="@color/vyze_yellow"
+                app:trackColor="#33333322"
+                app:trackThickness="12dp"
+                app:indicatorTrackGapSize="0dp"
                 tools:progress="45" />
 
             <TextView
                 android:id="@+id/progress_text"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:layout_gravity="end|top"
-                android:layout_marginTop="-2dp"
+                android:layout_gravity="end|bottom"
+                android:layout_marginBottom="-4dp"
                 android:text="0%"
-                android:textColor="#007F8B"
-                android:textSize="12sp"
-                android:fontFamily="monospace"
+                android:textColor="#231f20"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium"
                 tools:text="45%" />
         </FrameLayout>
 
@@ -68,7 +74,7 @@
             android:layout_height="wrap_content"
             android:layout_marginTop="20dp"
             android:text="Preparing Vyze..."
-            android:textColor="#666666"
+            android:textColor="#333333"
             android:textSize="14sp"
             android:gravity="center"
             android:importantForAccessibility="yes"
@@ -93,7 +99,7 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginTop="12dp"
-            android:textColor="#999999"
+            android:textColor="#666666"
             android:textSize="11sp"
             android:gravity="center"
             android:fontFamily="monospace"
