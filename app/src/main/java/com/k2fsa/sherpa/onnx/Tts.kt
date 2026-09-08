@@ -42,7 +42,7 @@ class OfflineTts(
     ): GeneratedAudio? {
         synchronized(lock) {
             if (ptr == 0L) return null
-            return generateFromFile(ptr, text, sid, speed)
+            return generateImpl(ptr, text, sid, speed)
         }
     }
 
@@ -73,14 +73,16 @@ class OfflineTts(
         release()
     }
 
-    private external fun newFromFile(config: OfflineTtsConfig): Long
-    private external fun delete(ptr: Long)
-    private external fun generateFromFile(
+    /** JNI: native implementation of OfflineTts.generate(). */
+    private external fun generateImpl(
         ptr: Long,
         text: String,
         sid: Int,
         speed: Float
     ): GeneratedAudio?
+
+    private external fun newFromFile(config: OfflineTtsConfig): Long
+    private external fun delete(ptr: Long)
     private external fun getSampleRate(ptr: Long): Int
     private external fun getNumSpeakers(ptr: Long): Int
 }

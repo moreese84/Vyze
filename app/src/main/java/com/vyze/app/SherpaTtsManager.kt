@@ -296,11 +296,11 @@ class SherpaTtsManager(private val context: Context) {
 
         if (modelFile?.exists() != true || tokensFile?.exists() != true) {
             Log.i(TAG, "Kokoro not in external storage — extracting from assets")
-            modelFile = extractAsset("kokoro/model.onnx", "kokoro")
-            tokensFile = extractAsset("kokoro/tokens.txt", "kokoro")
-            voicesFile = extractAsset("kokoro/voices.bin", "kokoro")
+            modelFile = extractAsset("sherpa-models/kokoro/model.onnx", "kokoro")
+            tokensFile = extractAsset("sherpa-models/kokoro/tokens.txt", "kokoro")
+            voicesFile = extractAsset("sherpa-models/kokoro/voices.bin", "kokoro")
             // Recursively extract espeak-ng-data subtree (phontab, phon dictionaries, etc.)
-            extractAssetTree("kokoro/espeak-ng-data", "kokoro/espeak-ng-data")
+            extractAssetTree("sherpa-models/kokoro/espeak-ng-data", "kokoro/espeak-ng-data")
         }
 
         if (modelFile == null || !modelFile.exists() || tokensFile == null || !tokensFile.exists()) {
@@ -346,8 +346,8 @@ class SherpaTtsManager(private val context: Context) {
 
         if (modelFile?.exists() != true || tokensFile?.exists() != true) {
             Log.i(TAG, "MMS not in external storage — extracting from assets")
-            modelFile = extractAsset("mms/model.onnx", "mms")
-            tokensFile = extractAsset("mms/tokens.txt", "mms")
+            modelFile = extractAsset("sherpa-models/mms/model.onnx", "mms")
+            tokensFile = extractAsset("sherpa-models/mms/tokens.txt", "mms")
         }
 
         if (modelFile == null || !modelFile.exists() || tokensFile == null || !tokensFile.exists()) {
