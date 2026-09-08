@@ -111,7 +111,8 @@ class OfflineTtsMatchaModelConfig(
     @JvmField val lexicon: String = "",
     @JvmField val tokens: String = "",
     @JvmField val dataDir: String = "",
-    @JvmField val noiseScale: Float = 0.667f,
+    @JvmField val dictDir: String = "",
+    @JvmField val noiseScale: Float = 1.0f,
     @JvmField val lengthScale: Float = 1.0f
 )
 
@@ -137,9 +138,9 @@ class OfflineTtsZipVoiceModelConfig(
     @JvmField val vocoder: String = "",
     @JvmField val dataDir: String = "",
     @JvmField val lexicon: String = "",
-    @JvmField val featScale: Float = 1.0f,
-    @JvmField val tShift: Int = 8,
-    @JvmField val targetRms: Float = 1.0f,
+    @JvmField val featScale: Float = 0.1f,
+    @JvmField val tShift: Float = 0.5f,
+    @JvmField val targetRms: Float = 0.1f,
     @JvmField val guidanceScale: Float = 1.0f
 )
 
