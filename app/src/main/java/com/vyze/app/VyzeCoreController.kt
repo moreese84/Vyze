@@ -1430,27 +1430,33 @@ class VyzeCoreController(
          * Fast-start: speak the first word-aligned fragment once the lead-in
          * reaches this many characters (before the first sentence ends), so
          * first speech begins sooner. Must be long enough that the fragment
-         * reads naturally as an opening clause.
+         * reads naturally as an opening clause. Lowered from 44 to 30 so
+         * first audio arrives ~300-500ms sooner — the brief mid-sentence
+         * pause is a worthwhile tradeoff for blind users who hear silence.
          */
-        private const val FAST_START_CHARS = 44
+        private const val FAST_START_CHARS = 30
         /** Minimum length of the fast-start fragment (avoids "Yes."-style clips). */
-        private const val FAST_START_MIN_CHARS = 20
+        private const val FAST_START_MIN_CHARS = 18
 
         // ── Dynamic Resolution Constants ──────────────────────────
 
         /**
-         * Higher resolution for text extraction (512px captures fine text details,
-         * e.g. tiny Chinese glyphs on small bottles; capped by the engine's own
-         * MAX_INPUT_DIMENSION of 512). Only used when OCR actually found text.
+         * Higher resolution for text extraction (384px captures fine text details,
+         * balanced against prefill latency; 512px previously but OCR provides
+         * ground truth so the model only needs to interpret — not read — the
+         * image, making the smaller dimension safe and measurably faster).
+         * Only used when OCR actually found text to echo.
          */
-        private const val TEXT_EXTRACTION_DIMENSION = 512
+        private const val TEXT_EXTRACTION_DIMENSION = 384
 
         /**
-         * Text queries where OCR found nothing readable — still needs a little
-         * more than the 256px scene budget for object-level reading attempts,
-         * but paying 512px here would only slow prefill with no text to gain.
+         * Text queries where OCR found nothing readable — the model is doing
+         * visual-only object ID (like a scene query), so 256px is adequate.
+         * The old 384px was a hangover from when 512px was the main text
+         * dimension; now that the post-OCR path uses 384, the no-OCR path
+         * may as well use the scene budget (256px) for fastest prefill.
          */
-        private const val TEXT_EXTRACTION_NO_OCR_DIMENSION = 384
+        private const val TEXT_EXTRACTION_NO_OCR_DIMENSION = 256
 
         /** Standard resolution for scene queries (256x256 for fast inference). */
         private const val SCENE_QUERY_DIMENSION = 256
