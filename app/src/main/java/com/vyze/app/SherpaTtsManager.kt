@@ -299,6 +299,8 @@ class SherpaTtsManager(private val context: Context) {
             modelFile = extractAsset("kokoro/model.onnx", "kokoro")
             tokensFile = extractAsset("kokoro/tokens.txt", "kokoro")
             voicesFile = extractAsset("kokoro/voices.bin", "kokoro")
+            // Recursively extract espeak-ng-data subtree (phontab, phon dictionaries, etc.)
+            extractAssetTree("kokoro/espeak-ng-data", "kokoro/espeak-ng-data")
         }
 
         if (modelFile == null || !modelFile.exists() || tokensFile == null || !tokensFile.exists()) {
@@ -309,14 +311,15 @@ class SherpaTtsManager(private val context: Context) {
         try {
             val modelDir = modelFile.parentFile?.absolutePath ?: ""
             val voicesPath = if (voicesFile?.exists() == true) voicesFile.absolutePath else ""
+            val espeakDir = File(modelDir, "espeak-ng-data").absolutePath
             Log.i(TAG, "Kokoro model: ${modelFile.absolutePath}")
             Log.i(TAG, "Kokoro tokens: ${tokensFile.absolutePath}")
             Log.i(TAG, "Kokoro voices: $voicesPath (exists=${voicesFile?.exists()})")
-            Log.i(TAG, "Kokoro dataDir: $modelDir")
+            Log.i(TAG, "Kokoro dataDir: $espeakDir (exists=${File(espeakDir).exists()})")
             val config = OfflineTtsConfig(
                 model = modelFile.absolutePath,
                 tokens = tokensFile.absolutePath,
-                dataDir = modelDir,
+                dataDir = espeakDir,
                 voices = voicesPath,
                 numThreads = 2,
                 debug = true
@@ -391,6 +394,49 @@ class SherpaTtsManager(private val context: Context) {
         } catch (e: Throwable) {
             Log.e(TAG, "Failed to extract asset $assetPath: ${e.message}")
             null
+        }
+    }
+
+    /**
+     * Recursively extract a directory tree from APK assets to internal storage.
+     * Sherpa's Kokoro model expects an espeak-ng-data subtree with phontab,
+     * phondata, and per-language dictionary files at [dataDir]/espeak-ng-data/.
+     *
+     * @param assetPrefix  Prefix inside src/main/assets/, e.g. "kokoro/espeak-ng-data"
+     * @param subDir       Relative subdirectory under [modelBaseDir], e.g. "kokoro/espeak-ng-data"
+     */
+    private fun extractAssetTree(assetPrefix: String, subDir: String) {
+        try {
+            val targetDir = File(modelBaseDir, subDir)
+            targetDir.mkdirs()
+            val entries = try { context.assets.list(assetPrefix) } catch (_: Throwable) { null }
+            if (entries.isNullOrEmpty()) {
+                Log.w(TAG, "extractAssetTree: empty or missing asset prefix '$assetPrefix'")
+                return
+            }
+            for (entry in entries) {
+                val assetChild = "$assetPrefix/$entry"
+                val targetChild = File(targetDir, entry)
+                if (entry.contains(".") && !assetChild.endsWith("/")) {
+                    // File — try to copy
+                    if (targetChild.exists()) continue
+                    try {
+                        context.assets.open(assetChild).use { input ->
+                            targetChild.outputStream().use { output ->
+                                input.copyTo(output)
+                            }
+                        }
+                        Log.d(TAG, "Extracted asset tree: $assetChild → ${targetChild.absolutePath}")
+                    } catch (_: Throwable) {
+                        Log.w(TAG, "extractAssetTree: could not copy $assetChild")
+                    }
+                } else {
+                    // Subdirectory — recurse
+                    extractAssetTree(assetChild, "$subDir/$entry")
+                }
+            }
+        } catch (e: Throwable) {
+            Log.e(TAG, "extractAssetTree failed for '$assetPrefix': ${e.message}")
         }
     }
 
