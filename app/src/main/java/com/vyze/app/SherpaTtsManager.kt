@@ -417,21 +417,20 @@ class SherpaTtsManager(private val context: Context) {
             for (entry in entries) {
                 val assetChild = "$assetPrefix/$entry"
                 val targetChild = File(targetDir, entry)
-                if (entry.contains(".") && !assetChild.endsWith("/")) {
-                    // File — try to copy
+                // Try to open as a file first — if it fails, treat as a subdirectory
+                try {
                     if (targetChild.exists()) continue
-                    try {
-                        context.assets.open(assetChild).use { input ->
-                            targetChild.outputStream().use { output ->
-                                input.copyTo(output)
-                            }
+                    context.assets.open(assetChild).use { input ->
+                        targetChild.outputStream().use { output ->
+                            input.copyTo(output)
                         }
-                        Log.d(TAG, "Extracted asset tree: $assetChild → ${targetChild.absolutePath}")
-                    } catch (_: Throwable) {
-                        Log.w(TAG, "extractAssetTree: could not copy $assetChild")
                     }
-                } else {
-                    // Subdirectory — recurse
+                    Log.d(TAG, "Extracted: $assetChild → ${targetChild.absolutePath}")
+                } catch (_: java.io.FileNotFoundException) {
+                    // Not a file — recurse as subdirectory
+                    extractAssetTree(assetChild, "$subDir/$entry")
+                } catch (_: Throwable) {
+                    // Might still be a directory Android couldn't list — try recursing
                     extractAssetTree(assetChild, "$subDir/$entry")
                 }
             }
