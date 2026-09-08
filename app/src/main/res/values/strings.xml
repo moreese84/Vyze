@@ -63,6 +63,25 @@
     <string name="currency_sen10">10 sen coin detected</string>
     <string name="currency_sen5">5 sen coin detected</string>
 
+    <!-- ── Bank Card ───────────────────────────────────────────────── -->
+    <string name="bank_card_identified">%1$s %2$s detected</string>
+    <string name="bank_card_unknown">Bank card detected. Bank name not clearly visible.</string>
+    <string name="bank_card_unreadable">I cannot identify this card clearly.</string>
+    <string name="bank_card_maybank">Maybank</string>
+    <string name="bank_card_cimb">CIMB</string>
+    <string name="bank_card_public_bank">Public Bank</string>
+    <string name="bank_card_hong_leong">Hong Leong Bank</string>
+    <string name="bank_card_rhb">RHB Bank</string>
+    <string name="bank_card_ambank">AmBank</string>
+    <string name="bank_card_affin">Affin Bank</string>
+    <string name="bank_card_alliance">Alliance Bank</string>
+    <string name="bank_card_hsbc">HSBC</string>
+    <string name="bank_card_standard_chartered">Standard Chartered</string>
+    <string name="bank_card_citibank">Citibank</string>
+    <string name="bank_card_debit">Debit</string>
+    <string name="bank_card_credit">Credit</string>
+    <string name="bank_card_atm">ATM</string>
+
     <!-- ── Color Labels ──────────────────────────────────────────────── -->
     <string name="color_black">Black</string>
     <string name="color_white">White</string>

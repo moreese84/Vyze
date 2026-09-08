@@ -25,26 +25,39 @@ import java.util.concurrent.atomic.AtomicLong
  * [hasPendingSpeech] returns true iff the set is non-empty — guaranteed
  * 100% accurate, no polling, no transient false readings.
  *
+ * ## Offline Engine
+ * All speech is produced by Sherpa-ONNX (Kokoro for EN/ZH, MMS for MS/other)
+ * — fully offline, no Google TTS dependency. The Android TextToSpeech types
+ * appear only in signatures kept for call-site compatibility.
+ *
  * ## Volume Stability
  * TTS plays through the MEDIA stream (USAGE_MEDIA) so it matches the
  * phone's normal media volume exactly: the hardware volume buttons keep
  * working as usual and every utterance outputs at the identical, stable
  * gain for the entire session. The optional in-app volume setting is
- * applied per-utterance via KEY_PARAM_VOLUME.
+ * applied by SherpaTtsManager at AudioTrack scaling time.
  *
  * ## Audio Focus
  * Requests AUDIOFOCUS_GAIN (permanent) for the entire app session.
  * Focus is held from app open to app close. Never released per-utterance
  * or on stop() — only on onDestroy().
  */
-class TTSManager(context: Context) : TextToSpeech.OnInitListener {
+class TTSManager(context: Context) {
 
-    private var tts: TextToSpeech? = null
+    // ── Sherpa-ONNX TTS (offline, no Google dependency) ────────
+    // Shared singleton: two TTSManager instances exist (VyzeApplication +
+    // TtsViewModel) and each would otherwise load its own copy of the models.
+    private val sherpaTts: SherpaTtsManager by lazy { SherpaTtsManager.getInstance(appContext) }
 
     @Volatile
     private var isInitialized = false
 
+    /** True once the missing-model warning has been logged/crash-reported in this session. */
+    @Volatile
+    private var missingModelWarningShown = false
+
     private var cachedVolume: Float = DEFAULT_VOLUME
+    private var cachedRate: Float = DEFAULT_SPEECH_RATE
     private val appContext: Context = context.applicationContext
 
     // ── Audio Manager ─────────────────────────────────────────────
@@ -75,6 +88,14 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
     /** Callback invoked when TTS engine is fully ready. */
     var onReady: (() -> Unit)? = null
 
+    /**
+     * Caller-supplied progress listener (engine-global, like the old additive
+     * wrapper around Google TTS): fired for EVERY utterance start/done, and
+     * for error on utterances dropped by stop()/QUEUE_FLUSH.
+     */
+    @Volatile
+    private var callerListener: UtteranceProgressListener? = null
+
     // ── Utterance ID Tracking ─────────────────────────────────────
     // Thread-safe set of utterance IDs currently queued or playing.
     // Every speak() call adds an ID; onDone/onError removes it.
@@ -103,122 +124,62 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
     // USAGE_MEDIA routes TTS to STREAM_MUSIC, so Vyze speaks at exactly
     // the phone's media volume and the hardware volume buttons work
     // normally during speech (no hidden accessibility-stream slider).
-
-    private val ttsAudioAttributes = AudioAttributes.Builder()
-        .setUsage(AudioAttributes.USAGE_MEDIA)
-        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-        .build()
+    // NOTE: This is retained for AudioFocus requests even though this app uses
+    // Sherpa TTS, not the Android TTS engine.
 
     private val focusAttributes = AudioAttributes.Builder()
         .setUsage(AudioAttributes.USAGE_MEDIA)
         .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
         .build()
 
-    // ── Utterance Progress Listener (Global) ──────────────────────
-    // Set once during init. Tracks ALL utterances via pendingUtteranceIds.
-    // This is the single source of truth for completion detection.
-
-    private val globalUtteranceListener = object : UtteranceProgressListener() {
-        override fun onStart(utteranceId: String?) {
-            Log.d(TAG, "onStart: $utteranceId (pending=${pendingUtteranceIds.size})")
-        }
-
-        override fun onDone(utteranceId: String?) {
-            if (utteranceId != null) {
-                pendingUtteranceIds.remove(utteranceId)
-                Log.d(TAG, "onDone: $utteranceId removed (pending=${pendingUtteranceIds.size})")
-            }
-        }
-
-        @Deprecated("Deprecated in Java")
-        override fun onError(utteranceId: String?) {
-            if (utteranceId != null) {
-                pendingUtteranceIds.remove(utteranceId)
-                Log.w(TAG, "onError: $utteranceId removed (pending=${pendingUtteranceIds.size})")
-            }
-        }
-
-        override fun onError(utteranceId: String?, errorCode: Int) {
-            if (utteranceId != null) {
-                pendingUtteranceIds.remove(utteranceId)
-                Log.w(TAG, "onError: $utteranceId code=$errorCode removed (pending=${pendingUtteranceIds.size})")
-            }
-        }
-    }
-
     // ── Initialization ────────────────────────────────────────────
 
     init {
-        Log.i(TAG, "TTSManager created — stream=MEDIA (follows phone volume)")
-        tts = try {
-            TextToSpeech(appContext, this, GOOGLE_TTS_ENGINE)
-        } catch (e: Throwable) {
-            Log.w(TAG, "Google TTS engine not available, falling back to system: ${e.message}")
-            TextToSpeech(appContext, this)
-        }
-        Log.d(TAG, "TTS constructor called, waiting for onInit callback")
+        Log.i(TAG, "TTSManager created — offline Sherpa TTS only (Kokoro + MMS), no Google TTS")
+        // Do not initialize the Android TextToSpeech Google engine.
+        // All spoken output is produced by Sherpa-ONNX (Kokoro for EN/ZH, MMS for MS/other).
+        // Model loading is async; the ready callback below flips isInitialized
+        // and drains anything spoken before the models finished loading.
+        // Posted to the main handler so the ready path never runs inside the
+        // constructor — callers assign onReady only after construction, and a
+        // shared already-loaded engine would otherwise fire it too early.
+        sherpaTts.addOnReady { mainHandler.post { onSherpaReady() } }
+        sherpaTts.initialize()
     }
 
-    override fun onInit(status: Int) {
-        if (status == TextToSpeech.SUCCESS) {
-            Log.i(TAG, "onInit: TextToSpeech.SUCCESS — setting up language")
+    /** Runs on the main thread once Sherpa model loading has finished. */
+    private fun onSherpaReady() {
+        val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val savedLang = prefs.getString(KEY_LANGUAGE, LANGUAGE_ENGLISH) ?: LANGUAGE_ENGLISH
+        currentLocale = localeFromKey(savedLang)
 
-            val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            val savedLang = prefs.getString(KEY_LANGUAGE, LANGUAGE_ENGLISH) ?: LANGUAGE_ENGLISH
-            currentLocale = localeFromKey(savedLang)
-
-            val langResult = tts?.setLanguage(currentLocale)
-            Log.d(TAG, "setLanguage($currentLocale) returned: $langResult")
-
-            if (langResult == TextToSpeech.LANG_MISSING_DATA ||
-                langResult == TextToSpeech.LANG_NOT_SUPPORTED
-            ) {
-                Log.w(TAG, "Language $currentLocale not supported, falling back to English")
-                val fallbackResult = tts?.setLanguage(Locale.US)
-                Log.d(TAG, "setLanguage(Locale.US) returned: $fallbackResult")
-                currentLocale = Locale.US
-
-                if (fallbackResult == TextToSpeech.LANG_MISSING_DATA ||
-                    fallbackResult == TextToSpeech.LANG_NOT_SUPPORTED
-                ) {
-                    Log.e(TAG, "TTS INIT FAILED: No supported language found")
-                    return
-                }
+        if (!sherpaTts.isReady()) {
+            // initialize() completed but neither model could be loaded.
+            if (!missingModelWarningShown) {
+                missingModelWarningShown = true
+                Log.w(TAG, "TTS startup warning: offline voice models not loadable")
+                CrashLogFile.log(TAG, "TTS startup: offline voice models not loadable")
             }
-
-            tts?.setAudioAttributes(ttsAudioAttributes)
-
-            // ── Voice Quality Selection ──────────────────────────────
-            selectBestVoice(currentLocale)
-
-            // ── User Voice Preference ───────────────────────────────
-            // Restore the user's chosen voice (if any) over the auto pick.
-            val savedVoice = prefs.getString(KEY_VOICE_NAME, "") ?: ""
-            if (savedVoice.isNotBlank() && savedVoice != VOICE_AUTO) {
-                setVoiceByName(savedVoice)
-            }
-
-            // ── Prosody Tuning ───────────────────────────────────────
-            tts?.setPitch(WARM_PITCH)
-            tts?.setSpeechRate(WARM_RATE)
-
-            // Set the GLOBAL utterance progress listener — tracks ALL utterances
-            tts?.setOnUtteranceProgressListener(globalUtteranceListener)
-
-            Log.i(TAG, "TTS setup OK — locale=$currentLocale, engine=${tts?.defaultEngine}, " +
-                "pitch=$WARM_PITCH, rate=$WARM_RATE, volume=$cachedVolume")
-
-            mainHandler.postDelayed({
-                isInitialized = true
-                Log.i(TAG, "TTS fully initialized — initial drain: ${speechBuffer.size} buffered")
-                drainPendingQueue()
-                onReady?.invoke()
-                startDrainRetryTimer()
-            }, ENGINE_SETTLE_DELAY_MS)
-
-        } else {
-            Log.e(TAG, "TTS INIT FAILED — status=$status (expected SUCCESS=${TextToSpeech.SUCCESS})")
+            return
         }
+
+        Log.i(TAG, "TTS setup OK — locale=$currentLocale, sherpa ready, " +
+            "pitch=$WARM_PITCH, rate=$WARM_RATE, volume=$cachedVolume")
+
+        isInitialized = true
+        Log.i(TAG, "TTS fully initialized — initial drain: ${speechBuffer.size} buffered")
+        drainPendingQueue()
+        onReady?.invoke()
+        startDrainRetryTimer()
+    }
+
+    /**
+     * Legacy Android TTS init callback. Google TTS is no longer used; kept
+     * only so any stale callers compile. Initialization is event-driven via
+     * Sherpa's ready callback instead.
+     */
+    fun onInit(status: Int) {
+        Log.i(TAG, "onInit: no-op — Google TTS disabled, using Sherpa offline TTS")
     }
 
     // ── Drain Retry Timer ─────────────────────────────────────────
@@ -264,16 +225,21 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
             val text = speechBuffer.poll() ?: break
             if (text.isBlank()) continue
 
-            val mode = if (drained == 0) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
             val utteranceId = nextUtteranceId()
-            val params = buildSpeakParams()
-            val result = tts?.speak(text, mode, params, utteranceId) ?: TextToSpeech.ERROR
 
-            if (result != TextToSpeech.SUCCESS) {
-                Log.e(TAG, "drainPendingQueue: speak() FAILED code=$result, text=\"${text.take(60)}\"")
-            } else {
+            if (sherpaTts.isReady()) {
+                val enhanced = enhanceForNaturalProsody(applyPronunciationOverrides(text))
                 pendingUtteranceIds.add(utteranceId)
-                Log.d(TAG, "Drained #$drained (id=$utteranceId): ${text.take(60)}...")
+                sherpaTts.speak(
+                    enhanced, currentLocale, cachedRate(), cachedVolume,
+                    onStart = { onUtteranceStart(utteranceId) },
+                    onDone = { onUtteranceDone(utteranceId) }
+                )
+                Log.d(TAG, "Drained #$drained (sherpa, id=$utteranceId): ${text.take(60)}...")
+            } else {
+                Log.d(TAG, "drainPendingQueue: Sherpa not ready — re-queuing: \"${text.take(60)}\"")
+                speechBuffer.add(text)
+                break
             }
 
             lastSpeechTime = System.currentTimeMillis()
@@ -288,6 +254,7 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
         return drained
     }
 
+
     // ── Public Speech API ─────────────────────────────────────────
 
     /**
@@ -296,7 +263,8 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
      * and tracks it until onDone/onError removes it.
      *
      * @param text       The text to speak
-     * @param queueMode  TextToSpeech.QUEUE_FLUSH or QUEUE_ADD
+     * @param queueMode  QUEUE_FLUSH barges in (cancels current + queued speech
+     *                   and reports them as onError); QUEUE_ADD appends.
      * @param utteranceId Optional caller-provided ID (e.g., "session_chunk_3")
      *                    If null, generates one automatically.
      * @return true if speak() succeeded
@@ -326,19 +294,29 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
         // Enhance text with pronunciation overrides + natural prosody pauses
         val enhancedText = enhanceForNaturalProsody(applyPronunciationOverrides(text))
 
-        val id = utteranceId ?: nextUtteranceId()
-        val params = buildSpeakParams()
-        val result = tts?.speak(enhancedText, queueMode, params, id) ?: TextToSpeech.ERROR
-
-        if (result != TextToSpeech.SUCCESS) {
-            Log.e(TAG, "speak() FAILED code=$result, text=\"${text.take(60)}\", id=$id")
-        } else {
+        // This app does not use Google TTS. If Sherpa is not ready, enqueue for retry.
+        if (sherpaTts.isReady()) {
+            // QUEUE_FLUSH is barge-in: report the flushed utterances as errors
+            // (the Google TTS contract) so waiting listeners can resume.
+            if (queueMode == TextToSpeech.QUEUE_FLUSH) {
+                notifyFlushed()
+            }
+            val id = utteranceId ?: nextUtteranceId()
             pendingUtteranceIds.add(id)
-            Log.d(TAG, "speak() OK id=$id queueMode=$queueMode pending=${pendingUtteranceIds.size} " +
+            sherpaTts.speak(
+                enhancedText, currentLocale, cachedRate(), cachedVolume,
+                onStart = { onUtteranceStart(id) },
+                onDone = { onUtteranceDone(id) },
+                flush = queueMode == TextToSpeech.QUEUE_FLUSH
+            )
+            Log.d(TAG, "speak() OK (sherpa) id=$id queueMode=$queueMode pending=${pendingUtteranceIds.size} " +
                 "text=\"${text.take(60)}\"")
+            return true
         }
 
-        return result == TextToSpeech.SUCCESS
+        Log.d(TAG, "speak() Sherpa not ready — buffering: \"${text.take(60)}\"")
+        speechBuffer.add(enhancedText)
+        return false
     }
 
     /**
@@ -369,22 +347,28 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
         // Enhance text with pronunciation overrides + natural prosody pauses
         val enhancedText = enhanceForNaturalProsody(applyPronunciationOverrides(text))
 
-        tts?.stop()
-        pendingUtteranceIds.clear()
-
+        // QUEUE_FLUSH semantics: barge-in — report the flushed utterances as
+        // errors (the Google TTS contract) so waiting listeners can resume.
+        notifyFlushed()
         val id = nextUtteranceId()
-        val params = buildSpeakParams()
-        val result = tts?.speak(enhancedText, TextToSpeech.QUEUE_FLUSH, params, id) ?: TextToSpeech.ERROR
 
-        if (result != TextToSpeech.SUCCESS) {
-            Log.e(TAG, "speakImmediate() FAILED code=$result, text=\"${text.take(60)}\", id=$id")
-        } else {
+        // This app does not use Google TTS. If Sherpa is not ready, enqueue for retry.
+        if (sherpaTts.isReady()) {
             pendingUtteranceIds.add(id)
-            Log.d(TAG, "speakImmediate() OK id=$id pending=${pendingUtteranceIds.size} " +
+            sherpaTts.speak(
+                enhancedText, currentLocale, cachedRate(), cachedVolume,
+                onStart = { onUtteranceStart(id) },
+                onDone = { onUtteranceDone(id) },
+                flush = true
+            )
+            Log.d(TAG, "speakImmediate() OK (sherpa) id=$id pending=${pendingUtteranceIds.size} " +
                 "text=\"${text.take(60)}\"")
+            return true
         }
 
-        return result == TextToSpeech.SUCCESS
+        Log.d(TAG, "speakImmediate() Sherpa not ready — buffering: \"${text.take(60)}\"")
+        speechBuffer.add(enhancedText)
+        return false
     }
 
     fun speakQueued(text: String) {
@@ -407,9 +391,9 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
         }
     }
 
-    fun isSpeaking(): Boolean = tts?.isSpeaking == true
+    fun isSpeaking(): Boolean = sherpaTts.isSpeaking()
 
-    fun isReady(): Boolean = isInitialized
+    fun isReady(): Boolean = sherpaTts.isReady()
 
     /**
      * Stop all speech and clear all pending utterance tracking.
@@ -417,68 +401,68 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
      * immediately after stop().
      */
     fun stop() {
-        tts?.stop()
-        pendingUtteranceIds.clear()
-        Log.d(TAG, "stop() — pendingUtteranceIds cleared")
+        notifyFlushed()
+        sherpaTts.stop()
+        Log.d(TAG, "stop() — pendingUtteranceIds cleared, flushed utterances reported as onError")
+    }
+
+    // ── Utterance Event Forwarding ────────────────────────────────
+
+    // The listener is CAPTURED when the event happens, not when the posted
+    // runnable executes: speakThenCallback() assigns a fresh listener right
+    // after stop()+speak(), and a captured-at-execution listener would deliver
+    // the OLD utterance's onError to the NEW listener — firing its onDone
+    // before the new utterance even starts.
+
+    /** Utterance started processing — forward to the caller listener. */
+    private fun onUtteranceStart(id: String) {
+        val listener = callerListener
+        mainHandler.post { listener?.onStart(id) }
+    }
+
+    /** Utterance finished playing (or failed) — untrack and forward. */
+    private fun onUtteranceDone(id: String) {
+        pendingUtteranceIds.remove(id)
+        val listener = callerListener
+        mainHandler.post { listener?.onDone(id) }
+    }
+
+    /**
+     * Report currently-pending utterances as errored and untrack them.
+     * Mirrors Google TTS, which fires onError for utterances dropped by
+     * stop()/QUEUE_FLUSH — callers rely on that to leave their wait state.
+     */
+    private fun notifyFlushed() {
+        val ids = pendingUtteranceIds.toList()
+        if (ids.isEmpty()) return
+        pendingUtteranceIds.removeAll(ids)
+        val listener = callerListener
+        ids.forEach { id -> mainHandler.post { listener?.onError(id) } }
     }
 
     /**
      * Set a caller-provided UtteranceProgressListener.
      *
-     * CRITICAL: This is ADDITIVE — the global pendingUtteranceIds listener
-     * is ALWAYS preserved. The caller's listener is wrapped around the global
-     * one so both fire for each utterance. This prevents the caller from
-     * accidentally overwriting the global listener and breaking hasPendingSpeech().
+     * Engine-global (as the old additive wrapper effectively was): the
+     * listener fires for EVERY utterance — onStart when generation begins,
+     * onDone when its audio finishes playing, onError when it is dropped by
+     * stop()/QUEUE_FLUSH. Internal pendingUtteranceIds tracking is separate
+     * and cannot be overwritten by callers.
      */
     fun setOnUtteranceProgressListener(listener: UtteranceProgressListener) {
-        tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-            override fun onStart(utteranceId: String?) {
-                globalUtteranceListener.onStart(utteranceId)
-                listener.onStart(utteranceId)
-            }
-
-            override fun onDone(utteranceId: String?) {
-                globalUtteranceListener.onDone(utteranceId)
-                listener.onDone(utteranceId)
-            }
-
-            @Deprecated("Deprecated in Java")
-            override fun onError(utteranceId: String?) {
-                globalUtteranceListener.onError(utteranceId)
-                listener.onError(utteranceId)
-            }
-
-            override fun onError(utteranceId: String?, errorCode: Int) {
-                globalUtteranceListener.onError(utteranceId, errorCode)
-                listener.onError(utteranceId, errorCode)
-            }
-        })
+        callerListener = listener
     }
 
     /**
-     * Queue a silent utterance to keep hasPendingSpeech() == true
-     * while the hardware AudioTrack drains the final audible utterance.
-     * Android TTS onDone() fires when the engine finishes encoding,
-     * NOT when the speaker finishes playing. This silent tail prevents
-     * the caller from prematurely transitioning to IDLE.
-     *
-     * @param durationMs  Duration of silence in milliseconds (200–400 typical)
-     * @param queueMode   QUEUE_ADD to append after the last audible utterance
+     * Legacy Google-TTS silent tail. Obsolete with Sherpa: onDone now fires
+     * only after the hardware AudioTrack has drained the utterance, so
+     * hasPendingSpeech() already stays true until the speaker is silent.
+     * Kept as a harmless no-op for call-site compatibility.
      */
     fun playSilentUtterance(durationMs: Int = 300, queueMode: Int = TextToSpeech.QUEUE_ADD): Boolean {
         if (!isInitialized) return false
-        val id = nextUtteranceId()
-        val params = Bundle().apply {
-            putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 0.0f)
-        }
-        val result = tts?.speak(" ", queueMode, params, id) ?: TextToSpeech.ERROR
-        if (result == TextToSpeech.SUCCESS) {
-            pendingUtteranceIds.add(id)
-            Log.d(TAG, "playSilentUtterance: id=$id (${durationMs}ms) pending=${pendingUtteranceIds.size}")
-        } else {
-            Log.e(TAG, "playSilentUtterance: FAILED code=$result")
-        }
-        return result == TextToSpeech.SUCCESS
+        Log.d(TAG, "playSilentUtterance: no-op (Sherpa TTS does not produce silent utterances)")
+        return false
     }
 
     /**
@@ -540,100 +524,45 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
 
     // ── Speak Parameters ──────────────────────────────────────────
 
-    private fun buildSpeakParams(): Bundle {
-        return Bundle().apply {
-            // Apply the in-app volume setting (0-1 multiplier over the
-            // media stream volume). Default 1.0 = exactly the phone volume.
-            putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, cachedVolume)
-        }
-    }
+    // Not used: this app does not use the Android Google TTS engine.
+    // Volume is applied inside SherpaTtsManager via AudioTrack scaling.
+    @Suppress("UNUSED_PARAMETER")
+    private fun buildSpeakParams(): Bundle = Bundle()
 
     // ── Voice Quality Selection ──────────────────────────────────
 
+    // Google TTS is not used by this app, so Android voice selection is disabled.
+    // Sherpa model selection is driven by locale inside SherpaTtsManager.
+
     private fun selectBestVoice(locale: Locale) {
-        val engine = tts ?: return
-        val voices = engine.voices
-        if (voices.isNullOrEmpty()) {
-            Log.w(TAG, "selectBestVoice: no voices available")
-            return
-        }
-
-        val localeVoices = voices.filter { voice ->
-            voice.locale.language == locale.language &&
-                !voice.features.contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED)
-        }
-
-        if (localeVoices.isEmpty()) {
-            Log.w(TAG, "selectBestVoice: NO voice pack installed for ${locale.getDisplayLanguage(Locale.US)} (${locale.language}). " +
-                "TTS will use the engine default voice (likely English). " +
-                "Install the language pack in Android Settings > System > Languages > TTS.")
-            return
-        }
-
-        val best = localeVoices.sortedWith(
-            compareByDescending<Voice> { it.quality }
-                .thenByDescending { it.isNetworkConnectionRequired }
-        ).first()
-
-        engine.voice = best
-        Log.i(TAG, "selectBestVoice: chose '${best.name}' quality=${best.quality} " +
-            "locale=${best.locale} network=${best.isNetworkConnectionRequired}")
+        // No-op: Google TTS voices are not used.
     }
 
     // ── Voice Picker Support (Tier 1) ──────────────────────────────
 
-    /** Installed voices for the current language (uninstalled packs excluded). */
-    fun getInstalledVoicesForCurrentLanguage(): List<Voice> {
-        val engine = tts ?: return emptyList()
-        val voices = engine.voices ?: return emptyList()
-        return voices.filter { voice ->
-            voice.locale.language == currentLocale.language &&
-                !voice.features.contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED)
-        }.sortedByDescending { it.quality }
-    }
+    /** Installed voices for the current language (uninstalled packs excluded).
+     * Returns an empty list because this app uses Sherpa TTS, not the Android TTS engine.
+     */
+    fun getInstalledVoicesForCurrentLanguage(): List<Voice> = emptyList()
 
-    /** Name of the voice actually in use, or null if unknown. */
-    fun getCurrentVoiceName(): String? = tts?.voice?.name
+    /** Name of the voice actually in use, or null if unknown.
+     * Always null because this app uses Sherpa TTS, not Android TTS voices.
+     */
+    fun getCurrentVoiceName(): String? = null
 
     /**
-     * True when at least one INSTALLED voice exists for the given language
-     * code ("en" / "ms" / "zh"). Uninstalled packs are excluded, so this is
-     * the safe pre-check before switching the language — setLanguage() would
-     * otherwise fall back to English AND persist that fallback as the choice.
+     * True when an offline Sherpa model can speak the given language
+     * code ("en" / "ms" / "zh"). Drives the voice-settings language gate:
+     * all three supported languages are covered once either model loads.
      */
-    fun hasInstalledVoicesFor(language: String): Boolean {
-        val engine = tts ?: return false
-        val voices = engine.voices ?: return false
-        return voices.any { v ->
-            v.locale.language == language &&
-                !v.features.contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED)
-        }
-    }
+    fun hasInstalledVoicesFor(language: String): Boolean = sherpaTts.hasVoiceFor(language)
 
     /**
      * Select a voice by name ("" or [VOICE_AUTO] → auto-pick the best
-     * installed voice). No-op if the name is no longer installed.
+     * installed voice). No-op because this app uses Sherpa TTS.
      */
     fun setVoiceByName(name: String) {
-        val engine = tts ?: return
-        if (!isInitialized) {
-            Log.d(TAG, "setVoiceByName($name) — TTS not ready, ignored (applied on init)")
-            return
-        }
-        if (name.isBlank() || name == VOICE_AUTO) {
-            selectBestVoice(currentLocale)
-            return
-        }
-        val match = engine.voices?.find { v ->
-            v.name == name &&
-                !v.features.contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED)
-        }
-        if (match != null) {
-            engine.voice = match
-            Log.i(TAG, "setVoiceByName: chose '${match.name}' quality=${match.quality}")
-        } else {
-            Log.w(TAG, "setVoiceByName: '$name' not installed — keeping current voice")
-        }
+        // No-op: Google TTS voices are not used.
     }
 
     /**
@@ -641,16 +570,9 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
      * robotic base quality (or when no voice pack is installed at all and
      * the engine falls back to its default). Used to offer the better
      * voice install prompt.
+     * Always false because this app uses Sherpa TTS, not Android TTS.
      */
-    fun isVoiceQualityLow(): Boolean {
-        val engine = tts ?: return false
-        if (!isInitialized) return false
-        val installed = getInstalledVoicesForCurrentLanguage()
-        if (installed.isEmpty()) return true
-        val bestQuality = installed.maxOf { it.quality }
-        Log.d(TAG, "isVoiceQualityLow: best quality=$bestQuality (${installed.size} installed)")
-        return bestQuality < Voice.QUALITY_HIGH
-    }
+    fun isVoiceQualityLow(): Boolean = false
 
     // ── Natural Prosody Enhancement ───────────────────────────────
 
@@ -711,40 +633,19 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
             return
         }
 
-        val engine = tts ?: return
+        // Google TTS is not used by this app, so there is no Android engine to switch.
+        // Sherpa model selection is locale-driven inside SherpaTtsManager.
+        currentLocale = locale
 
-        val result = engine.setLanguage(locale)
-        if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
-            Log.w(TAG, "switchToLocale($locale) — language not supported, trying locale.language only")
-            val langOnly = Locale(locale.language)
-            val result2 = engine.setLanguage(langOnly)
-            if (result2 == TextToSpeech.LANG_MISSING_DATA || result2 == TextToSpeech.LANG_NOT_SUPPORTED) {
-                Log.w(TAG, "switchToLocale($locale) — no voice pack installed, falling back to English")
-                engine.setLanguage(Locale.US)
-                currentLocale = Locale.US
-                return
-            }
-            currentLocale = langOnly
-        } else {
-            currentLocale = locale
-        }
-
-        selectBestVoice(currentLocale)
-
-        Log.i(TAG, "switchToLocale: locked to $currentLocale")
+        Log.i(TAG, "switchToLocale: locale updated to $currentLocale (Sherpa model selection is locale-based)")
     }
 
     fun setLanguage(languageKey: String, context: Context) {
         val locale = localeFromKey(languageKey)
         currentLocale = locale
 
-        val result = tts?.setLanguage(locale)
-        Log.d(TAG, "setLanguage($locale) returned: $result")
-        if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
-            Log.e(TAG, "Language $locale not available, falling back to English")
-            tts?.setLanguage(Locale.US)
-            currentLocale = Locale.US
-        }
+        // Google TTS is not used by this app, so there is no Android engine to switch.
+        // Sherpa model selection is locale-driven inside SherpaTtsManager.
 
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
@@ -766,12 +667,15 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
 
     // ── Settings ──────────────────────────────────────────────────
 
+    // Google TTS is not used by this app.
+    // SetSpeechRate / setPitch are no-ops here — prosody is controlled by the
+    // speed parameter passed to SherpaTtsManager.speak().
     fun setSpeechRate(rate: Float) {
-        tts?.setSpeechRate(rate.coerceIn(0.5f, 2.0f))
+        cachedRate = rate.coerceIn(0.5f, 2.0f)
     }
 
     fun setPitch(pitch: Float) {
-        tts?.setPitch(pitch.coerceIn(0.5f, 1.5f))
+        // Sherpa TTS does not expose pitch control. No-op to keep settings consistent.
     }
 
     fun setVolume(volume: Float) {
@@ -780,22 +684,22 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
 
     fun getVolume(): Float = cachedVolume
 
+    internal fun cachedRate(): Float = cachedRate
+
     fun applySettings(context: Context) {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         setSpeechRate(prefs.getFloat(KEY_SPEECH_RATE, DEFAULT_SPEECH_RATE))
         setPitch(prefs.getFloat(KEY_PITCH, DEFAULT_PITCH))
         setVolume(prefs.getFloat(KEY_VOLUME, DEFAULT_VOLUME))
+        cachedRate = prefs.getFloat(KEY_SPEECH_RATE, DEFAULT_SPEECH_RATE)
 
         val savedLang = prefs.getString(KEY_LANGUAGE, LANGUAGE_ENGLISH) ?: LANGUAGE_ENGLISH
         setLanguage(savedLang, context)
 
-        // Restore the user's chosen voice (or re-auto-pick best after language switch)
-        val savedVoice = prefs.getString(KEY_VOICE_NAME, "") ?: ""
-        if (savedVoice.isNotBlank() && savedVoice != VOICE_AUTO) {
-            setVoiceByName(savedVoice)
-        } else {
-            selectBestVoice(currentLocale)
-        }
+        // Google TTS is not used by this app, so there is no voice name to restore.
+        // Sherpa model selection is driven by locale inside SherpaTtsManager.
+
+        sherpaTts.initialize()
     }
 
     // ── Lifecycle ─────────────────────────────────────────────────
@@ -803,11 +707,15 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
     fun onDestroy() {
         stopDrainRetryTimer()
         mainHandler.removeCallbacksAndMessages(null)
-        tts?.stop()
+        // stop() only — the Sherpa engine is a shared app-scoped singleton
+        // (VyzeApplication + TtsViewModel both hold a TTSManager), so one
+        // instance's teardown must not unload the models for the other.
+        // Models stay resident for the process lifetime; the OS reclaims
+        // them when the whole app is killed.
+        notifyFlushed()
+        sherpaTts.stop()
         pendingUtteranceIds.clear()
         abandonAudioFocus()
-        tts?.shutdown()
-        tts = null
         isInitialized = false
         speechBuffer.clear()
         Log.d(TAG, "TTS destroyed")
@@ -883,8 +791,6 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
         const val DRAIN_RETRY_MS = 5000L
 
         // ── Voice Quality & Prosody Constants ───────────────────────
-
-        private const val GOOGLE_TTS_ENGINE = "com.google.android.tts"
 
         /**
          * English-voice respellings for brand names generic EN voices misread.

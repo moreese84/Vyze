@@ -45,6 +45,25 @@ captures/
 .DS_Store
 Thumbs.db
 
+# Node modules (pitch deck tools)
+node_modules/
+
+# Python cache
+__pycache__/
+
+# Pitch deck files (local only)
+*.pptx
+
+# Generated pitch deck Python scripts (local only)
+build_deck.py
+generate_deck.py
+populate_cradle_deck.py
+populate_cradle_deck_final.py
+populate_cradle_deck_fixed.py
+populate_cradle_deck_perfect.py
+populate_cradle_deck_v2.py
+populate_cradle_deck_v3.py
+
 # Project specific
 *.log
 *.tmp

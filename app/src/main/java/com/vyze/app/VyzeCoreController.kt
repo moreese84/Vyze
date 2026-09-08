@@ -70,6 +70,10 @@ class VyzeCoreController(
     @Volatile
     private var currencyModeActive = false
 
+    /** True while the current snapshot is a bank card identification query. */
+    @Volatile
+    private var bankCardModeActive = false
+
     /**
      * Timestamp of the last inference activity (token received). The
      * watchdog re-arms itself while tokens are still flowing, so long
@@ -312,6 +316,20 @@ class VyzeCoreController(
                             }
                         }
                         currencyModeActive = false
+
+                        // ── BANK CARD SCAN HISTORY ───────────────────
+                        // Persist a confident bank card identification
+                        // (bank name, card type) into scan history.
+                        if (bankCardModeActive && fullResponse.isNotBlank()) {
+                            try {
+                                com.vyze.app.data.ScanRepository(context.applicationContext)
+                                    .saveBankCardScan(fullResponse.take(120))
+                                CrashLogFile.log(TAG, "Bank card scan saved: ${fullResponse.take(60)}")
+                            } catch (e: Throwable) {
+                                CrashLogFile.logError(TAG, "Bank card scan save failed: ${e.message}", e)
+                            }
+                        }
+                        bankCardModeActive = false
                     }
                     isInferring.set(false)
                     CrashLogFile.log(TAG, "isInferring set to false")
@@ -567,6 +585,7 @@ class VyzeCoreController(
         lastDescribedObject = ""
         lastDescribedTime = 0L
         currencyModeActive = false
+        bankCardModeActive = false
     }
 
     // ── Snapshot Trigger ───────────────────────────────────────────
@@ -622,12 +641,14 @@ class VyzeCoreController(
         val isTapQuery = query?.contains(TAP_POSITION_MARKER) == true
         val currencyQuery = isCurrencyQuery(query)
         currencyModeActive = currencyQuery
+        val bankCardQuery = isBankCardQuery(query)
+        bankCardModeActive = bankCardQuery
         // Pointing questions ("what is this", "apa ini", "这是什么") point at a
         // real object, usually packaged goods with labels — give them the
         // high-resolution + OCR pre-pass so the brand and text are read from
         // ground truth instead of a 256px guess.
         val isTextQuery = isTextExtractionQuery(query) || isTapQuery || currencyQuery ||
-            isPointingQuery(query)
+            bankCardQuery || isPointingQuery(query)
 
         onStatusUpdate("Analyzing snapshot...")
 
@@ -807,9 +828,9 @@ class VyzeCoreController(
                 }
                 CrashLogFile.log(TAG, "Similar interactions resolved: ${similarInteractions.size} found")
 
-                val memoryContext = if (continuousMode || currencyModeActive || !ocrText.isNullOrBlank()) {
-                    null // scene memory adds nothing where OCR is already the ground truth
-                } else {
+        val memoryContext = if (continuousMode || currencyModeActive || bankCardModeActive || !ocrText.isNullOrBlank()) {
+            null // scene memory adds nothing where OCR is already the ground truth
+        } else {
                     buildMemoryContext(similarInteractions)
                 }
                 if (memoryContext != null) {
@@ -824,6 +845,7 @@ class VyzeCoreController(
                     userLocale = activeUserLocale,
                     ocrText = ocrText,
                     currencyMode = currencyModeActive,
+                    bankCardMode = bankCardModeActive,
                     memoryContext = memoryContext
                 )
                 CrashLogFile.log(TAG, "Base prompt built: ${basePrompt.length} chars")
@@ -1057,6 +1079,7 @@ class VyzeCoreController(
                     userLocale = activeUserLocale,
                     ocrText = null,
                     currencyMode = false,
+                    bankCardMode = false,
                     memoryContext = null
                 )
                 CrashLogFile.log(TAG, "Text prompt built: ${basePrompt.length} chars")
@@ -1290,6 +1313,17 @@ class VyzeCoreController(
         return CURRENCY_KEYWORDS.any { keyword -> lower.contains(keyword) }
     }
 
+    /**
+     * Detect if the query is asking to identify a bank card.
+     * Returns true for queries containing bank-card-related keywords
+     * in English, Malay, or Chinese.
+     */
+    private fun isBankCardQuery(query: String?): Boolean {
+        if (query.isNullOrBlank()) return false
+        val lower = query.lowercase()
+        return BANK_CARD_KEYWORDS.any { keyword -> lower.contains(keyword) }
+    }
+
     // ── Medicine Knowledge Base ──────────────────────────────────
 
     /**
@@ -1518,6 +1552,18 @@ class VyzeCoreController(
             "syiling", "koin",
             // Chinese
             "钱", "钞票", "纸币", "硬币", "钱币", "多少钱"
+        )
+
+        /** Keywords that trigger bank card identification. */
+        private val BANK_CARD_KEYWORDS = listOf(
+            // English
+            "bank card", "debit card", "credit card", "atm card",
+            "card", "what card", "which bank",
+            // Malay / Bahasa Melayu
+            "kad bank", "kad debit", "kad kredit", "kad atm",
+            "kad", "kad apa", "bank apa",
+            // Chinese
+            "银行卡", "借记卡", "信用卡", "什么卡", "哪家银行"
         )
 
         /** Keywords that trigger medicine database lookup. */

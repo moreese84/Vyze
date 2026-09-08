@@ -1166,8 +1166,19 @@ class MainActivity : AppCompatActivity() {
                 } else null
 
                 // Fallback: detect language from the transcribed text itself
-                // This covers devices where EXTRA_LANGUAGE is missing from results Bundle
-                val finalLocale = detectedLocale ?: detectLocaleFromText(bestMatch)
+                // This covers two cases:
+                // 1. Devices where EXTRA_LANGUAGE is missing from results Bundle
+                // 2. SpeechRecognizer returns 'en' even for Malay/Chinese speech
+                //    (common on English-default phones where the recognizer ignores
+                //     the EXTRA_LANGUAGE_PREFERENCE hint)
+                val textDetectedLocale = detectLocaleFromText(bestMatch)
+                val finalLocale = if (detectedLocale != null &&
+                    detectedLocale.language in listOf("ms", "zh")
+                ) {
+                    detectedLocale // Trust recognizer if it says Malay/Chinese
+                } else {
+                    textDetectedLocale // Use text detection for Malay/Chinese
+                }
 
                 Log.i(TAG, "onResults: \"$bestMatch\" lang=$finalLocale (bundle=$detectedLang)")
                 CrashLogFile.log(TAG, "Speech result: \"$bestMatch\" lang=$finalLocale")

@@ -6,7 +6,7 @@ import androidx.room.PrimaryKey
 /**
  * Room entity representing a single scan result.
  *
- * Types: OCR, BARCODE, CURRENCY, COLOR, FACE, SCENE
+ * Types: OCR, BARCODE, CURRENCY, BANK_CARD, COLOR, FACE, SCENE
  */
 @Entity(tableName = "scan_history")
 data class ScanEntity(
@@ -16,7 +16,7 @@ data class ScanEntity(
     /** Timestamp when the scan was captured (System.currentTimeMillis). */
     val timestamp: Long = System.currentTimeMillis(),
 
-    /** Scan type: OCR, BARCODE, CURRENCY, COLOR, FACE, SCENE. */
+    /** Scan type: OCR, BARCODE, CURRENCY, BANK_CARD, COLOR, FACE, SCENE. */
     val type: String,
 
     /** The recognized content (text, denomination, color name, etc.). */

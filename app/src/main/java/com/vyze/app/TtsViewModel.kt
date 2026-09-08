@@ -25,6 +25,10 @@ class TtsViewModel(application: Application) : AndroidViewModel(application) {
      */
     val ttsManager: TTSManager by lazy {
         TTSManager(application.applicationContext).apply {
+            // Prefer offline Sherpa TTS when model files are present; otherwise fall
+            // back to the default Google/system TTS engine.
+            // Sherpa model files ship in src/main/assets (kokoro/ + mms/) and are
+            // extracted to the app-scoped external directory on first use.
             applySettings(application.applicationContext)
         }
     }

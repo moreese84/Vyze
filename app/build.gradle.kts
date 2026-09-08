@@ -94,6 +94,7 @@ android {
     androidResources {
         noCompress += "litertlm"
         noCompress += "tflite"
+        noCompress += "onnx"
     }
 
     packaging {

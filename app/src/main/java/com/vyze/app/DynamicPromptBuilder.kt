@@ -28,6 +28,7 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
         userLocale: Locale = Locale.US,
         ocrText: String? = null,
         currencyMode: Boolean = false,
+        bankCardMode: Boolean = false,
         memoryContext: String? = null,
         textOnlyMode: Boolean = false
     ): String {
@@ -88,6 +89,11 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
             // 3b. Currency reading rules (banknotes + coins)
             if (currencyMode) {
                 sb.appendLine(CURRENCY_RULES)
+            }
+
+            // 3c. Bank card identification rules
+            if (bankCardMode) {
+                sb.appendLine(BANK_CARD_RULES)
             }
 
             // 4. Language mirror — reinforce at bottom
@@ -240,6 +246,20 @@ Output 1-2 spoken sentences with spatial positioning. No filler, no formatting."
             "(for example: 50 Ringgit, or 10 cents) and the dominant color. " +
             "If the value cannot be read clearly, say exactly: I cannot read this " +
             "clearly. NEVER guess or invent a value. Do not mention serial numbers."
+
+        /**
+         * Bank card identification rules.
+         * Priority is exact bank name + card type from logos and printed text.
+         * A wrong bank name is far worse than "I cannot identify this card"
+         * for a blind user.
+         */
+        private const val BANK_CARD_RULES =
+            "This is a bank card — debit, credit, or ATM card. Identify the BANK " +
+            "name from the logo and printed text (for example: Maybank, CIMB, " +
+            "Public Bank, HSBC). Then state the card type (debit, credit, or ATM) " +
+            "if visible. If you cannot clearly identify the bank or card type, say " +
+            "exactly: I cannot identify this card clearly. NEVER guess or invent " +
+            "a bank name. Do not read or mention the card number."
 
         private const val CONTINUOUS_MODE_RULES =
             "Instant assistant. Key objects + position. 15 words max. Use commas between items, period at end."

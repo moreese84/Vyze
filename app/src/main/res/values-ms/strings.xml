@@ -56,6 +56,25 @@
     <string name="currency_sen10">Syiling 10 sen dikesan</string>
     <string name="currency_sen5">Syiling 5 sen dikesan</string>
 
+    <!-- ── Bank Card ───────────────────────────────────────────────── -->
+    <string name="bank_card_identified">%1$s %2$s dikesan</string>
+    <string name="bank_card_unknown">Kad bank dikesan. Nama bank tidak kelihatan dengan jelas.</string>
+    <string name="bank_card_unreadable">Saya tidak dapat mengenal pasti kad ini dengan jelas.</string>
+    <string name="bank_card_maybank">Maybank</string>
+    <string name="bank_card_cimb">CIMB</string>
+    <string name="bank_card_public_bank">Public Bank</string>
+    <string name="bank_card_hong_leong">Hong Leong Bank</string>
+    <string name="bank_card_rhb">RHB Bank</string>
+    <string name="bank_card_ambank">AmBank</string>
+    <string name="bank_card_affin">Affin Bank</string>
+    <string name="bank_card_alliance">Alliance Bank</string>
+    <string name="bank_card_hsbc">HSBC</string>
+    <string name="bank_card_standard_chartered">Standard Chartered</string>
+    <string name="bank_card_citibank">Citibank</string>
+    <string name="bank_card_debit">Debit</string>
+    <string name="bank_card_credit">Kredit</string>
+    <string name="bank_card_atm">ATM</string>
+
     <!-- ── Color Labels ──────────────────────────────────────────────── -->
     <string name="color_black">Hitam</string>
     <string name="color_white">Putih</string>

@@ -19,6 +19,7 @@ Vyze speaks what the camera sees — instantly, privately, offline.
 - **Text Reading** — Reads labels, signs, prescriptions, packaging and menus aloud — in whole sentences, in the text's original language, to the end
 - **Product & Brand Naming** — Identifies packaged goods by brand and product type as printed ("Maggi instant noodle packet"), then reads the rest
 - **Currency Reading** — Reads the value on banknotes and coins aloud, with a strict never-guess rule
+- **Bank Card Identification** — Identifies bank name and card type (debit/credit/ATM) from logos and printed text, with a strict never-guess rule
 - **Medicine Lookup** — Cross-references OCR against a local drug database to answer "what medicine is this?"
 - **Multi-Language** — Auto-detects your spoken language and responds in it (English, Malay, Chinese, and more)
 - **Text-Only Q&A** — Answers general-knowledge questions ("what is paracetamol used for?") without the camera
@@ -53,7 +54,9 @@ Camera Frame ──→ ML Kit OCR ──→ DynamicPromptBuilder
 | **VyzeCoreController** | `VyzeCoreController.kt` | Pipeline orchestrator, session isolation, sentence streaming |
 | **DynamicPromptBuilder** | `DynamicPromptBuilder.kt` | Intent-based prompt construction, language mirroring |
 | **OcrHelper** | `OcrHelper.kt` | ML Kit on-device OCR (Latin + Chinese) |
-| **TTSManager** | `TTSManager.kt` | Google neural TTS, utterance tracking, voice switching |
+| **TTSManager** | `TTSManager.kt` | Offline Sherpa-ONNX TTS (Kokoro EN/ZH + Meta MMS Malay), utterance tracking, voice switching |
+| **SherpaTtsManager** | `SherpaTtsManager.kt` | Sherpa-ONNX engine, Kokoro & MMS model loading, AudioTrack playback |
+| **OfflineTts** | `Tts.kt` | JNI wrapper for sherpa-onnx native speech synthesis |
 | **CameraSetupDelegate** | `CameraSetupDelegate.kt` | CameraX frame extraction, snapshot capture |
 | **CameraFragment** | `CameraFragment.kt` | UI, speech callbacks, auto-snapshot loop |
 | **MemoryRepository** | `MemoryRepository.kt` | Vector similarity search, adaptive intelligence |
@@ -66,7 +69,7 @@ Camera Frame ──→ ML Kit OCR ──→ DynamicPromptBuilder
 ## Key Features
 
 ### Fully Offline
-All inference runs on-device. No cloud APIs, no data uploads, no subscriptions. Works underground, on planes, in rural areas.
+All inference runs on-device — including the TTS engine. No cloud APIs, no data uploads, no subscriptions, no Google TTS dependency. Works underground, on planes, in rural areas.
 
 ### Fast Response Times
 - **OCR fast-path**: ~150ms (ML Kit only — skips Gemma when confidence ≥ 85%)
@@ -110,6 +113,14 @@ When Android's recognizer gives up (no match, timeout, audio error — the class
 ### Reading Whole Panels
 Tap or ask about dense packaging and the full text is read to the end: an adaptive output budget is sized to the OCR text actually found (up to ~800 words), the inference watchdog re-arms while tokens are still flowing so long reads are never cut off mid-way, and the prompt forbids letter-by-letter spelling and premature stops. Brand pronunciation is corrected before synthesis ("Maggi" is spoken MAY-ghee, not MAY-jee).
 
+### Offline TTS (No Google Dependency)
+Vyze uses **Sherpa-ONNX** with two models for fully offline speech synthesis — no Google TTS, no network, no voice-pack installs:
+
+- **Kokoro** (MIT license, 325 MB) — neural-quality English and Chinese voices. Auto-selected for `en` and `zh` locales.
+- **Meta MMS** (CC-BY-NC, 114 MB) — functional-quality Malay voice plus multilingual fallback. Auto-selected for `ms` and other locales.
+
+Both models ship in `app/src/main/assets/` and are extracted on first launch. Audio plays through the media stream via `AudioTrack` so the hardware volume buttons work normally. Queue-based speech with barge-in support: a tap or new voice query immediately interrupts any active utterance.
+
 ---
 
 ## Hardware Acceleration
@@ -136,7 +147,7 @@ GPU kernels are pre-compiled during warm-up to eliminate first-inference cold-st
 | **VLM Engine** | Gemma 4 E2B (2.59 GB, multimodal) via LiteRT-LM 0.16.1 |
 | **OCR** | Google ML Kit Text Recognition (Latin + Chinese) |
 | **Camera** | CameraX 1.3.1 |
-| **TTS** | Google Android TTS (neural voice selection) |
+| **TTS** | Sherpa-ONNX (Kokoro EN/ZH + Meta MMS Malay), fully offline, no Google dependency |
 | **Speech Recognition** | Android SpeechRecognizer + Gemma 4 E2B native ASR fallback (offline) |
 | **Database** | Room 2.7.0 (adaptive memory + vector search) |
 | **Coroutines** | kotlinx-coroutines 1.10.1 |
@@ -162,13 +173,26 @@ GPU kernels are pre-compiled during warm-up to eliminate first-inference cold-st
 
 ### Model Setup
 
-Push the Gemma 4 E2B model to your device:
+Vyze needs two sets of models:
 
-```bash
-adb push gemma-4-E2B-it.litertlm /storage/emulated/0/Download/
-```
+1. **Gemma 4 E2B (VLM)** — push to your device:
+   ```bash
+   adb push gemma-4-E2B-it.litertlm /storage/emulated/0/Download/
+   ```
+   The app checks both `/storage/emulated/0/Download/` and the app-scoped external files directory.
 
-The app checks both `/storage/emulated/0/Download/` and the app-scoped external files directory.
+2. **TTS Models (Kokoro + Meta MMS)** — bundled in the APK (`app/src/main/assets/`). Run the setup script once:
+   ```bash
+   # Windows (PowerShell)
+   .\setup-sherpa.ps1
+
+   # or download manually:
+   .\setup-sherpa-curl.bat
+   ```
+   This downloads:
+   - **Kokoro** (325 MB) — neural-quality English & Chinese voices
+   - **Meta MMS** (114 MB) — Malay & multilingual voice
+   - **Sherpa-ONNX JNI libraries** (26 MB) — native speech engine
 
 ### Install
 

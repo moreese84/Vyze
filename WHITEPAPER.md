@@ -321,7 +321,11 @@ Triple-tap-and-hold is a deliberately hard-to-trigger gesture that opens the dia
 
 A dedicated classifier (`isCurrencyQuery`; "what money is this", "read this note", "berapa nilai duit ini", "多少钱") routes money scans through the high-resolution text path with a dedicated prompt rule set: identify the VALUE from the large numerals and printed text, state value + currency + dominant color, and **never guess** — an unreadable note is reported as "I cannot read this clearly", never assigned a denomination. Confident reads are persisted to scan history as a currency entry. The no-guess rule is absolute here because a wrong denomination is worse than no answer for a blind user.
 
-### 8.7 Pointing questions & packaged-brand identification
+### 8.7 Bank card identification
+
+A dedicated classifier (`isBankCardQuery`; "what card is this", "kad apa ini", "这是什么卡") routes bank card scans through the high-resolution text path with a dedicated prompt rule set: identify the BANK name from the logo and printed text, state the card type (debit, credit, or ATM) if visible, and **never guess** — an unreadable card is reported as "I cannot identify this card clearly", never assigned a bank name. Confident reads are persisted to scan history as a bank card entry. The no-guess rule is absolute here because a wrong bank identification is worse than no answer for a blind user. Card numbers are never read or mentioned.
+
+### 8.8 Pointing questions & packaged-brand identification
 
 "What is this?" is the most common real-world question, and it is *not* a text-only knowledge question — it points at an object. Vyze treats pointing phrases (English, Malay, Chinese deictics plus "what am I holding"-style phrasings) as object-focused asks and routes them through the 384 px + OCR path (§6.4) so the answer is grounded in what is actually printed. Combined with the brand-first prompt rule (§6.3), scanning two visually similar products (e.g. two white instant-noodle packets from different brands) yields the printed brand and product name rather than a guess from a downscaled frame.
 
@@ -338,7 +342,7 @@ All persistence is via **Room** (SQLite) inside the app sandbox. There is no clo
 | `MedicineEntity` | Pre-populated medicine knowledge base (name, active ingredient, dose, warnings). |
 | `MemoryDao` / `VyzeMemoryEntity` | Adaptive memory — preferences, environment observations, Q&A interactions, with pruning of entries older than a retention cutoff. |
 | `InteractionDao` / `InteractionRecord` | Full Q&A history plus **serialized 256-float image embeddings** of the scene that prompted each interaction. |
-| `ScanDao` / `ScanEntity` | Scan history by type (scene, OCR, barcode, currency, color). |
+| `ScanDao` / `ScanEntity` | Scan history by type (scene, OCR, barcode, currency, bank card, color). |
 | `ErrorLogDao` / `ErrorLogEntity` | Local crash & diagnostic logs (pruned on launch). |
 
 ### 9.2 Lightweight embeddings
@@ -424,7 +428,7 @@ Production lessons are encoded directly in the code:
 | Progress-aware watchdog | 15 s with no output → force-reset |
 | GPU warm-up timeout | 60 s |
 | Free-RAM preflight (std / low-RAM) | 1200 MB / 800 MB |
-| Image dimension (text/tap/currency) | 384 px |
+| Image dimension (text/tap/currency/bank card) | 384 px |
 | Image dimension (scene / continuous) | 256 px |
 | Sampling | temp 0.1, top-K 1 |
 | Token caps | scene 96 · text-only Q&A 192 · ASR 96 · text reads adaptive 192–1024 (64 + OCR chars ÷ 4) |

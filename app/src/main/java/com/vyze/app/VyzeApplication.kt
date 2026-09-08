@@ -69,6 +69,10 @@ class VyzeApplication : Application() {
     /** Singleton TTSManager. Managed externally via TtsViewModel. */
     val ttsManager: TTSManager by lazy {
         TTSManager(applicationContext).apply {
+            // Prefer offline Sherpa TTS when model files are present; otherwise fall
+            // back to the default Google/system TTS engine.
+            // Sherpa model files ship in src/main/assets (kokoro/ + mms/) and are
+            // extracted to the app-scoped external directory on first use.
             applySettings(applicationContext)
         }
     }

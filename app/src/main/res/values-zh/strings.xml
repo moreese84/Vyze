@@ -56,6 +56,25 @@
     <string name="currency_sen10">检测到10分硬币</string>
     <string name="currency_sen5">检测到5分硬币</string>
 
+    <!-- ── Bank Card ───────────────────────────────────────────────── -->
+    <string name="bank_card_identified">检测到%1$s %2$s</string>
+    <string name="bank_card_unknown">检测到银行卡。银行名称不清晰。</string>
+    <string name="bank_card_unreadable">我无法清晰识别这张卡。</string>
+    <string name="bank_card_maybank">马来亚银行</string>
+    <string name="bank_card_cimb">联昌银行</string>
+    <string name="bank_card_public_bank">大众银行</string>
+    <string name="bank_card_hong_leong">丰隆银行</string>
+    <string name="bank_card_rhb">兴业银行</string>
+    <string name="bank_card_ambank">安邦银行</string>
+    <string name="bank_card_affin">艾芬银行</string>
+    <string name="bank_card_alliance">联友银行</string>
+    <string name="bank_card_hsbc">汇丰银行</string>
+    <string name="bank_card_standard_chartered">渣打银行</string>
+    <string name="bank_card_citibank">花旗银行</string>
+    <string name="bank_card_debit">借记卡</string>
+    <string name="bank_card_credit">信用卡</string>
+    <string name="bank_card_atm">ATM卡</string>
+
     <!-- ── Color Labels ──────────────────────────────────────────────── -->
     <string name="color_black">黑色</string>
     <string name="color_white">白色</string>

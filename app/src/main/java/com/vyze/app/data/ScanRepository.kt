@@ -46,6 +46,11 @@ class ScanRepository(context: Context) {
         return saveScan(type = TYPE_CURRENCY, content = denomination)
     }
 
+    /** Saves a bank card identification result. */
+    suspend fun saveBankCardScan(cardInfo: String): Long {
+        return saveScan(type = TYPE_BANK_CARD, content = cardInfo)
+    }
+
     /** Saves a color analysis result. */
     suspend fun saveColorScan(colorName: String): Long {
         return saveScan(type = TYPE_COLOR, content = colorName)
@@ -126,6 +131,7 @@ class ScanRepository(context: Context) {
         const val TYPE_OCR = "OCR"
         const val TYPE_BARCODE = "BARCODE"
         const val TYPE_CURRENCY = "CURRENCY"
+        const val TYPE_BANK_CARD = "BANK_CARD"
         const val TYPE_COLOR = "COLOR"
         const val TYPE_FACE = "FACE"
         const val TYPE_SCENE = "SCENE"
