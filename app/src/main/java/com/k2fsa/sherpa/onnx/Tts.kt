@@ -90,52 +90,145 @@ data class GeneratedAudio(
     val samples: FloatArray
 )
 
-/**
- * Model config — the native JNI code expects this as a nested object
- * inside OfflineTtsConfig.
- */
-class OfflineTtsModelConfig(
+// ── Model Config (Vits) ──────────────────────────────────────────────
+
+class OfflineTtsVitsModelConfig(
     @JvmField val model: String = "",
+    @JvmField val lexicon: String = "",
     @JvmField val tokens: String = "",
     @JvmField val dataDir: String = "",
     @JvmField val dictDir: String = "",
-    @JvmField val modelType: String = "",
-    @JvmField val debug: Boolean = false,
-    @JvmField val provider: String = "cpu",
-    @JvmField val numThreads: Int = 2,
-    @JvmField val maxNumSentences: Int = 1
+    @JvmField val noiseScale: Float = 0.667f,
+    @JvmField val noiseScaleW: Float = 0.8f,
+    @JvmField val lengthScale: Float = 1.0f
 )
 
-class OfflineTtsConfig(
-    @JvmField val modelConfig: OfflineTtsModelConfig,
-    @JvmField val numThreads: Int = 2,
-    @JvmField val debug: Boolean = false,
+// ── Model Config (Matcha) ────────────────────────────────────────────
+
+class OfflineTtsMatchaModelConfig(
+    @JvmField val acousticModel: String = "",
+    @JvmField val vocoder: String = "",
+    @JvmField val lexicon: String = "",
+    @JvmField val tokens: String = "",
+    @JvmField val dataDir: String = "",
+    @JvmField val noiseScale: Float = 0.667f,
+    @JvmField val lengthScale: Float = 1.0f
+)
+
+// ── Model Config (Kokoro) ────────────────────────────────────────────
+
+class OfflineTtsKokoroModelConfig(
+    @JvmField val model: String = "",
+    @JvmField val voices: String = "",
+    @JvmField val tokens: String = "",
+    @JvmField val dataDir: String = "",
+    @JvmField val lengthScale: Float = 1.0f,
+    @JvmField val lexicon: String = "",
+    @JvmField val lang: String = ""
+)
+
+// ── Model Config (ZipVoice) ──────────────────────────────────────────
+
+class OfflineTtsZipVoiceModelConfig(
+    @JvmField val tokens: String = "",
+    @JvmField val encoder: String = "",
+    @JvmField val decoder: String = "",
+    @JvmField val vocoder: String = "",
+    @JvmField val dataDir: String = "",
+    @JvmField val lexicon: String = "",
+    @JvmField val featScale: Float = 1.0f,
+    @JvmField val tShift: Int = 8,
+    @JvmField val targetRms: Float = 1.0f,
+    @JvmField val guidanceScale: Float = 1.0f
+)
+
+// ── Model Config (Kitten) ────────────────────────────────────────────
+
+class OfflineTtsKittenModelConfig(
+    @JvmField val model: String = "",
+    @JvmField val voices: String = "",
+    @JvmField val tokens: String = "",
+    @JvmField val dataDir: String = "",
+    @JvmField val lengthScale: Float = 1.0f
+)
+
+// ── Model Config (Pocket) ────────────────────────────────────────────
+
+class OfflineTtsPocketModelConfig(
+    @JvmField val lmFlow: String = "",
+    @JvmField val lmMain: String = "",
+    @JvmField val encoder: String = "",
+    @JvmField val decoder: String = "",
+    @JvmField val textConditioner: String = "",
+    @JvmField val vocabJson: String = "",
+    @JvmField val tokenScoresJson: String = "",
+    @JvmField val voiceEmbeddingCacheCapacity: Int = 0
+)
+
+// ── Model Config (Supertonic) ────────────────────────────────────────
+
+class OfflineTtsSupertonicModelConfig(
+    @JvmField val durationPredictor: String = "",
+    @JvmField val textEncoder: String = "",
+    @JvmField val vectorEstimator: String = "",
+    @JvmField val vocoder: String = "",
+    @JvmField val ttsJson: String = "",
+    @JvmField val unicodeIndexer: String = "",
+    @JvmField val voiceStyle: String = ""
+)
+
+// ── Top-level Model Config ──────────────────────────────────────────
+
+/**
+ * Matches the JNI layout from sherpa-onnx java-api.
+ * The native code calls GetObjectField on each model sub-config
+ * and GetObjectField/GetIntField/GetBooleanField on the scalar fields.
+ */
+class OfflineTtsModelConfig(
+    @JvmField val vits: OfflineTtsVitsModelConfig = OfflineTtsVitsModelConfig(),
+    @JvmField val matcha: OfflineTtsMatchaModelConfig = OfflineTtsMatchaModelConfig(),
+    @JvmField val kokoro: OfflineTtsKokoroModelConfig = OfflineTtsKokoroModelConfig(),
+    @JvmField val zipvoice: OfflineTtsZipVoiceModelConfig = OfflineTtsZipVoiceModelConfig(),
+    @JvmField val kitten: OfflineTtsKittenModelConfig = OfflineTtsKittenModelConfig(),
+    @JvmField val pocket: OfflineTtsPocketModelConfig = OfflineTtsPocketModelConfig(),
+    @JvmField val supertonic: OfflineTtsSupertonicModelConfig = OfflineTtsSupertonicModelConfig(),
+    @JvmField val numThreads: Int = 1,
+    @JvmField val debug: Boolean = true,
     @JvmField val provider: String = "cpu"
+)
+
+// ── Top-level TTS Config ────────────────────────────────────────────
+
+/**
+ * Matches the JNI layout from sherpa-onnx java-api.
+ * OfflineTtsConfig wraps OfflineTtsModelConfig plus global settings.
+ */
+class OfflineTtsConfig(
+    @JvmField val modelConfig: OfflineTtsModelConfig = OfflineTtsModelConfig(),
+    @JvmField val ruleFsts: String = "",
+    @JvmField val ruleFars: String = "",
+    @JvmField val maxNumSentences: Int = 1,
+    @JvmField val silenceScale: Float = 0.2f
 ) {
+    /**
+     * Convenience constructor for the Kokoro model path case.
+     * Builds a full config with only the kokoro model/tokens populated.
+     */
     constructor(
         model: String = "",
         tokens: String = "",
-        dataDir: String = "",
-        dictDir: String = "",
-        modelType: String = "",
         numThreads: Int = 2,
-        debug: Boolean = false,
-        provider: String = "cpu",
-        maxNumSentences: Int = 1
+        debug: Boolean = false
     ) : this(
         modelConfig = OfflineTtsModelConfig(
-            model = model,
-            tokens = tokens,
-            dataDir = dataDir,
-            dictDir = dictDir,
-            modelType = modelType,
-            debug = debug,
-            provider = provider,
+            kokoro = OfflineTtsKokoroModelConfig(
+                model = model,
+                tokens = tokens
+            ),
             numThreads = numThreads,
-            maxNumSentences = maxNumSentences
+            debug = debug,
+            provider = "cpu"
         ),
-        numThreads = numThreads,
-        debug = debug,
-        provider = provider
+        maxNumSentences = 1
     )
 }
