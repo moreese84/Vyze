@@ -306,17 +306,31 @@ class SherpaTtsManager(private val context: Context) {
 
         try {
             val modelDir = modelFile.parentFile?.absolutePath ?: ""
+            val voicesFile = File(modelDir, "voices.bin")
+            val voicesPath = if (voicesFile.exists()) voicesFile.absolutePath else ""
+            Log.i(TAG, "Kokoro model: ${modelFile.absolutePath}")
+            Log.i(TAG, "Kokoro tokens: ${tokensFile.absolutePath}")
+            Log.i(TAG, "Kokoro voices: $voicesPath")
+            Log.i(TAG, "Kokoro dataDir: $modelDir")
             val config = OfflineTtsConfig(
                 model = modelFile.absolutePath,
                 tokens = tokensFile.absolutePath,
                 dataDir = modelDir,
+                voices = voicesPath,
                 numThreads = 2,
-                debug = false
+                debug = true
             )
             kokoroTts = OfflineTts(config)
-            Log.i(TAG, "Kokoro model loaded — sampleRate=${kokoroTts?.sampleRate()}")
+            val sr = kokoroTts?.sampleRate() ?: -1
+            Log.i(TAG, "Kokoro model loaded — sampleRate=$sr")
+            if (sr <= 0) {
+                Log.w(TAG, "Kokoro model returned invalid sample rate — unloading")
+                kokoroTts?.release()
+                kokoroTts = null
+            }
         } catch (e: Throwable) {
-            Log.e(TAG, "Failed to load Kokoro: ${e.message}")
+            Log.e(TAG, "Failed to load Kokoro: ${e.javaClass.simpleName} — ${e.message}")
+            CrashLogFile.logError(TAG, "Kokoro load failed", e)
             kokoroTts = null
         }
     }
@@ -344,7 +358,7 @@ class SherpaTtsManager(private val context: Context) {
                 tokens = tokensFile.absolutePath,
                 dataDir = modelDir,
                 numThreads = 2,
-                debug = false
+                debug = true
             )
             mmsTts = OfflineTts(config)
             Log.i(TAG, "MMS model loaded — sampleRate=${mmsTts?.sampleRate()}")

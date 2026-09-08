@@ -220,6 +220,7 @@ class OfflineTtsConfig(
         model: String = "",
         tokens: String = "",
         dataDir: String = "",
+        voices: String = "",
         numThreads: Int = 2,
         debug: Boolean = false
     ) : this(
@@ -227,7 +228,8 @@ class OfflineTtsConfig(
             kokoro = OfflineTtsKokoroModelConfig(
                 model = model,
                 tokens = tokens,
-                dataDir = dataDir
+                dataDir = dataDir,
+                voices = voices
             ),
             numThreads = numThreads,
             debug = debug,
