@@ -292,11 +292,13 @@ class SherpaTtsManager(private val context: Context) {
         // Try external storage first, then extract from assets
         var modelFile: File? = File(kokoroModelDir, "model.onnx")
         var tokensFile: File? = File(kokoroModelDir, "tokens.txt")
+        var voicesFile: File? = File(kokoroModelDir, "voices.bin")
 
         if (modelFile?.exists() != true || tokensFile?.exists() != true) {
             Log.i(TAG, "Kokoro not in external storage — extracting from assets")
             modelFile = extractAsset("kokoro/model.onnx", "kokoro")
             tokensFile = extractAsset("kokoro/tokens.txt", "kokoro")
+            voicesFile = extractAsset("kokoro/voices.bin", "kokoro")
         }
 
         if (modelFile == null || !modelFile.exists() || tokensFile == null || !tokensFile.exists()) {
@@ -306,11 +308,10 @@ class SherpaTtsManager(private val context: Context) {
 
         try {
             val modelDir = modelFile.parentFile?.absolutePath ?: ""
-            val voicesFile = File(modelDir, "voices.bin")
-            val voicesPath = if (voicesFile.exists()) voicesFile.absolutePath else ""
+            val voicesPath = if (voicesFile?.exists() == true) voicesFile.absolutePath else ""
             Log.i(TAG, "Kokoro model: ${modelFile.absolutePath}")
             Log.i(TAG, "Kokoro tokens: ${tokensFile.absolutePath}")
-            Log.i(TAG, "Kokoro voices: $voicesPath")
+            Log.i(TAG, "Kokoro voices: $voicesPath (exists=${voicesFile?.exists()})")
             Log.i(TAG, "Kokoro dataDir: $modelDir")
             val config = OfflineTtsConfig(
                 model = modelFile.absolutePath,
@@ -355,11 +356,13 @@ class SherpaTtsManager(private val context: Context) {
             val modelDir = modelFile.parentFile?.absolutePath ?: ""
             Log.i(TAG, "MMS model: ${modelFile.absolutePath}")
             Log.i(TAG, "MMS tokens: ${tokensFile.absolutePath}")
-            Log.i(TAG, "MMS dataDir: $modelDir")
+            // dataDir intentionally empty for MMS — Sherpa would otherwise look
+            // for phontab/phondata files (espeak-ng lexicon data) that the Meta
+            // MMS VITS model does not provide or require.
             val config = OfflineTtsConfig.forVits(
                 model = modelFile.absolutePath,
                 tokens = tokensFile.absolutePath,
-                dataDir = modelDir,
+                dataDir = "",
                 numThreads = 2,
                 debug = true
             )
