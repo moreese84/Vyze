@@ -90,14 +90,52 @@ data class GeneratedAudio(
     val samples: FloatArray
 )
 
-data class OfflineTtsConfig(
-    val model: String = "",
-    val tokens: String = "",
-    val dataDir: String = "",
-    val dictDir: String = "",
-    val modelType: String = "",
-    val numThreads: Int = 2,
-    val debug: Boolean = false,
-    val provider: String = "cpu",
-    val maxNumSentences: Int = 1
+/**
+ * Model config — the native JNI code expects this as a nested object
+ * inside OfflineTtsConfig.
+ */
+class OfflineTtsModelConfig(
+    @JvmField val model: String = "",
+    @JvmField val tokens: String = "",
+    @JvmField val dataDir: String = "",
+    @JvmField val dictDir: String = "",
+    @JvmField val modelType: String = "",
+    @JvmField val debug: Boolean = false,
+    @JvmField val provider: String = "cpu",
+    @JvmField val numThreads: Int = 2,
+    @JvmField val maxNumSentences: Int = 1
 )
+
+class OfflineTtsConfig(
+    @JvmField val modelConfig: OfflineTtsModelConfig,
+    @JvmField val numThreads: Int = 2,
+    @JvmField val debug: Boolean = false,
+    @JvmField val provider: String = "cpu"
+) {
+    constructor(
+        model: String = "",
+        tokens: String = "",
+        dataDir: String = "",
+        dictDir: String = "",
+        modelType: String = "",
+        numThreads: Int = 2,
+        debug: Boolean = false,
+        provider: String = "cpu",
+        maxNumSentences: Int = 1
+    ) : this(
+        modelConfig = OfflineTtsModelConfig(
+            model = model,
+            tokens = tokens,
+            dataDir = dataDir,
+            dictDir = dictDir,
+            modelType = modelType,
+            debug = debug,
+            provider = provider,
+            numThreads = numThreads,
+            maxNumSentences = maxNumSentences
+        ),
+        numThreads = numThreads,
+        debug = debug,
+        provider = provider
+    )
+}
