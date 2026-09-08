@@ -213,8 +213,8 @@ class OfflineTtsConfig(
     @JvmField val silenceScale: Float = 0.2f
 ) {
     /**
-     * Convenience constructor for the Kokoro model path case.
-     * Builds a full config with only the kokoro model/tokens populated.
+     * Convenience constructor for the Kokoro model (EN/ZH neural TTS).
+     * Populates only the [Kokoro][OfflineTtsKokoroModelConfig] sub-config.
      */
     constructor(
         model: String = "",
@@ -237,4 +237,32 @@ class OfflineTtsConfig(
         ),
         maxNumSentences = 1
     )
+
+    companion object {
+        /**
+         * Build a config for a VITS-based model (e.g. Meta MMS for Malay).
+         * Populates only the [vits][OfflineTtsVitsModelConfig] sub-config.
+         */
+        fun forVits(
+            model: String,
+            tokens: String,
+            dataDir: String,
+            numThreads: Int = 2,
+            debug: Boolean = false
+        ): OfflineTtsConfig {
+            return OfflineTtsConfig(
+                model = OfflineTtsModelConfig(
+                    vits = OfflineTtsVitsModelConfig(
+                        model = model,
+                        tokens = tokens,
+                        dataDir = dataDir
+                    ),
+                    numThreads = numThreads,
+                    debug = debug,
+                    provider = "cpu"
+                ),
+                maxNumSentences = 1
+            )
+        }
+    }
 }

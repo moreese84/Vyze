@@ -353,7 +353,10 @@ class SherpaTtsManager(private val context: Context) {
 
         try {
             val modelDir = modelFile.parentFile?.absolutePath ?: ""
-            val config = OfflineTtsConfig(
+            Log.i(TAG, "MMS model: ${modelFile.absolutePath}")
+            Log.i(TAG, "MMS tokens: ${tokensFile.absolutePath}")
+            Log.i(TAG, "MMS dataDir: $modelDir")
+            val config = OfflineTtsConfig.forVits(
                 model = modelFile.absolutePath,
                 tokens = tokensFile.absolutePath,
                 dataDir = modelDir,
