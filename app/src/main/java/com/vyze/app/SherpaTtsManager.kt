@@ -16,6 +16,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
+import kotlinx.coroutines.delay
 import java.io.File
 import java.util.Locale
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -235,6 +236,7 @@ class SherpaTtsManager(private val context: Context) {
     // ── Queue Drain ─────────────────────────────────────────────
 
     private fun startDrainIfIdle() {
+// Safety kick: if drain doesn't start within 2s, retry        scope.launch {            delay(2000L)            if (!speakQueue.isEmpty() && drainJob?.isActive != true) {                Log.w(TAG, "Drain queue kick-start — drain stalled")                startDrainIfIdle()            }        }
         synchronized(drainLock) {
             if (drainJob?.isActive != true) {
                 drainJob = scope.launch { drainQueue() }
