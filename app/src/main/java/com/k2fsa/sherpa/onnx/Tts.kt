@@ -29,9 +29,14 @@ class OfflineTts(
     }
 
     init {
-        ptr = newFromFile(config)
+        try {
+            ptr = newFromFile(config)
+        } catch (e: Throwable) {
+            Log.e(TAG, "newFromFile threw: ${e.javaClass.simpleName}: ${e.message}")
+            ptr = 0L
+        }
         if (ptr == 0L) {
-            throw RuntimeException("Failed to create OfflineTts from config")
+            Log.w(TAG, "Failed to create OfflineTts from config — engine will be unavailable")
         }
     }
 

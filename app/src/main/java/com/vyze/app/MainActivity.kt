@@ -257,16 +257,13 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
         hapticManager?.cancel()
 
-        // Kill process on exit — releases all GPU, camera, and TTS resources
-        // immediately. Prevents background battery drain from orphaned
-        // LiteRT-LM GPU delegates and CameraX sessions.
-        // isFinishing() = true only when user exits (back/home), not on
-        // rotation or temporary backgrounding.
-        if (isFinishing) {
-            mainHandler.postDelayed({
-                android.os.Process.killProcess(android.os.Process.myPid())
-            }, 300L)
-        }
+        // Note: Process kill removed. The previous killProcess(myPid()) call
+        // conflicted with the error-screen catch block in onCreate: when the
+        // user pressed Back on the error screen, onDestroy ran with isFinishing=true
+        // and killed the process — making it impossible to read the crash details
+        // and producing an EXIT_SELF / status=255 in dumpsys.
+        // GPU/LiteRT/CameraX resources are reclaimed by the OS on process death
+        // or by the next cold start.
     }
 
     // ── TTS Setup ────────────────────────────────────────────────
