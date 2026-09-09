@@ -144,7 +144,10 @@ class TTSManager(context: Context) {
         // constructor — callers assign onReady only after construction, and a
         // shared already-loaded engine would otherwise fire it too early.
         sherpaTts.addOnReady { mainHandler.post { onSherpaReady() } }
-        sherpaTts.initialize()
+        // Model loading is now lazy (triggered by first speak() call).
+        // No longer calling initialize() eagerly — the old call started model
+        // extraction + JNI OfflineTts creation in a coroutine at construction
+        // time, which triggered native exit(255) on config validation failure.
     }
 
     /** Runs on the main thread once Sherpa model loading has finished. */
@@ -699,7 +702,7 @@ class TTSManager(context: Context) {
         // Google TTS is not used by this app, so there is no voice name to restore.
         // Sherpa model selection is driven by locale inside SherpaTtsManager.
 
-        sherpaTts.initialize()
+        // Model loading is now lazy (triggered by first speak() call).
     }
 
     // ── Lifecycle ─────────────────────────────────────────────────

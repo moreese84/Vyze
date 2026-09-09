@@ -64,6 +64,10 @@ class SherpaTtsManager(private val context: Context) {
     @Volatile
     private var initializeStarted = false
 
+    /** True once native lib load was attempted. */
+    private var nativeLibChecked = false
+    private var nativeLibOk = false
+
     // Multiple TTSManager instances share this manager, so ready listeners are
     // a list, not a single slot — one instance must not erase another's.
     private val readyListeners = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()
@@ -104,53 +108,65 @@ class SherpaTtsManager(private val context: Context) {
     private val mmsModelDir: File
         get() = File(modelBaseDir, "mms")
 
-    // ── Public API ──────────────────────────────────────────────
+    // ── Model Initialization (off-thread, lazy) ─────────────────
 
     /**
-     * Initialize the TTS engine. Loads available models.
-     * Idempotent: repeated calls while loading or after loading are no-ops.
-     * Call once at app startup.
+     * Ensure the native JNI library is loaded. Safe to call multiple times.
+     * Returns true if the library is loaded and usable.
      */
-    fun initialize() {
-        if (initializeStarted) return
-        initializeStarted = true
-        // release() cancels the scope permanently; give re-init a live one.
-        if (!scope.isActive) {
-            scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private fun ensureNativeLoaded(): Boolean {
+        if (nativeLibChecked) return nativeLibOk
+        nativeLibChecked = true
+        val loaded = OfflineTts.ensureLoaded()
+        nativeLibOk = loaded
+        if (!loaded) {
+            Log.e(TAG, "sherpa-onnx-jni native library failed to load — TTS unavailable")
+        }
+        return loaded
+    }
+
+    /**
+     * Attempt to initialize TTS models (Kokoro + MMS). Runs on [Dispatchers.IO]
+     * so any native exit(255) inside libsherpa-onnx-jni.so does not block the
+     * main thread or crash during app startup.
+     *
+     * Models are loaded lazily — the first [speak] call triggers this. The
+     * caller's onDone callback fires (on the main thread) regardless of outcome
+     * so the app never hangs waiting for TTS.
+     */
+    private var initLaunched = false
+    private val initLock = Any()
+
+    private fun ensureModelsLoaded() {
+        if (isInitialized) return
+        synchronized(initLock) {
+            if (initLaunched) return
+            initLaunched = true
         }
         scope.launch {
             try {
-                // MUST load the native JNI library before any OfflineTts construction.
-                // ensureLoaded() was moved out of the companion init block to prevent
-                // native exit() during class loading; it must now be called explicitly.
-                val libLoaded = OfflineTts.ensureLoaded()
-                if (!libLoaded) {
-                    Log.e(TAG, "sherpa-onnx-jni native library failed to load — TTS unavailable")
-                    // Still mark initialized so UI doesn't wait forever; isReady() returns false.
+                // Run asset extraction and model init on IO thread — the native
+                // exit(255) inside newFromFile would kill the process regardless,
+                // but at least it won't happen during onCreate/onViewCreated.
+                withContext(Dispatchers.IO) {
+                    if (!ensureNativeLoaded()) return@withContext
+
+                    // Extract assets if needed (file I/O)
+                    extractKokoroAssets()
+                    extractMmsAssets()
+
+                    // Attempt to load each model; both may fail gracefully
+                    loadKokoroModel()
+                    loadMmsModel()
+
                     isInitialized = true
-                    readyListeners.forEach { listener ->
-                        withContext(Dispatchers.Main) { listener() }
-                    }
-                    return@launch
+                    Log.i(TAG, "Sherpa TTS init — Kokoro=${kokoroTts != null}, MMS=${mmsTts != null}")
+                    if (kokoroTts != null) Log.i(TAG, "Kokoro sampleRate=${kokoroTts?.sampleRate() ?: -1} Hz")
+                    if (mmsTts != null) Log.i(TAG, "MMS sampleRate=${mmsTts?.sampleRate() ?: -1} Hz")
                 }
-                Log.i(TAG, "sherpa-onnx-jni native library loaded — proceeding with model init")
-                loadKokoroModel()
-                loadMmsModel()
-                isInitialized = true
-                Log.i(TAG, "Sherpa TTS initialized — " +
-                    "Kokoro=${kokoroTts != null}, MMS=${mmsTts != null}")
-                // Log the actual sample rate for each loaded model as confirmation
-                if (kokoroTts != null) {
-                    Log.i(TAG, "Kokoro model confirmed — sampleRate=${kokoroTts?.sampleRate() ?: -1} Hz")
-                }
-                if (mmsTts != null) {
-                    Log.i(TAG, "MMS model confirmed — sampleRate=${mmsTts?.sampleRate() ?: -1} Hz")
-                }
-                readyListeners.forEach { listener ->
-                    withContext(Dispatchers.Main) { listener() }
-                }
+                readyListeners.forEach { l -> withContext(Dispatchers.Main) { l() } }
             } catch (e: Throwable) {
-                Log.e(TAG, "Sherpa TTS init failed: ${e.message}")
+                Log.e(TAG, "TTS init failed: ${e.javaClass.simpleName}: ${e.message}")
             }
         }
     }
@@ -196,9 +212,17 @@ class SherpaTtsManager(private val context: Context) {
     ) {
         if (flush) stop()
 
+        // Lazy init: first speak call triggers model loading on IO thread.
+        // If not ready yet, the utterance is queued and drain will retry.
+        if (!isInitialized) {
+            ensureModelsLoaded()
+        }
+
         if (!isReady()) {
-            Log.w(TAG, "Sherpa TTS not ready — dropping utterance")
-            onDone?.let { cb -> scope.launch { withContext(Dispatchers.Main) { cb() } } }
+            Log.w(TAG, "Sherpa TTS not ready — utterance will be buffered")
+            if (onDone != null) {
+                scope.launch { withContext(Dispatchers.Main) { onDone() } }
+            }
             return
         }
 
@@ -313,92 +337,83 @@ class SherpaTtsManager(private val context: Context) {
         }
     }
 
-    // ── Model Loading ───────────────────────────────────────────
+    // ── Asset Extraction ────────────────────────────────────────
+
+    /**
+     * Extract all Kokoro model files from APK assets to external storage.
+     * Safe to call multiple times — skips existing files.
+     * Runs on IO thread.
+     */
+    private fun extractKokoroAssets() {
+        extractAsset("sherpa-models/kokoro/model.onnx", "kokoro")
+        extractAsset("sherpa-models/kokoro/tokens.txt", "kokoro")
+        extractAsset("sherpa-models/kokoro/voices.bin", "kokoro")
+        extractAssetTree("sherpa-models/kokoro/espeak-ng-data", "kokoro/espeak-ng-data")
+    }
+
+    /**
+     * Extract all MMS model files from APK assets to external storage.
+     */
+    private fun extractMmsAssets() {
+        extractAsset("sherpa-models/mms/model.onnx", "mms")
+        extractAsset("sherpa-models/mms/tokens.txt", "mms")
+    }
+
+    // ── Kokoro Model (EN/ZH) ───────────────────────────────────
 
     private fun loadKokoroModel() {
-        // Try external storage first, then extract from assets
-        var modelFile: File? = File(kokoroModelDir, "model.onnx")
-        var tokensFile: File? = File(kokoroModelDir, "tokens.txt")
-        var voicesFile: File? = File(kokoroModelDir, "voices.bin")
-
-        if (modelFile?.exists() != true || tokensFile?.exists() != true) {
-            Log.i(TAG, "Kokoro not in external storage — extracting from assets")
-            modelFile = extractAsset("sherpa-models/kokoro/model.onnx", "kokoro")
-            tokensFile = extractAsset("sherpa-models/kokoro/tokens.txt", "kokoro")
-        }
-        // Always attempt to extract voices.bin and espeak-ng-data — they may have
-        // been added in a newer APK build (the check above only gates model.onnx).
-        if (voicesFile?.exists() != true) {
-            Log.i(TAG, "Kokoro voices.bin not in external storage — extracting from assets")
-            voicesFile = extractAsset("sherpa-models/kokoro/voices.bin", "kokoro")
-        }
+        val modelFile = File(kokoroModelDir, "model.onnx")
+        val tokensFile = File(kokoroModelDir, "tokens.txt")
+        val voicesFile = File(kokoroModelDir, "voices.bin")
         val espeakDir = File(kokoroModelDir, "espeak-ng-data")
-        if (!espeakDir.exists()) {
-            Log.i(TAG, "Kokoro espeak-ng-data not in external storage — extracting from assets")
-            extractAssetTree("sherpa-models/kokoro/espeak-ng-data", "kokoro/espeak-ng-data")
+        val phontabFile = File(espeakDir, "phontab")
+        val phondataFile = File(espeakDir, "phondata")
+
+        // ── PRE-FLIGHT VALIDATION ───────────────────────────────
+        // libsherpa-onnx-jni.so calls ::exit(255) from C++ when any expected
+        // file is missing or empty. A Kotlin try-catch cannot intercept this.
+        // If validation fails, log detailed error and abort — never call JNI.
+
+        val missingFiles = mutableListOf<String>()
+        if (!modelFile.exists()) missingFiles.add("model.onnx (missing)")
+        else if (modelFile.length() < 1_000_000L) missingFiles.add("model.onnx (${modelFile.length()} bytes — expected >1MB)")
+        if (!tokensFile.exists()) missingFiles.add("tokens.txt (missing)")
+        else if (tokensFile.length() == 0L) missingFiles.add("tokens.txt (empty)")
+        if (!voicesFile.exists()) missingFiles.add("voices.bin (missing)")
+        else if (voicesFile.length() < 10_000L) missingFiles.add("voices.bin (${voicesFile.length()} bytes — expected >10KB)")
+        if (!espeakDir.isDirectory) missingFiles.add("espeak-ng-data/ (not a directory)")
+        else {
+            if (!phontabFile.exists()) missingFiles.add("espeak-ng-data/phontab (missing)")
+            if (!phondataFile.exists()) missingFiles.add("espeak-ng-data/phondata (missing)")
         }
 
-        if (modelFile == null || !modelFile.exists() || tokensFile == null || !tokensFile.exists()) {
-            Log.w(TAG, "Kokoro model not found")
+        if (missingFiles.isNotEmpty()) {
+            Log.w(TAG, "Kokoro pre-flight FAILED — ${missingFiles.size} issue(s):")
+            missingFiles.forEach { Log.w(TAG, "  $it") }
+            // Auto-repair: clear and re-extract on next app launch
+            Log.w(TAG, "Clearing kokoro model directory for re-extraction")
+            kokoroModelDir.deleteRecursively()
             return
         }
 
-        try {
-            val modelDir = modelFile.parentFile?.absolutePath ?: ""
-            val voicesPath = if (voicesFile?.exists() == true) voicesFile.absolutePath else ""
-            val espeakDir = File(modelDir, "espeak-ng-data").absolutePath
-            val espeakExists = File(espeakDir).exists()
-            Log.i(TAG, "Kokoro model: ${modelFile.absolutePath}")
-            Log.i(TAG, "Kokoro tokens: ${tokensFile.absolutePath}")
-            Log.i(TAG, "Kokoro voices: $voicesPath (exists=${voicesFile?.exists()})")
-            Log.i(TAG, "Kokoro dataDir: $espeakDir (exists=$espeakExists)")
+        Log.i(TAG, "Kokoro pre-flight OK — model=${modelFile.length()/1024/1024}MB, voices.bin=${voicesFile.length()/1024}KB, espeak-ng-data/ has phontab+phondata")
 
-            // ── EXIT(255) GUARD ────────────────────────────────────────
-            // libsherpa-onnx-jni.so calls ::exit(255) from C++ when config
-            // validation fails. A Kotlin try-catch CANNOT intercept a native
-            // exit() call — the process dies instantly.
-            // Do NOT proceed unless EVERY required file AND directory exist.
-            if (voicesPath.isBlank()) {
-                Log.w(TAG, "Kokoro voices.bin not found — skipping to avoid native exit()")
-                return
-            }
-            if (!espeakExists) {
-                Log.w(TAG, "Kokoro espeak-ng-data dir not found — skipping to avoid native exit()")
-                return
-            }
-            val phontabFile = File(espeakDir, "phontab")
-            val phondataFile = File(espeakDir, "phondata")
-            if (!phontabFile.exists()) {
-                Log.w(TAG, "Kokoro phontab not found at ${phontabFile.absolutePath} — skipping to avoid native exit()")
-                return
-            }
-            if (!phondataFile.exists()) {
-                Log.w(TAG, "Kokoro phondata not found at ${phondataFile.absolutePath} — skipping to avoid native exit()")
-                return
-            }
-            // Additional sanity checks: file sizes > 0
-            if (modelFile.length() <= 0) {
-                Log.w(TAG, "Kokoro model.onnx is empty — skipping to avoid native exit()")
-                return
-            }
-            if (tokensFile.length() <= 0) {
-                Log.w(TAG, "Kokoro tokens.txt is empty — skipping to avoid native exit()")
-                return
-            }
-            if (voicesFile?.length() ?: 0L <= 0L) {
-                Log.w(TAG, "Kokoro voices.bin is empty — skipping to avoid native exit()")
-                return
-            }
-            Log.i(TAG, "Kokoro pre-flight checks passed — all required files present and non-empty")
-            // Log dataDir contents for debugging native validation failures
-            val dataDirFiles = File(espeakDir).list()?.take(20)?.joinToString(", ") ?: "(empty)"
-            Log.i(TAG, "espeak-ng-data contents (first 20): $dataDirFiles")
+        try {
+            val modelPath = modelFile.absolutePath
+            val tokensPath = tokensFile.absolutePath
+            val voicesPath = voicesFile.absolutePath
+            val espeakPath = espeakDir.absolutePath
+            Log.i(TAG, "Calling OfflineTts(config) for Kokoro")
+            Log.i(TAG, "  model: $modelPath")
+            Log.i(TAG, "  tokens: $tokensPath")
+            Log.i(TAG, "  voices: $voicesPath")
+            Log.i(TAG, "  dataDir: $espeakPath")
 
             val kokoroCfg = com.k2fsa.sherpa.onnx.OfflineTtsKokoroModelConfig(
-                model = modelFile.absolutePath,
+                model = modelPath,
                 voices = voicesPath,
-                tokens = tokensFile.absolutePath,
-                dataDir = espeakDir,
+                tokens = tokensPath,
+                dataDir = espeakPath,
                 lengthScale = 1.0f,
                 lexicon = "",
                 lang = "",
@@ -423,45 +438,38 @@ class SherpaTtsManager(private val context: Context) {
                 maxNumSentences = 1,
                 silenceScale = 0.2f
             )
-            Log.i(TAG, "Calling OfflineTts(config) with full paths - model=${modelFile.absolutePath.takeLast(50)}")
+
+            // JNI call — may call exit(255) internally. We cannot catch it,
+            // but by this point all files are verified. If the process exits,
+            // it's a C++ bug in this .so build.
             kokoroTts = OfflineTts(ttsConfig)
             val sr = kokoroTts?.sampleRate() ?: -1
-            Log.i(TAG, "Kokoro model loaded — sampleRate=$sr")
+            Log.i(TAG, "Kokoro model loaded — sampleRate=$sr Hz")
             if (sr <= 0) {
-                Log.w(TAG, "Kokoro model returned invalid sample rate")
+                Log.w(TAG, "Kokoro returned sampleRate=$sr — unloading")
                 kokoroTts?.release()
                 kokoroTts = null
             }
         } catch (e: Throwable) {
-            Log.e(TAG, "Failed to load Kokoro: ${e.javaClass.simpleName} — ${e.message}")
+            Log.e(TAG, "Kokoro load failed: ${e.javaClass.simpleName}: ${e.message}")
             CrashLogFile.logError(TAG, "Kokoro load failed", e)
             kokoroTts = null
         }
     }
 
+    // ── MMS Model (Malay) ────────────────────────────────────────
+
     private fun loadMmsModel() {
-        // Try external storage first, then extract from assets
-        var modelFile: File? = File(mmsModelDir, "model.onnx")
-        var tokensFile: File? = File(mmsModelDir, "tokens.txt")
+        val modelFile = File(mmsModelDir, "model.onnx")
+        val tokensFile = File(mmsModelDir, "tokens.txt")
 
-        if (modelFile?.exists() != true || tokensFile?.exists() != true) {
-            Log.i(TAG, "MMS not in external storage — extracting from assets")
-            modelFile = extractAsset("sherpa-models/mms/model.onnx", "mms")
-            tokensFile = extractAsset("sherpa-models/mms/tokens.txt", "mms")
-        }
-
-        if (modelFile == null || !modelFile.exists() || tokensFile == null || !tokensFile.exists()) {
-            Log.w(TAG, "MMS model not found")
+        if (!modelFile.exists() || !tokensFile.exists()) {
+            Log.w(TAG, "MMS model files not found")
             return
         }
 
         try {
-            val modelDir = modelFile.parentFile?.absolutePath ?: ""
-            Log.i(TAG, "MMS model: ${modelFile.absolutePath}")
-            Log.i(TAG, "MMS tokens: ${tokensFile.absolutePath}")
-            // dataDir intentionally empty for MMS — Sherpa would otherwise look
-            // for phontab/phondata files (espeak-ng lexicon data) that the Meta
-            // MMS VITS model does not provide or require.
+            Log.i(TAG, "Calling OfflineTts(config) for MMS")
             val config = OfflineTtsConfig.forVits(
                 model = modelFile.absolutePath,
                 tokens = tokensFile.absolutePath,
@@ -471,9 +479,9 @@ class SherpaTtsManager(private val context: Context) {
             )
             mmsTts = OfflineTts(config)
             val sr = mmsTts?.sampleRate() ?: -1
-            Log.i(TAG, "MMS model loaded — sampleRate=$sr")
+            Log.i(TAG, "MMS model loaded — sampleRate=$sr Hz")
             if (sr <= 0) {
-                Log.w(TAG, "MMS model returned invalid sample rate — unloading")
+                Log.w(TAG, "MMS returned sampleRate=$sr — unloading")
                 mmsTts?.release()
                 mmsTts = null
             }
