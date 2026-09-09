@@ -1220,9 +1220,13 @@ class VyzeCoreController(
         activeUserLocale = locale
         Log.i(TAG, "setUserLocale: $locale (language=${locale.language})")
 
-        // Switch TTS voice to match detected language
+        // Switch TTS voice to match detected language.
+        // mirrorDetectedLocale normalizes ISO 639-3 STT codes (zlm→ms-MY,
+        // cmn→zh) and enforces the unknown→English fallback — the raw
+        // switchToLocale pass-through previously let unsupported tags
+        // diverge the engine language state.
         mainHandler.post {
-            ttsManager.switchToLocale(locale)
+            ttsManager.mirrorDetectedLocale(detectedLocale)
         }
     }
 

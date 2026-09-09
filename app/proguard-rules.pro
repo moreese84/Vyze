@@ -2,12 +2,8 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Sherpa-ONNX JNI Bindings ────────────────────────────────────────────────
-# The native libsherpa-onnx-jni.so accesses Java fields via JNI GetFieldID /
-# GetObjectField. ProGuard must not rename or remove any class, field, or
-# method in the com.k2fsa.sherpa.onnx package.
--keep class com.k2fsa.sherpa.onnx.** { *; }
--keepclassmembers class com.k2fsa.sherpa.onnx.** { *; }
--dontwarn com.k2fsa.sherpa.onnx.**
+# (Keep rules REMOVED — TTS pivoted to platform android.speech.tts.TextToSpeech.
+# No com.k2fsa.sherpa.onnx classes remain in the APK.)
 
 # ── ML Kit Text Recognition ──────────────────────────────────────────────────
 -keep class com.google.mlkit.** { *; }

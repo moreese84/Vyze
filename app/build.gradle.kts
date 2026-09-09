@@ -92,9 +92,13 @@ android {
 
 
     androidResources {
+        // AAPT DEFLATE-compresses these asset types inside the APK otherwise.
+        // Compressed entries cannot be mmap'd, so any code that opens them via
+        // openFd() would throw "...it is probably compressed".
+        // (litertlm/tflite belong to the on-device VLM engine, not TTS —
+        // the sherpa-onnx 'onnx'/'txt' entries were removed with the TTS pivot.)
         noCompress += "litertlm"
         noCompress += "tflite"
-        noCompress += "onnx"
     }
 
     packaging {
