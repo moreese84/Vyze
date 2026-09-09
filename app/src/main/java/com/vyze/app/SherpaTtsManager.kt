@@ -186,6 +186,7 @@ class SherpaTtsManager(private val context: Context) {
     // ── Public API ──────────────────────────────────────────────
 
     fun isReady(): Boolean = isInitialized && vitsTts != null
+fun isInitDone(): Boolean = isInitialized
     
     /**
      * Directly generate PCM samples without going through the speak queue.

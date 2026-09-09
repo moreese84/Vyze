@@ -265,7 +265,11 @@ class TTSManager private constructor(context: Context) {
         queueMode: Int = TextToSpeech.QUEUE_ADD,
         utteranceId: String? = null
     ): Boolean {
-        if (text.isBlank()) return false
+        Log.d(TAG, "speak() called with text: '" + text.take(80) + "'")
+        if (text.isBlank()) {
+            Log.e(TAG, "speak() text is blank")
+            return false
+        }
         val now = System.currentTimeMillis()
         if (text == lastSpokenText && (now - lastSpeechTime) < DEBOUNCE_MS) {
             Log.d(TAG, "speak() DEBOUNCE: " + text.take(60))
@@ -274,6 +278,7 @@ class TTSManager private constructor(context: Context) {
         lastSpeechTime = now
         lastSpokenText = text
         val enhancedText = enhanceForNaturalProsody(applyPronunciationOverrides(text))
+        Log.d(TAG, "speak() isReady=" + sherpaTts.isReady() + ", isInit=" + sherpaTts.isInitDone())
         if (sherpaTts.isReady()) {
             if (queueMode == TextToSpeech.QUEUE_FLUSH) {
                 notifyFlushed()
@@ -281,13 +286,13 @@ class TTSManager private constructor(context: Context) {
             }
             val id = utteranceId ?: nextUtteranceId()
             pendingUtteranceIds.add(id)
-            Log.d(TAG, "speak() on IO: " + enhancedText.take(60))
+            Log.d(TAG, "Launching synthesis job on Dispatchers.IO: " + enhancedText.take(60))
             kotlinx.coroutines.GlobalScope.launch(Dispatchers.IO) {
                 synthesizeAndPlay(enhancedText, id)
             }
             return true
         }
-        Log.d(TAG, "speak() not ready: " + text.take(60))
+        Log.e(TAG, "speak() not ready — buffering: " + text.take(60))
         speechBuffer.add(enhancedText)
         return false
     }
@@ -301,7 +306,7 @@ class TTSManager private constructor(context: Context) {
                 kotlinx.coroutines.runBlocking(Dispatchers.Main) { onUtteranceDone(utteranceId) }
                 return
             }
-            Log.d(TAG, "Samples: " + audio.samples.size + ", Rate: " + audio.sampleRate)
+            Log.d(TAG, "Samples generated: " + audio.samples.size + ", Rate: " + audio.sampleRate)
             if (audio.samples.isEmpty()) {
                 Log.e(TAG, "generate() returned empty samples")
                 kotlinx.coroutines.runBlocking(Dispatchers.Main) { onUtteranceDone(utteranceId) }
