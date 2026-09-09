@@ -7,6 +7,7 @@ import android.media.AudioTrack
 import android.util.Log
 import com.k2fsa.sherpa.onnx.OfflineTts
 import com.k2fsa.sherpa.onnx.OfflineTtsConfig
+import com.k2fsa.sherpa.onnx.GeneratedAudio
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -185,6 +186,20 @@ class SherpaTtsManager(private val context: Context) {
     // ── Public API ──────────────────────────────────────────────
 
     fun isReady(): Boolean = isInitialized && vitsTts != null
+    
+    /**
+     * Directly generate PCM samples without going through the speak queue.
+     * Used by TTSManager for immediate synchronous generation + playback.
+     */
+    fun generateSamples(text: String, speed: Float = 1.0f): com.k2fsa.sherpa.onnx.GeneratedAudio? {
+        if (vitsTts == null) return null
+        return try {
+            vitsTts?.generate(text, speed = speed)
+        } catch (e: Throwable) {
+            Log.e(TAG, "generateSamples failed: " + e.message)
+            null
+        }
+    }
     fun isTtsAvailable(): Boolean = vitsTts != null
     fun hasVoiceFor(language: String): Boolean = vitsTts != null
 

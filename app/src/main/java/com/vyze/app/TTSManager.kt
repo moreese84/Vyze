@@ -1,6 +1,8 @@
 package com.vyze.app
 
 import android.content.Context
+import android.media.AudioTrack
+import android.media.AudioFormat
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
@@ -10,6 +12,8 @@ import android.os.Looper
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.speech.tts.Voice
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.Dispatchers
 import android.util.Log
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
@@ -261,53 +265,112 @@ class TTSManager private constructor(context: Context) {
     ): Boolean {
         if (text.isBlank()) return false
 
-        if (!isInitialized) {
-            Log.d(TAG, "speak() before TTS init — buffering: \"${text.take(60)}\"")
-            speechBuffer.add(text)
-            return false
-        }
-
         val now = System.currentTimeMillis()
+
+        // Debounce duplicate
         if (text == lastSpokenText && (now - lastSpeechTime) < DEBOUNCE_MS) {
-            Log.d(TAG, "speak() DEBOUNCE — dropping duplicate: \"${text.take(60)}\"")
+            Log.d(TAG, "speak() DEBOUNCE — dropping duplicate: " + text.take(60))
             return false
         }
-
         lastSpeechTime = now
         lastSpokenText = text
 
-        // Enhance text with pronunciation overrides + natural prosody pauses
         val enhancedText = enhanceForNaturalProsody(applyPronunciationOverrides(text))
 
-        // This app does not use Google TTS. If Sherpa is not ready, enqueue for retry.
         if (sherpaTts.isReady()) {
-            // QUEUE_FLUSH is barge-in: report the flushed utterances as errors
-            // (the Google TTS contract) so waiting listeners can resume.
             if (queueMode == TextToSpeech.QUEUE_FLUSH) {
                 notifyFlushed()
+                sherpaTts.stop()
             }
             val id = utteranceId ?: nextUtteranceId()
             pendingUtteranceIds.add(id)
-            sherpaTts.speak(
-                enhancedText, currentLocale, cachedRate(), cachedVolume,
-                onStart = { onUtteranceStart(id) },
-                onDone = { onUtteranceDone(id) },
-                flush = queueMode == TextToSpeech.QUEUE_FLUSH
-            )
-            Log.d(TAG, "speak() OK (sherpa) id=$id queueMode=$queueMode pending=${pendingUtteranceIds.size} " +
-                "text=\"${text.take(60)}\"")
+            Log.d(TAG, "speak() generating: " + enhancedText.take(60))
+            synthesizeAndPlay(enhancedText, id)
             return true
         }
 
-        Log.d(TAG, "speak() Sherpa not ready — buffering: \"${text.take(60)}\"")
+        Log.d(TAG, "speak() Sherpa not ready — buffering: " + text.take(60) + "")
         speechBuffer.add(enhancedText)
         return false
     }
 
-    /**
-     * Immediate speech for urgent accessibility feedback.
-     * Stops current speech, speaks with QUEUE_FLUSH.
-     */
+    private fun synthesizeAndPlay(text: String, utteranceId: String) {
+        try {
+            Log.d(TAG, "synthesizeAndPlay: generate() for " + text.take(60) + "")
+            val audio = sherpaTts.generateSamples(text, speed = cachedRate())
+            if (audio == null) {
+                Log.e(TAG, "synthesizeAndPlay: generate() returned null")
+                onUtteranceDone(utteranceId)
+                return
+            }
+            Log.d(TAG, "synthesizeAndPlay: samples=" + audio.samples.size + ", sampleRate=" + audio.sampleRate)
+            if (audio.samples.isEmpty()) {
+                Log.e(TAG, "synthesizeAndPlay: Sherpa returned empty samples")
+                onUtteranceDone(utteranceId)
+                return
+            }
+            val peak = audio.samples.maxOrNull() ?: 0f
+            Log.d(TAG, "synthesizeAndPlay: peak=" + peak)
+
+            playFloatPcm(audio.samples, audio.sampleRate, utteranceId)
+        } catch (e: Throwable) {
+            Log.e(TAG, "synthesizeAndPlay error: " + e.javaClass.simpleName + ": " + (e.message ?: ""))
+            onUtteranceDone(utteranceId)
+        }
+    }
+
+    private fun playFloatPcm(samples: FloatArray, sampleRate: Int, utteranceId: String) {
+        if (samples.isEmpty() || sampleRate <= 0) {
+            onUtteranceDone(utteranceId)
+            return
+        }
+        var track: AudioTrack? = null
+        try {
+            val minBuf = AudioTrack.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_FLOAT)
+            if (minBuf <= 0) {
+                Log.e(TAG, "getMinBufferSize=" + minBuf)
+                onUtteranceDone(utteranceId)
+                return
+            }
+            val bufSize = maxOf(minBuf, samples.size * 4)
+            track = AudioTrack.Builder()
+                .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
+                .setAudioFormat(AudioFormat.Builder().setSampleRate(sampleRate).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).setEncoding(AudioFormat.ENCODING_PCM_FLOAT).build())
+                .setBufferSizeInBytes(bufSize)
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .build()
+            if (track.state != AudioTrack.STATE_INITIALIZED) {
+                Log.e(TAG, "AudioTrack not initialized, state=" + track.state)
+                onUtteranceDone(utteranceId)
+                track.release()
+                track = null
+                return
+            }
+            Log.d(TAG, "AudioTrack OK — writing " + samples.size + " floats @ " + sampleRate + "Hz")
+            track.play()
+            val written = track.write(samples, 0, samples.size, AudioTrack.WRITE_BLOCKING)
+            Log.d(TAG, "AudioTrack.write returned " + written)
+            var waitedMs = 0
+            val durMs = (samples.size.toLong() * 1000 / sampleRate).toInt()
+            while (waitedMs < durMs + 2000) {
+                if (track.playbackHeadPosition >= samples.size) break
+                Thread.sleep(50)
+                waitedMs += 50
+            }
+            Log.d(TAG, "Drain done: headPos=" + track.playbackHeadPosition + ", waited=" + waitedMs + "ms")
+            track.stop()
+            track.release()
+            track = null
+            Log.d(TAG, "AudioTrack released OK")
+            onUtteranceDone(utteranceId)
+        } catch (e: Throwable) {
+            Log.e(TAG, "playFloatPcm error: " + e.javaClass.simpleName + ": " + (e.message ?: ""))
+            try { track?.stop() } catch (_: Throwable) {}
+            try { track?.release() } catch (_: Throwable) {}
+            onUtteranceDone(utteranceId)
+        }
+    }
+
     fun speakImmediate(text: String): Boolean {
         if (text.isBlank()) {
             Log.w(TAG, "speakImmediate() called with blank text — skipping")
