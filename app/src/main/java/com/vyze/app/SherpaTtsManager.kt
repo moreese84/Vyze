@@ -120,11 +120,32 @@ class SherpaTtsManager(private val context: Context) {
         }
         scope.launch {
             try {
+                // MUST load the native JNI library before any OfflineTts construction.
+                // ensureLoaded() was moved out of the companion init block to prevent
+                // native exit() during class loading; it must now be called explicitly.
+                val libLoaded = OfflineTts.ensureLoaded()
+                if (!libLoaded) {
+                    Log.e(TAG, "sherpa-onnx-jni native library failed to load — TTS unavailable")
+                    // Still mark initialized so UI doesn't wait forever; isReady() returns false.
+                    isInitialized = true
+                    readyListeners.forEach { listener ->
+                        withContext(Dispatchers.Main) { listener() }
+                    }
+                    return@launch
+                }
+                Log.i(TAG, "sherpa-onnx-jni native library loaded — proceeding with model init")
                 loadKokoroModel()
                 loadMmsModel()
                 isInitialized = true
                 Log.i(TAG, "Sherpa TTS initialized — " +
                     "Kokoro=${kokoroTts != null}, MMS=${mmsTts != null}")
+                // Log the actual sample rate for each loaded model as confirmation
+                if (kokoroTts != null) {
+                    Log.i(TAG, "Kokoro model confirmed — sampleRate=${kokoroTts?.sampleRate() ?: -1} Hz")
+                }
+                if (mmsTts != null) {
+                    Log.i(TAG, "MMS model confirmed — sampleRate=${mmsTts?.sampleRate() ?: -1} Hz")
+                }
                 readyListeners.forEach { listener ->
                     withContext(Dispatchers.Main) { listener() }
                 }
