@@ -353,17 +353,32 @@ class SherpaTtsManager(private val context: Context) {
             Log.i(TAG, "Kokoro voices: $voicesPath (exists=${voicesFile?.exists()})")
             Log.i(TAG, "Kokoro dataDir: $espeakDir (exists=$espeakExists)")
 
-            // Guard: native sherpa-onnx calls exit(255) when config validation
-            // fails (e.g. missing voices.bin, missing espeak-ng-data/phontab).
-            // Must not call OfflineTts(config) unless all required paths exist.
+            // ── EXIT(255) GUARD ────────────────────────────────────────
+            // libsherpa-onnx-jni.so calls ::exit(255) from C++ when config
+            // validation fails. A Kotlin try-catch CANNOT intercept a native
+            // exit() call — the process dies instantly.
+            // Do NOT proceed unless EVERY required file AND directory exist.
             if (voicesPath.isBlank()) {
-                Log.w(TAG, "Kokoro voices.bin not found — skipping Kokoro init to avoid native exit()")
+                Log.w(TAG, "Kokoro voices.bin not found — skipping to avoid native exit()")
                 return
             }
             if (!espeakExists) {
-                Log.w(TAG, "Kokoro espeak-ng-data not found — skipping Kokoro init to avoid native exit()")
+                Log.w(TAG, "Kokoro espeak-ng-data dir not found — skipping to avoid native exit()")
                 return
             }
+            // The native code ALSO checks for phontab inside the dataDir.
+            // If phontab is missing, exit(255) still fires despite dataDir existing.
+            val phontabFile = File(espeakDir, "phontab")
+            val phondataFile = File(espeakDir, "phondata")
+            if (!phontabFile.exists()) {
+                Log.w(TAG, "Kokoro phontab not found at ${phontabFile.absolutePath} — skipping to avoid native exit()")
+                return
+            }
+            if (!phondataFile.exists()) {
+                Log.w(TAG, "Kokoro phondata not found at ${phondataFile.absolutePath} — skipping to avoid native exit()")
+                return
+            }
+            Log.i(TAG, "Kokoro pre-flight checks passed — all required files present")
 
             val config = OfflineTtsConfig(
                 model = modelFile.absolutePath,
