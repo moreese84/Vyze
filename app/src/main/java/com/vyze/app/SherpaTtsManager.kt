@@ -124,18 +124,23 @@ class SherpaTtsManager(private val context: Context) {
         val tokensFile = File(modelDir, "tokens.txt")
 
         if (!modelFile.exists() || !tokensFile.exists()) {
-            // Extract from APK assets on first run
             modelDir.mkdirs()
             extractAsset("mms/model.onnx", modelDir)
             extractAsset("mms/tokens.txt", modelDir)
         }
 
-        if (!modelFile.exists() || !tokensFile.exists()) {
-            Log.w(TAG, "VITS model files not found after extraction")
-            return
-        }
-        if (modelFile.length() < 1_000_000L) {
-            Log.w(TAG, "VITS model.onnx too small (${modelFile.length()} bytes) — skipping")
+        // ── PRE-FLIGHT FILE VALIDATION ───────────────────────────
+        val issues = mutableListOf<String>()
+        if (!modelFile.exists()) issues.add("model.onnx not found")
+        else if (modelFile.length() < 1_000_000L) issues.add("model.onnx too small (${modelFile.length()} bytes, need >1MB)")
+        else Log.i(TAG, "model.onnx OK: ${modelFile.length()} bytes")
+
+        if (!tokensFile.exists()) issues.add("tokens.txt not found")
+        else if (tokensFile.length() == 0L) issues.add("tokens.txt is empty")
+        else Log.i(TAG, "tokens.txt OK: ${tokensFile.length()} bytes")
+
+        if (issues.isNotEmpty()) {
+            issues.forEach { Log.w(TAG, "PRE-FLIGHT FAIL: $it") }
             return
         }
 
@@ -170,7 +175,7 @@ class SherpaTtsManager(private val context: Context) {
                     input.copyTo(output)
                 }
             }
-            Log.i(TAG, "Extracted $assetName → ${targetFile.absolutePath}")
+            Log.i(TAG, "Extracted $assetName → ${targetFile.absolutePath} (${targetFile.length()} bytes)")
         } catch (e: Throwable) {
             Log.e(TAG, "Failed to extract $assetName: ${e.message}")
         }
@@ -180,7 +185,7 @@ class SherpaTtsManager(private val context: Context) {
 
     fun isReady(): Boolean = isInitialized && vitsTts != null
     fun isTtsAvailable(): Boolean = vitsTts != null
-    fun hasVoiceFor(language: String): Boolean = vitsTts != null  // single multilingual model
+    fun hasVoiceFor(language: String): Boolean = vitsTts != null
 
     fun speak(
         text: String,
@@ -262,9 +267,23 @@ class SherpaTtsManager(private val context: Context) {
                 yield()
                 if (gen != playbackGen.get()) return
 
+                // ── DIAGNOSTIC: log raw PCM output ───────────────
+                if (audio != null) {
+                    Log.i(TAG, "GENERATE RESULT: samples=${audio.samples.size}, sampleRate=${audio.sampleRate}")
+                    Log.i(TAG, "GENERATE: null=${audio == null}, samples.isEmpty=${audio.samples.isEmpty()}")
+                    if (audio.samples.isNotEmpty()) {
+                        val firstFew = audio.samples.take(5).joinToString(", ") { "%.4f".format(it) }
+                        val lastFew = audio.samples.takeLast(5).joinToString(", ") { "%.4f".format(it) }
+                        Log.i(TAG, "GENERATE: first5=[$firstFew], last5=[$lastFew]")
+                        Log.i(TAG, "GENERATE: min=${audio.samples.min()}, max=${audio.samples.max()}")
+                    }
+                } else {
+                    Log.w(TAG, "GENERATE RESULT: audio is NULL — model returned nothing")
+                }
+
                 if (audio != null && audio.samples.isNotEmpty()) {
-                    val dur = audio.samples.size / audio.sampleRate
-                    Log.d(TAG, "Synthesis OK — samples=${audio.samples.size}, rate=${audio.sampleRate}, dur=${dur}s")
+                    val dur = audio.samples.size / audio.sampleRate.toFloat()
+                    Log.i(TAG, "Playback: ${audio.samples.size} samples @ ${audio.sampleRate}Hz, ~${"%.1f".format(dur)}s")
                     playPcm16(audio.samples, audio.sampleRate, gen, item.volume)
                 } else {
                     Log.w(TAG, "Synthesis returned empty audio — null=${audio == null}, size=${audio?.samples?.size}")
@@ -284,30 +303,20 @@ class SherpaTtsManager(private val context: Context) {
         }
     }
 
-    // ── Audio Playback (PCM 16-bit) ─────────────────────────────
+    // ── Audio Playback (PCM 16-bit, MODE_STREAM) ────────────────
 
-    /**
-     * Play synthesized audio. Converts 32-bit float samples to 16-bit PCM
-     * for universal hardware compatibility. Uses MODE_STATIC for the full
-     * utterance (fits within typical TTS duration limits).
-     */
     private fun playPcm16(samples: FloatArray, sampleRate: Int, gen: Long, volume: Float) {
         if (samples.isEmpty() || sampleRate <= 0) return
 
         val durSec = samples.size / sampleRate.toFloat()
-        Log.d(TAG, "playPcm16: ${samples.size} samples @ ${sampleRate}Hz, ${"%.1f".format(durSec)}s, vol=${"%.2f".format(volume)}")
+        Log.i(TAG, "playPcm16: ${samples.size} samples @ ${sampleRate}Hz, ${"%.1f".format(durSec)}s, vol=${"%.2f".format(volume)}")
 
         // Convert FloatArray → ShortArray (PCM 16-bit)
         val pcm16 = ShortArray(samples.size)
         val v = volume.coerceIn(0f, 1f)
-        var peak: Float = 0f
         for (i in samples.indices) {
-            val s = (samples[i] * v).coerceIn(-1f, 1f)
-            pcm16[i] = (s * 32767f).toInt().toShort()
-            val abs = kotlin.math.abs(s)
-            if (abs > peak) peak = abs
+            pcm16[i] = (samples[i].coerceIn(-1f, 1f) * 32767f).toInt().toShort()
         }
-        Log.d(TAG, "PCM16 conversion: peak=${"%.3f".format(peak)}, ${pcm16.size} shorts")
 
         var track: AudioTrack? = null
         try {
@@ -321,7 +330,7 @@ class SherpaTtsManager(private val context: Context) {
                 return
             }
             val bufBytes = maxOf(minBuf, pcm16.size * 2)
-            Log.d(TAG, "minBuf=$minBuf, bufBytes=$bufBytes")
+            Log.i(TAG, "minBuf=$minBuf, bufBytes=$bufBytes")
 
             val t = AudioTrack.Builder()
                 .setAudioAttributes(
@@ -338,42 +347,62 @@ class SherpaTtsManager(private val context: Context) {
                         .build()
                 )
                 .setBufferSizeInBytes(bufBytes)
-                .setTransferMode(AudioTrack.MODE_STATIC)
+                .setTransferMode(AudioTrack.MODE_STREAM)
                 .build()
             track = t
 
-            val written = t.write(pcm16, 0, pcm16.size)
-            Log.d(TAG, "AudioTrack.write: $written shorts written of ${pcm16.size}")
-            if (written != pcm16.size) {
-                Log.w(TAG, "AudioTrack.write wrote $written, expected ${pcm16.size}")
+            if (t.state != AudioTrack.STATE_INITIALIZED) {
+                Log.w(TAG, "AudioTrack not initialized (state=${t.state})")
+                return
             }
+            Log.i(TAG, "AudioTrack INITIALIZED, state=${t.state}")
+
+            t.play()
+            Log.i(TAG, "AudioTrack.play(), state=${t.playState}")
 
             isPlaying.set(true)
-            t.play()
-            Log.d(TAG, "AudioTrack.play() called, state=${t.playState}")
 
-            // Wait for playback to finish
-            if (gen == playbackGen.get()) {
-                val totalFrames = pcm16.size
+            // Write in chunks (streaming mode)
+            val chunkSize = 2048
+            var offset = 0
+            var totalWritten = 0
+            while (offset < pcm16.size && isPlaying.get() && gen == playbackGen.get()) {
+                val end = minOf(offset + chunkSize, pcm16.size)
+                val written = t.write(pcm16, offset, end - offset)
+                if (written > 0) {
+                    totalWritten += written
+                    offset += written
+                } else if (written == 0) {
+                    Thread.sleep(10)
+                } else {
+                    Log.w(TAG, "AudioTrack.write error=$written")
+                    break
+                }
+            }
+            Log.i(TAG, "AudioTrack: wrote $totalWritten shorts of ${pcm16.size}")
+
+            // Wait for hardware drain
+            if (isPlaying.get() && gen == playbackGen.get()) {
                 var waitedMs = 0
                 while (isPlaying.get() && gen == playbackGen.get()) {
-                    if (t.playbackHeadPosition >= totalFrames) break
+                    if (t.playbackHeadPosition >= pcm16.size) break
                     Thread.sleep(50)
                     waitedMs += 50
-                    if (waitedMs > durSec.toInt() * 1000 + 2000) { // duration + 2s guard
-                        Log.w(TAG, "Playback wait timed out after ${waitedMs}ms")
+                    if (waitedMs > (durSec * 1000).toInt() + 3000) {
+                        Log.w(TAG, "Drain timeout after ${waitedMs}ms (headPos=${t.playbackHeadPosition})")
                         break
                     }
                 }
-                Log.d(TAG, "Playback done: headPos=${t.playbackHeadPosition}, waited=${waitedMs}ms")
+                Log.i(TAG, "Drain done: headPos=${t.playbackHeadPosition}, waited=${waitedMs}ms")
             }
         } catch (e: Throwable) {
             Log.e(TAG, "AudioTrack error: ${e.javaClass.simpleName}: ${e.message}")
+            if (gen == playbackGen.get()) isPlaying.set(false)
         } finally {
             try { track?.stop() } catch (_: Throwable) {}
             try { track?.release() } catch (_: Throwable) {}
             if (gen == playbackGen.get()) isPlaying.set(false)
-            Log.d(TAG, "AudioTrack released")
+            Log.i(TAG, "AudioTrack released")
         }
     }
 
