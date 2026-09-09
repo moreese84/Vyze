@@ -5,14 +5,8 @@ import android.util.Log
 /**
  * Sherpa-ONNX Text-to-Speech engine wrapper.
  *
- * Supports Kokoro (EN/ZH) and Meta MMS (multilingual including Malay) models.
+ * Uses a single VITS model (Meta MMS) for multilingual synthesis.
  * All inference runs fully offline on-device.
- *
- * ## Safety
- * The native libsherpa-onnx-jni.so calls exit(255) when config validation
- * fails. This class wraps all JNI calls in try-catch blocks and never calls
- * into the native layer unless pre-conditions (file existence checks) have
- * passed at the call site.
  */
 class OfflineTts(
     private val config: OfflineTtsConfig
@@ -25,16 +19,12 @@ class OfflineTts(
 
         private var nativeLibLoaded = false
 
-        /**
-         * Load the native JNI library. Safe to call multiple times.
-         * Returns true if the library was loaded successfully.
-         */
         fun ensureLoaded(): Boolean {
             if (nativeLibLoaded) return true
             try {
                 System.loadLibrary("sherpa-onnx-jni")
                 nativeLibLoaded = true
-                Log.i(TAG, "sherpa-onnx-jni loaded successfully")
+                Log.i(TAG, "sherpa-onnx-jni loaded")
                 return true
             } catch (e: UnsatisfiedLinkError) {
                 Log.e(TAG, "Failed to load sherpa-onnx-jni: ${e.message}")
@@ -48,22 +38,16 @@ class OfflineTts(
             try {
                 ptr = newFromFile(config)
             } catch (e: Throwable) {
-                Log.e(TAG, "newFromFile threw: ${e.javaClass.simpleName}: ${e.message}")
+                Log.e(TAG, "newFromFile: ${e.javaClass.simpleName}: ${e.message}")
                 ptr = 0L
             }
         } else {
-            Log.w(TAG, "Native library not loaded — cannot create OfflineTts instance")
+            Log.w(TAG, "Native library not loaded")
         }
-        if (ptr == 0L) {
-            Log.w(TAG, "Failed to create OfflineTts from config — engine will be unavailable")
-        }
+        if (ptr == 0L) Log.w(TAG, "OfflineTts creation failed — TTS unavailable")
     }
 
-    fun generate(
-        text: String,
-        sid: Int = 0,
-        speed: Float = 1.0f
-    ): GeneratedAudio? {
+    fun generate(text: String, sid: Int = 0, speed: Float = 1.0f): GeneratedAudio? {
         if (ptr == 0L) return null
         synchronized(lock) {
             if (ptr == 0L) return null
@@ -89,37 +73,22 @@ class OfflineTts(
 
     fun release() {
         synchronized(lock) {
-            if (ptr != 0L) {
-                delete(ptr)
-                ptr = 0
-            }
+            if (ptr != 0L) { delete(ptr); ptr = 0L }
         }
     }
 
-    protected fun finalize() {
-        release()
-    }
+    protected fun finalize() { release() }
 
-    /** JNI: native implementation of OfflineTts.generate(). */
-    private external fun generateImpl(
-        ptr: Long,
-        text: String,
-        sid: Int,
-        speed: Float
-    ): GeneratedAudio?
-
+    private external fun generateImpl(ptr: Long, text: String, sid: Int, speed: Float): GeneratedAudio?
     private external fun newFromFile(config: OfflineTtsConfig): Long
     private external fun delete(ptr: Long)
     private external fun getSampleRate(ptr: Long): Int
     private external fun getNumSpeakers(ptr: Long): Int
 }
 
-data class GeneratedAudio(
-    val sampleRate: Int,
-    val samples: FloatArray
-)
+data class GeneratedAudio(val sampleRate: Int, val samples: FloatArray)
 
-// ── Model Config (Vits) ──────────────────────────────────────────────
+// ── VITS Model Config ─────────────────────────────────────────
 
 class OfflineTtsVitsModelConfig(
     @JvmField val model: String = "",
@@ -132,89 +101,52 @@ class OfflineTtsVitsModelConfig(
     @JvmField val lengthScale: Float = 1.0f
 )
 
-// ── Model Config (Matcha) ────────────────────────────────────────────
+// ── Unused config stubs (JNI requires the fields on OfflineTtsModelConfig) ──
 
 class OfflineTtsMatchaModelConfig(
-    @JvmField val acousticModel: String = "",
-    @JvmField val vocoder: String = "",
-    @JvmField val lexicon: String = "",
-    @JvmField val tokens: String = "",
-    @JvmField val dataDir: String = "",
-    @JvmField val dictDir: String = "",
-    @JvmField val noiseScale: Float = 1.0f,
-    @JvmField val lengthScale: Float = 1.0f
+    @JvmField val acousticModel: String = "", @JvmField val vocoder: String = "",
+    @JvmField val lexicon: String = "", @JvmField val tokens: String = "",
+    @JvmField val dataDir: String = "", @JvmField val dictDir: String = "",
+    @JvmField val noiseScale: Float = 1.0f, @JvmField val lengthScale: Float = 1.0f
 )
-
-// ── Model Config (Kokoro) ────────────────────────────────────────────
 
 class OfflineTtsKokoroModelConfig(
-    @JvmField val model: String = "",
-    @JvmField val voices: String = "",
-    @JvmField val tokens: String = "",
-    @JvmField val dataDir: String = "",
-    @JvmField val lengthScale: Float = 1.0f,
-    @JvmField val lexicon: String = "",
-    @JvmField val lang: String = "",
-    @JvmField val dictDir: String = ""
+    @JvmField val model: String = "", @JvmField val voices: String = "",
+    @JvmField val tokens: String = "", @JvmField val dataDir: String = "",
+    @JvmField val lengthScale: Float = 1.0f, @JvmField val lexicon: String = "",
+    @JvmField val lang: String = "", @JvmField val dictDir: String = ""
 )
-
-// ── Model Config (ZipVoice) ──────────────────────────────────────────
 
 class OfflineTtsZipVoiceModelConfig(
-    @JvmField val tokens: String = "",
-    @JvmField val encoder: String = "",
-    @JvmField val decoder: String = "",
-    @JvmField val vocoder: String = "",
-    @JvmField val dataDir: String = "",
-    @JvmField val lexicon: String = "",
-    @JvmField val featScale: Float = 0.1f,
-    @JvmField val tShift: Float = 0.5f,
-    @JvmField val targetRms: Float = 0.1f,
-    @JvmField val guidanceScale: Float = 1.0f
+    @JvmField val tokens: String = "", @JvmField val encoder: String = "",
+    @JvmField val decoder: String = "", @JvmField val vocoder: String = "",
+    @JvmField val dataDir: String = "", @JvmField val lexicon: String = "",
+    @JvmField val featScale: Float = 0.1f, @JvmField val tShift: Float = 0.5f,
+    @JvmField val targetRms: Float = 0.1f, @JvmField val guidanceScale: Float = 1.0f
 )
 
-// ── Model Config (Kitten) ────────────────────────────────────────────
-
 class OfflineTtsKittenModelConfig(
-    @JvmField val model: String = "",
-    @JvmField val voices: String = "",
-    @JvmField val tokens: String = "",
-    @JvmField val dataDir: String = "",
+    @JvmField val model: String = "", @JvmField val voices: String = "",
+    @JvmField val tokens: String = "", @JvmField val dataDir: String = "",
     @JvmField val lengthScale: Float = 1.0f
 )
 
-// ── Model Config (Pocket) ────────────────────────────────────────────
-
 class OfflineTtsPocketModelConfig(
-    @JvmField val lmFlow: String = "",
-    @JvmField val lmMain: String = "",
-    @JvmField val encoder: String = "",
-    @JvmField val decoder: String = "",
-    @JvmField val textConditioner: String = "",
-    @JvmField val vocabJson: String = "",
-    @JvmField val tokenScoresJson: String = "",
-    @JvmField val voiceEmbeddingCacheCapacity: Int = 0
+    @JvmField val lmFlow: String = "", @JvmField val lmMain: String = "",
+    @JvmField val encoder: String = "", @JvmField val decoder: String = "",
+    @JvmField val textConditioner: String = "", @JvmField val vocabJson: String = "",
+    @JvmField val tokenScoresJson: String = "", @JvmField val voiceEmbeddingCacheCapacity: Int = 0
 )
 
-// ── Model Config (Supertonic) ────────────────────────────────────────
-
 class OfflineTtsSupertonicModelConfig(
-    @JvmField val durationPredictor: String = "",
-    @JvmField val textEncoder: String = "",
-    @JvmField val vectorEstimator: String = "",
-    @JvmField val vocoder: String = "",
-    @JvmField val ttsJson: String = "",
-    @JvmField val unicodeIndexer: String = "",
+    @JvmField val durationPredictor: String = "", @JvmField val textEncoder: String = "",
+    @JvmField val vectorEstimator: String = "", @JvmField val vocoder: String = "",
+    @JvmField val ttsJson: String = "", @JvmField val unicodeIndexer: String = "",
     @JvmField val voiceStyle: String = ""
 )
 
-// ── Top-level Model Config ──────────────────────────────────────────
+// ── Top-level Model Config ────────────────────────────────────
 
-/**
- * Matches the JNI layout from sherpa-onnx java-api.
- * The native code calls GetObjectField on each model sub-config
- * and GetObjectField/GetIntField/GetBooleanField on the scalar fields.
- */
 class OfflineTtsModelConfig(
     @JvmField val vits: OfflineTtsVitsModelConfig = OfflineTtsVitsModelConfig(),
     @JvmField val matcha: OfflineTtsMatchaModelConfig = OfflineTtsMatchaModelConfig(),
@@ -228,12 +160,8 @@ class OfflineTtsModelConfig(
     @JvmField val provider: String = "cpu"
 )
 
-// ── Top-level TTS Config ────────────────────────────────────────────
+// ── Top-level TTS Config ──────────────────────────────────────
 
-/**
- * Matches the JNI layout from sherpa-onnx java-api.
- * OfflineTtsConfig wraps OfflineTtsModelConfig plus global settings.
- */
 class OfflineTtsConfig(
     @JvmField val model: OfflineTtsModelConfig = OfflineTtsModelConfig(),
     @JvmField val ruleFsts: String = "",
@@ -241,41 +169,15 @@ class OfflineTtsConfig(
     @JvmField val maxNumSentences: Int = 1,
     @JvmField val silenceScale: Float = 0.2f
 ) {
-    /**
-     * Convenience constructor for the Kokoro model (EN/ZH neural TTS).
-     * Populates only the [Kokoro][OfflineTtsKokoroModelConfig] sub-config.
-     */
-    constructor(
-        model: String = "",
-        tokens: String = "",
-        dataDir: String = "",
-        voices: String = "",
-        numThreads: Int = 2,
-        debug: Boolean = false
-    ) : this(
-        model = OfflineTtsModelConfig(
-            kokoro = OfflineTtsKokoroModelConfig(
-                model = model,
-                tokens = tokens,
-                dataDir = dataDir,
-                voices = voices
-            ),
-            numThreads = numThreads,
-            debug = debug,
-            provider = "cpu"
-        ),
-        maxNumSentences = 1
-    )
-
     companion object {
         /**
-         * Build a config for a VITS-based model (e.g. Meta MMS for Malay).
-         * Populates only the [vits][OfflineTtsVitsModelConfig] sub-config.
+         * Build a config for a VITS-based model (e.g. Meta MMS).
+         * Populates only the [vits] sub-config; all other model slots stay default.
          */
         fun forVits(
             model: String,
             tokens: String,
-            dataDir: String,
+            dataDir: String = "",
             numThreads: Int = 2,
             debug: Boolean = false
         ): OfflineTtsConfig {
