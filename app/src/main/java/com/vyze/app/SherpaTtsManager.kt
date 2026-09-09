@@ -298,8 +298,16 @@ class SherpaTtsManager(private val context: Context) {
             Log.i(TAG, "Kokoro not in external storage — extracting from assets")
             modelFile = extractAsset("sherpa-models/kokoro/model.onnx", "kokoro")
             tokensFile = extractAsset("sherpa-models/kokoro/tokens.txt", "kokoro")
+        }
+        // Always attempt to extract voices.bin and espeak-ng-data — they may have
+        // been added in a newer APK build (the check above only gates model.onnx).
+        if (voicesFile?.exists() != true) {
+            Log.i(TAG, "Kokoro voices.bin not in external storage — extracting from assets")
             voicesFile = extractAsset("sherpa-models/kokoro/voices.bin", "kokoro")
-            // Recursively extract espeak-ng-data subtree (phontab, phon dictionaries, etc.)
+        }
+        val espeakDir = File(kokoroModelDir, "espeak-ng-data")
+        if (!espeakDir.exists()) {
+            Log.i(TAG, "Kokoro espeak-ng-data not in external storage — extracting from assets")
             extractAssetTree("sherpa-models/kokoro/espeak-ng-data", "kokoro/espeak-ng-data")
         }
 
@@ -312,10 +320,24 @@ class SherpaTtsManager(private val context: Context) {
             val modelDir = modelFile.parentFile?.absolutePath ?: ""
             val voicesPath = if (voicesFile?.exists() == true) voicesFile.absolutePath else ""
             val espeakDir = File(modelDir, "espeak-ng-data").absolutePath
+            val espeakExists = File(espeakDir).exists()
             Log.i(TAG, "Kokoro model: ${modelFile.absolutePath}")
             Log.i(TAG, "Kokoro tokens: ${tokensFile.absolutePath}")
             Log.i(TAG, "Kokoro voices: $voicesPath (exists=${voicesFile?.exists()})")
-            Log.i(TAG, "Kokoro dataDir: $espeakDir (exists=${File(espeakDir).exists()})")
+            Log.i(TAG, "Kokoro dataDir: $espeakDir (exists=$espeakExists)")
+
+            // Guard: native sherpa-onnx calls exit(255) when config validation
+            // fails (e.g. missing voices.bin, missing espeak-ng-data/phontab).
+            // Must not call OfflineTts(config) unless all required paths exist.
+            if (voicesPath.isBlank()) {
+                Log.w(TAG, "Kokoro voices.bin not found — skipping Kokoro init to avoid native exit()")
+                return
+            }
+            if (!espeakExists) {
+                Log.w(TAG, "Kokoro espeak-ng-data not found — skipping Kokoro init to avoid native exit()")
+                return
+            }
+
             val config = OfflineTtsConfig(
                 model = modelFile.absolutePath,
                 tokens = tokensFile.absolutePath,
@@ -370,7 +392,13 @@ class SherpaTtsManager(private val context: Context) {
                 debug = true
             )
             mmsTts = OfflineTts(config)
-            Log.i(TAG, "MMS model loaded — sampleRate=${mmsTts?.sampleRate()}")
+            val sr = mmsTts?.sampleRate() ?: -1
+            Log.i(TAG, "MMS model loaded — sampleRate=$sr")
+            if (sr <= 0) {
+                Log.w(TAG, "MMS model returned invalid sample rate — unloading")
+                mmsTts?.release()
+                mmsTts = null
+            }
         } catch (e: Throwable) {
             Log.e(TAG, "Failed to load MMS: ${e.message}")
             mmsTts = null
