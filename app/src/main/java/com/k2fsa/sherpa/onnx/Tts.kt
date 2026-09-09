@@ -1,6 +1,5 @@
 package com.k2fsa.sherpa.onnx
 
-import android.content.Context
 import android.util.Log
 
 /**
@@ -8,6 +7,12 @@ import android.util.Log
  *
  * Supports Kokoro (EN/ZH) and Meta MMS (multilingual including Malay) models.
  * All inference runs fully offline on-device.
+ *
+ * ## Safety
+ * The native libsherpa-onnx-jni.so calls exit(255) when config validation
+ * fails. This class wraps all JNI calls in try-catch blocks and never calls
+ * into the native layer unless pre-conditions (file existence checks) have
+ * passed at the call site.
  */
 class OfflineTts(
     private val config: OfflineTtsConfig
@@ -18,22 +23,36 @@ class OfflineTts(
     companion object {
         private const val TAG = "SherpaOfflineTts"
 
-        init {
+        private var nativeLibLoaded = false
+
+        /**
+         * Load the native JNI library. Safe to call multiple times.
+         * Returns true if the library was loaded successfully.
+         */
+        fun ensureLoaded(): Boolean {
+            if (nativeLibLoaded) return true
             try {
                 System.loadLibrary("sherpa-onnx-jni")
+                nativeLibLoaded = true
                 Log.i(TAG, "sherpa-onnx-jni loaded successfully")
+                return true
             } catch (e: UnsatisfiedLinkError) {
                 Log.e(TAG, "Failed to load sherpa-onnx-jni: ${e.message}")
+                return false
             }
         }
     }
 
     init {
-        try {
-            ptr = newFromFile(config)
-        } catch (e: Throwable) {
-            Log.e(TAG, "newFromFile threw: ${e.javaClass.simpleName}: ${e.message}")
-            ptr = 0L
+        if (nativeLibLoaded) {
+            try {
+                ptr = newFromFile(config)
+            } catch (e: Throwable) {
+                Log.e(TAG, "newFromFile threw: ${e.javaClass.simpleName}: ${e.message}")
+                ptr = 0L
+            }
+        } else {
+            Log.w(TAG, "Native library not loaded — cannot create OfflineTts instance")
         }
         if (ptr == 0L) {
             Log.w(TAG, "Failed to create OfflineTts from config — engine will be unavailable")
@@ -45,6 +64,7 @@ class OfflineTts(
         sid: Int = 0,
         speed: Float = 1.0f
     ): GeneratedAudio? {
+        if (ptr == 0L) return null
         synchronized(lock) {
             if (ptr == 0L) return null
             return generateImpl(ptr, text, sid, speed)
@@ -52,6 +72,7 @@ class OfflineTts(
     }
 
     fun sampleRate(): Int {
+        if (ptr == 0L) return 0
         synchronized(lock) {
             if (ptr == 0L) return 0
             return getSampleRate(ptr)
@@ -59,6 +80,7 @@ class OfflineTts(
     }
 
     fun numSpeakers(): Int {
+        if (ptr == 0L) return 0
         synchronized(lock) {
             if (ptr == 0L) return 0
             return getNumSpeakers(ptr)
