@@ -256,10 +256,12 @@ class SherpaTtsManager(private val context: Context) {
                 val tts = selectModelForLocale(item.locale)
                 if (tts == null) {
                     Log.w(TAG, "No TTS model available for locale: ${item.locale}")
+        Log.d(TAG, "Kokoro available=${isKokoroAvailable()}, MMS available=${isMmsAvailable()}, isInitialized=$isInitialized")
                     withContext(Dispatchers.Main) { item.onDone?.invoke() }
                     continue
                 }
 
+                Log.d(TAG, "Synthesizing text: \"${item.text.take(80)}\" (len=${item.text.length}, locale=${item.locale})")
                 val audio = withContext(Dispatchers.Default) {
                     tts.generate(item.text, speed = item.speed)
                 }
@@ -267,9 +269,13 @@ class SherpaTtsManager(private val context: Context) {
                 if (gen != playbackGen.get()) return // stopped — queue was flushed
 
                 if (audio != null && audio.samples.isNotEmpty()) {
+                    Log.d(TAG, "Synthesis OK — samples=${audio.samples.size}, sampleRate=${audio.sampleRate}, duration=${audio.samples.size / audio.sampleRate}s")
                     playAudio(audio.samples, audio.sampleRate, gen, item.volume)
                 } else {
-                    Log.w(TAG, "TTS generation returned empty audio")
+                    Log.w(TAG, "TTS generation returned empty audio — null=${audio == null}, samples=${audio?.samples?.size}")
+                    if (audio != null) {
+                        Log.w(TAG, "samples.size=${audio.samples.size}, sampleRate=${audio.sampleRate}")
+                    }
                 }
 
                 if (gen == playbackGen.get()) {
@@ -498,18 +504,36 @@ class SherpaTtsManager(private val context: Context) {
      * actually played them. Cancellable two ways: [stop] bumps the playback
      * generation (checked between chunks) and flips [isPlaying]; both exit the
      * loops early so barge-in is responsive.
+     *
+     * Sherpa-ONNX Kokoro outputs 32-bit float PCM samples at the model's native
+     * sample rate (typically 24000 Hz). The AudioTrack is configured with
+     * ENCODING_PCM_FLOAT and the dynamic sample rate from the generated audio.
      */
     private fun playAudio(samples: FloatArray, sampleRate: Int, gen: Long, volume: Float) {
+        if (samples.isEmpty()) {
+            Log.w(TAG, "playAudio: samples array is empty — nothing to play")
+            return
+        }
+        if (sampleRate <= 0) {
+            Log.w(TAG, "playAudio: invalid sampleRate=$sampleRate — cannot play")
+            return
+        }
+
+        val durationSec = samples.size / sampleRate.toFloat()
+        Log.d(TAG, "playAudio: samples=${samples.size}, sampleRate=$sampleRate, duration=%.1fs, volume=%.2f"
+            .format(durationSec, volume))
+
         var track: AudioTrack? = null
         try {
             val minBuf = AudioTrack.getMinBufferSize(
                 sampleRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_FLOAT
             )
             if (minBuf <= 0) {
-                Log.w(TAG, "playAudio: invalid min buffer size $minBuf")
+                Log.w(TAG, "playAudio: getMinBufferSize returned $minBuf for sr=$sampleRate — playback unavailable")
                 return
             }
             val bufferSize = maxOf(minBuf, sampleRate / 2 * 4) // at least 0.5s
+            Log.d(TAG, "playAudio: minBuf=$minBuf, bufferSize=$bufferSize")
 
             val t = AudioTrack.Builder()
                 .setAudioAttributes(
@@ -531,6 +555,7 @@ class SherpaTtsManager(private val context: Context) {
             track = t
 
             t.play()
+            Log.d(TAG, "playAudio: AudioTrack created and playing (state=${t.playState})")
             isPlaying.set(true)
 
             // Stream scaled samples in chunks with NON_BLOCKING writes and a
@@ -538,43 +563,67 @@ class SherpaTtsManager(private val context: Context) {
             // every iteration re-checks the playback generation first.
             val chunkFloats = 4096
             var offset = 0
+            var totalWritten = 0
             while (offset < samples.size && isPlaying.get() && gen == playbackGen.get()) {
                 val end = minOf(offset + chunkFloats, samples.size)
                 val bytes = (end - offset) * 4
                 val byteBuffer = ByteBuffer.allocate(bytes).order(ByteOrder.LITTLE_ENDIAN)
                 val floatBuffer = byteBuffer.asFloatBuffer()
-                for (k in offset until end) floatBuffer.put(samples[k] * volume)
+                for (k in offset until end) {
+                    floatBuffer.put(samples[k] * volume.coerceIn(0f, 1f))
+                }
 
                 var bufOffset = 0
+                var writeAttempts = 0
                 while (bufOffset < bytes && isPlaying.get() && gen == playbackGen.get()) {
-                    val written = t.write(
-                        byteBuffer.array(), bufOffset, bytes - bufOffset,
-                        AudioTrack.WRITE_NON_BLOCKING
-                    )
+                    val written = try {
+                        t.write(
+                            byteBuffer.array(), bufOffset, bytes - bufOffset,
+                            AudioTrack.WRITE_NON_BLOCKING
+                        )
+                    } catch (e: IllegalStateException) {
+                        Log.e(TAG, "AudioTrack.write IllegalStateException at offset=$offset: ${e.message}")
+                        return
+                    }
                     if (written < 0) {
-                        Log.e(TAG, "AudioTrack.write failed (device may be disconnected): $written")
+                        Log.e(TAG, "AudioTrack.write error=$written at offset=$offset — aborting playback")
                         return
                     }
                     if (written == 0) {
+                        writeAttempts++
+                        if (writeAttempts > 50) { // ~500ms stall guard
+                            Log.w(TAG, "AudioTrack.write stalled for 500ms at offset=$offset — aborting")
+                            return
+                        }
                         Thread.sleep(10) // buffer full — retry shortly
                     } else {
                         bufOffset += written
+                        writeAttempts = 0
                     }
                 }
+                totalWritten += (end - offset)
                 offset = end
             }
+            Log.d(TAG, "playAudio: streaming complete — totalWritten=$totalWritten samples, interrupted=${!isPlaying.get() || gen != playbackGen.get()}")
 
             // Wait for the hardware to drain what was written — playbackHeadPosition
             // reaches totalFrames only when the speaker has finished the utterance.
             if (isPlaying.get() && gen == playbackGen.get()) {
                 val totalFrames = samples.size
+                var drainWaitMs = 0
                 while (isPlaying.get() && gen == playbackGen.get()) {
                     if (t.playbackHeadPosition >= totalFrames) break
                     Thread.sleep(50)
+                    drainWaitMs += 50
+                    if (drainWaitMs > 5000) { // 5s safety timeout
+                        Log.w(TAG, "playAudio: drain wait timed out after 5s (headPos=${t.playbackHeadPosition}, total=$totalFrames)")
+                        break
+                    }
                 }
+                Log.d(TAG, "playAudio: drain complete after ${drainWaitMs}ms (headPos=${t.playbackHeadPosition}, totalFrames=$totalFrames)")
             }
         } catch (e: Throwable) {
-            Log.e(TAG, "Audio playback failed: ${e.message}")
+            Log.e(TAG, "playAudio: exception during playback: ${e.javaClass.simpleName}: ${e.message}")
         } finally {
             // track.stop() discards anything still buffered — barge-in is
             // silent immediately, not after the buffer drains.
@@ -585,6 +634,7 @@ class SherpaTtsManager(private val context: Context) {
             if (gen == playbackGen.get()) {
                 isPlaying.set(false)
             }
+            Log.d(TAG, "playAudio: AudioTrack released")
         }
     }
 
