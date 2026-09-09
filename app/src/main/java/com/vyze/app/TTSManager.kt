@@ -17,32 +17,24 @@ import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * Thread-safe Text-to-Speech manager for the Vyze accessibility app.
+ * Singleton Text-to-Speech manager for the Vyze accessibility app.
  *
- * ## Utterance ID Tracking (Deterministic Completion Detection)
- * Every speak() call registers a unique utteranceId in [pendingUtteranceIds].
- * UtteranceProgressListener.onDone/onError removes the ID.
- * [hasPendingSpeech] returns true iff the set is non-empty — guaranteed
- * 100% accurate, no polling, no transient false readings.
+ * ## Single Instance
+ * This class is a strict singleton — only one instance exists per process.
+ * Previously, VyzeApplication + TtsViewModel each created their own TTSManager,
+ * causing double model extraction and conflicting native JNI state.
  *
  * ## Offline Engine
- * All speech is produced by Sherpa-ONNX (Kokoro for EN/ZH, MMS for MS/other)
- * — fully offline, no Google TTS dependency. The Android TextToSpeech types
+ * All speech is produced by Sherpa-ONNX VITS (Meta MMS multilingual model).
+ * Fully offline, no Google TTS dependency. The Android TextToSpeech types
  * appear only in signatures kept for call-site compatibility.
- *
- * ## Volume Stability
- * TTS plays through the MEDIA stream (USAGE_MEDIA) so it matches the
- * phone's normal media volume exactly: the hardware volume buttons keep
- * working as usual and every utterance outputs at the identical, stable
- * gain for the entire session. The optional in-app volume setting is
- * applied by SherpaTtsManager at AudioTrack scaling time.
  *
  * ## Audio Focus
  * Requests AUDIOFOCUS_GAIN (permanent) for the entire app session.
  * Focus is held from app open to app close. Never released per-utterance
  * or on stop() — only on onDestroy().
  */
-class TTSManager(context: Context) {
+class TTSManager private constructor(context: Context) {
 
     // ── Sherpa-ONNX TTS (offline, no Google dependency) ────────
     // Shared singleton: two TTSManager instances exist (VyzeApplication +
@@ -135,19 +127,9 @@ class TTSManager(context: Context) {
     // ── Initialization ────────────────────────────────────────────
 
     init {
-        Log.i(TAG, "TTSManager created — offline Sherpa TTS only (Kokoro + MMS), no Google TTS")
-        // Do not initialize the Android TextToSpeech Google engine.
-        // All spoken output is produced by Sherpa-ONNX (Kokoro for EN/ZH, MMS for MS/other).
-        // Model loading is async; the ready callback below flips isInitialized
-        // and drains anything spoken before the models finished loading.
-        // Posted to the main handler so the ready path never runs inside the
-        // constructor — callers assign onReady only after construction, and a
-        // shared already-loaded engine would otherwise fire it too early.
-        sherpaTts.addOnReady { mainHandler.post { onSherpaReady() } }
-        // Model loading is now lazy (triggered by first speak() call).
-        // No longer calling initialize() eagerly — the old call started model
-        // extraction + JNI OfflineTts creation in a coroutine at construction
-        // time, which triggered native exit(255) on config validation failure.
+        Log.i(TAG, "[TTSManager] Single-File VITS Engine Active (Sherpa-ONNX MMS multilingual)")
+        // Model loading is lazy — triggered by first speak() call to SherpaTtsManager.
+        // No eager initialization to avoid native exit(255) during startup.
     }
 
     /** Runs on the main thread once Sherpa model loading has finished. */
@@ -742,8 +724,19 @@ class TTSManager(context: Context) {
         }
     }
 
-    companion object {
-        private const val TAG = "TTSManager"
+
+
+companion object {
+        private const val TAG = "[TTSManager]"
+
+        @Volatile
+        private var instance: TTSManager? = null
+
+        fun getInstance(context: Context): TTSManager {
+            return instance ?: synchronized(this) {
+                instance ?: TTSManager(context.applicationContext).also { instance = it }
+            }
+        }
 
         const val PREFS_NAME = "vyze_tts_settings"
         const val KEY_SPEECH_RATE = "speech_rate"
@@ -751,33 +744,17 @@ class TTSManager(context: Context) {
         const val KEY_VOLUME = "volume"
         const val KEY_LANGUAGE = "tts_language"
         const val KEY_VOICE_NAME = "tts_voice_name"
-
-        /** Sentinel value: auto-pick the best installed voice. */
         const val VOICE_AUTO = "automatic"
-
-        /** Set once the weak-voice install prompt has been answered/skipped. */
         const val KEY_VOICE_PROMPT_RESOLVED = "voice_prompt_resolved"
-
-        /** Set once the user has used Voice Settings (dismisses the cue hint). */
         const val KEY_VOICE_SETTINGS_KNOWN = "voice_settings_known"
-
         const val DEFAULT_SPEECH_RATE = 1.0f
         const val DEFAULT_PITCH = 1.0f
         const val DEFAULT_VOLUME = 1.0f
-
         const val LANGUAGE_ENGLISH = "en"
         const val LANGUAGE_MALAY = "ms"
         const val LANGUAGE_CHINESE = "zh"
-
         val SUPPORTED_LANGUAGES = listOf(LANGUAGE_ENGLISH, LANGUAGE_MALAY, LANGUAGE_CHINESE)
 
-        /**
-         * The language the user DECLARED in Vyze's voice settings (persisted),
-         * mapped to a Locale (US by default). This drives the speech-recognition
-         * language and the prompt output language from launch — not just after
-         * the first spoken exchange — so a Malay-speaking user on an English
-         * phone gets Malay recognition and Malay voice output consistently.
-         */
         fun storedLanguageLocale(context: android.content.Context): Locale {
             val key = context.getSharedPreferences(PREFS_NAME, android.content.Context.MODE_PRIVATE)
                 .getString(KEY_LANGUAGE, LANGUAGE_ENGLISH) ?: LANGUAGE_ENGLISH
@@ -793,30 +770,10 @@ class TTSManager(context: Context) {
         const val DRAIN_RETRY_INTERVAL_MS = 200L
         const val DRAIN_RETRY_MS = 5000L
 
-        // ── Voice Quality & Prosody Constants ───────────────────────
-
-        /**
-         * English-voice respellings for brand names generic EN voices misread.
-         * Key: the word as printed on the product. Value: a respelling the
-         * engine speaks the way the brand is actually said.
-         *
-         * "Maggi" (instant noodles): Google EN reads it "MAY-jee"; the brand
-         * is said "MAY-ghee" (hard g). "Mayghee" produces exactly that.
-         * Malay/Chinese voices already read these brands correctly.
-         */
         private val ENGLISH_PRONUNCIATION_OVERRIDES = mapOf(
             "maggi" to "Mayghee"
         )
-
-        /**
-         * Warmer pitch (-2%): eliminates flat, metallic synth tones.
-         */
         private const val WARM_PITCH = 0.96f
-
-        /**
-         * Conversational rate (-2%): slightly slower than default to
-         * allow natural cadence and emphasis.
-         */
         private const val WARM_RATE = 0.98f
     }
 }

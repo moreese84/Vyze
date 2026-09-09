@@ -2,39 +2,25 @@ package com.vyze.app
 
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
-import androidx.lifecycle.ViewModel
 
 /**
- * ViewModel that holds a singleton [TTSManager] instance.
+ * ViewModel that provides the shared [TTSManager] singleton.
  *
- * Ensures all fragments (CameraFragment, TtsSettingsFragment, etc.)
- * share the same TTS engine and settings state. The TTSManager is
- * created once and survives configuration changes within the same
- * Activity scope.
- *
- * Usage in Fragment:
- * ```kotlin
- * val ttsViewModel: TtsViewModel by activityViewModels()
- * val ttsManager = ttsViewModel.ttsManager
- * ```
+ * TTSManager is now a strict process-wide singleton ([TTSManager.getInstance]),
+ * so this ViewModel simply exposes it rather than creating a new instance.
+ * Previously, both VyzeApplication and this ViewModel created independent
+ * TTSManager instances, causing double native JNI state and silent audio.
  */
 class TtsViewModel(application: Application) : AndroidViewModel(application) {
 
-    /**
-     * Singleton TTSManager instance. Initialized once per ViewModel lifecycle.
-     */
     val ttsManager: TTSManager by lazy {
-        TTSManager(application.applicationContext).apply {
-            // Prefer offline Sherpa TTS when model files are present; otherwise fall
-            // back to the default Google/system TTS engine.
-            // Sherpa model files ship in src/main/assets (kokoro/ + mms/) and are
-            // extracted to the app-scoped external directory on first use.
-            applySettings(application.applicationContext)
-        }
+        TTSManager.getInstance(application.applicationContext)
     }
 
     override fun onCleared() {
         super.onCleared()
-        ttsManager.onDestroy()
+        // Do NOT call ttsManager.onDestroy() — the singleton lives for the
+        // process lifetime. Calling onDestroy from a ViewModel's onCleared
+        // would tear down TTS for other consumers (VyzeApplication, etc.).
     }
 }
