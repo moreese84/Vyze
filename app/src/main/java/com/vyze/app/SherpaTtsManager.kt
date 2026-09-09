@@ -366,8 +366,6 @@ class SherpaTtsManager(private val context: Context) {
                 Log.w(TAG, "Kokoro espeak-ng-data dir not found — skipping to avoid native exit()")
                 return
             }
-            // The native code ALSO checks for phontab inside the dataDir.
-            // If phontab is missing, exit(255) still fires despite dataDir existing.
             val phontabFile = File(espeakDir, "phontab")
             val phondataFile = File(espeakDir, "phondata")
             if (!phontabFile.exists()) {
@@ -378,21 +376,59 @@ class SherpaTtsManager(private val context: Context) {
                 Log.w(TAG, "Kokoro phondata not found at ${phondataFile.absolutePath} — skipping to avoid native exit()")
                 return
             }
-            Log.i(TAG, "Kokoro pre-flight checks passed — all required files present")
+            // Additional sanity checks: file sizes > 0
+            if (modelFile.length() <= 0) {
+                Log.w(TAG, "Kokoro model.onnx is empty — skipping to avoid native exit()")
+                return
+            }
+            if (tokensFile.length() <= 0) {
+                Log.w(TAG, "Kokoro tokens.txt is empty — skipping to avoid native exit()")
+                return
+            }
+            if (voicesFile?.length() ?: 0L <= 0L) {
+                Log.w(TAG, "Kokoro voices.bin is empty — skipping to avoid native exit()")
+                return
+            }
+            Log.i(TAG, "Kokoro pre-flight checks passed — all required files present and non-empty")
+            // Log dataDir contents for debugging native validation failures
+            val dataDirFiles = File(espeakDir).list()?.take(20)?.joinToString(", ") ?: "(empty)"
+            Log.i(TAG, "espeak-ng-data contents (first 20): $dataDirFiles")
 
-            val config = OfflineTtsConfig(
+            val kokoroCfg = com.k2fsa.sherpa.onnx.OfflineTtsKokoroModelConfig(
                 model = modelFile.absolutePath,
+                voices = voicesPath,
                 tokens = tokensFile.absolutePath,
                 dataDir = espeakDir,
-                voices = voicesPath,
-                numThreads = 2,
-                debug = true
+                lengthScale = 1.0f,
+                lexicon = "",
+                lang = "",
+                dictDir = ""
             )
-            kokoroTts = OfflineTts(config)
+            val modelCfg = com.k2fsa.sherpa.onnx.OfflineTtsModelConfig(
+                vits = com.k2fsa.sherpa.onnx.OfflineTtsVitsModelConfig(),
+                matcha = com.k2fsa.sherpa.onnx.OfflineTtsMatchaModelConfig(),
+                kokoro = kokoroCfg,
+                zipvoice = com.k2fsa.sherpa.onnx.OfflineTtsZipVoiceModelConfig(),
+                kitten = com.k2fsa.sherpa.onnx.OfflineTtsKittenModelConfig(),
+                pocket = com.k2fsa.sherpa.onnx.OfflineTtsPocketModelConfig(),
+                supertonic = com.k2fsa.sherpa.onnx.OfflineTtsSupertonicModelConfig(),
+                numThreads = 2,
+                debug = true,
+                provider = "cpu"
+            )
+            val ttsConfig = com.k2fsa.sherpa.onnx.OfflineTtsConfig(
+                model = modelCfg,
+                ruleFsts = "",
+                ruleFars = "",
+                maxNumSentences = 1,
+                silenceScale = 0.2f
+            )
+            Log.i(TAG, "Calling OfflineTts(config) with full paths - model=${modelFile.absolutePath.takeLast(50)}")
+            kokoroTts = OfflineTts(ttsConfig)
             val sr = kokoroTts?.sampleRate() ?: -1
             Log.i(TAG, "Kokoro model loaded — sampleRate=$sr")
             if (sr <= 0) {
-                Log.w(TAG, "Kokoro model returned invalid sample rate — unloading")
+                Log.w(TAG, "Kokoro model returned invalid sample rate")
                 kokoroTts?.release()
                 kokoroTts = null
             }
