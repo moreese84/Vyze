@@ -107,7 +107,12 @@ class VyzeCoreController(
     @Volatile
     private var firstChunkSent = false
 
-    private val SENTENCE_TERMINATORS = charArrayOf('.', '!', '?', '\n')
+    // Language FIX: added full-width CJK sentence punctuation (。！？；) —
+    // Gemma ends Chinese answers with these, not ASCII dots. Without them the
+    // streaming flush never found a boundary and a Chinese answer was only
+    // spoken after the whole generation finished (or stalled entirely on long
+    // answers), which users perceived as "no response" for Chinese queries.
+    private val SENTENCE_TERMINATORS = charArrayOf('.', '!', '?', '\n', '。', '！', '？', '；')
 
     private val minFlushChars = 10
 
@@ -454,7 +459,16 @@ class VyzeCoreController(
             // ── Hard ceiling ───────────────────────────────────────
             // If the model emits a long run without sentence punctuation
             // (rare), flush anyway so speech never stalls for seconds.
-            if (cut < 0 && text.length >= MAX_FLUSH_READ_AHEAD_CHARS) {
+            // Language FIX: ceiling halved for CJK — 200 Latin chars ≈ 40
+            // Chinese characters; CJK text is far denser, so the same stall
+            // protection must trip much earlier (200 CJK chars is a whole
+            // paragraph, roughly a minute of silence before the first word).
+            val readAheadCeiling = if (text.any { it.code in 0x2E80..0x9FFF || it.code in 0x3000..0x303F || it.code in 0xFF00..0xFFEF }) {
+                MAX_FLUSH_READ_AHEAD_CHARS / 5
+            } else {
+                MAX_FLUSH_READ_AHEAD_CHARS
+            }
+            if (cut < 0 && text.length >= readAheadCeiling) {
                 cut = text.length - 1
             }
 

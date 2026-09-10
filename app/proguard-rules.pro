@@ -5,6 +5,17 @@
 # (Keep rules REMOVED — TTS pivoted to platform android.speech.tts.TextToSpeech.
 # No com.k2fsa.sherpa.onnx classes remain in the APK.)
 
+# ── LiteRT-LM (Gemma on-device VLM runtime) ─────────────────────────────────
+# JNI-backed: liblitertlm_jni.so resolves Java methods/fields BY NAME via
+# GetMethodID/GetFieldID. R8 renaming these classes broke every native lookup
+# and aborted the runtime at first inference:
+#   "JNI DETECTED ERROR IN APPLICATION: mid == null in call to CallIntMethodV
+#    from LiteRtLmJni.nativeCreateConversation(...)"
+# Debug builds were unaffected (no minification) — release only. Same class of
+# bug the ML Kit / MediaPipe / TFLite rules below already guard against.
+-keep class com.google.ai.edge.litertlm.** { *; }
+-dontwarn com.google.ai.edge.litertlm.**
+
 # ── ML Kit Text Recognition ──────────────────────────────────────────────────
 -keep class com.google.mlkit.** { *; }
 -dontwarn com.google.mlkit.**

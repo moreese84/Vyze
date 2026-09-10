@@ -68,6 +68,14 @@ class TTSManager private constructor(context: Context) {
     @Volatile
     private var engineInitInFlight = false
 
+    /** True when the constructed engine was explicitly the Google TTS package. */
+    @Volatile
+    private var usedGoogleEngine = false
+
+    /** One-shot flag: Google engine failed init → retry once with system default. */
+    @Volatile
+    private var defaultEngineRetryTried = false
+
     private var cachedVolume: Float = DEFAULT_VOLUME
     private var cachedRate: Float = DEFAULT_SPEECH_RATE
     private val appContext: Context = context.applicationContext
@@ -161,17 +169,49 @@ class TTSManager private constructor(context: Context) {
         if (engine != null || engineInitInFlight) return
         engineInitInFlight = true
         mainHandler.post {
-            try {
-                Log.i(TAG, "bootstrapEngine: constructing TextToSpeech...")
-                engine = TextToSpeech(appContext) { status -> onInit(status) }
-            } catch (e: Throwable) {
-                Log.e(TAG, "bootstrapEngine: TextToSpeech construction failed", e)
-                engineInitInFlight = false
-                if (!missingModelWarningShown) {
-                    missingModelWarningShown = true
-                    CrashLogFile.log(TAG, "TTS startup: platform TextToSpeech unavailable (${e.message})")
+            var constructed = false
+            // Language FIX: the whitepaper (§7.2) documents that Vyze FORCES
+            // the Google TTS engine (com.google.android.tts) — it is the only
+            // engine with reliable ms-MY / zh-CN voice coverage. The pivot
+            // build constructed TextToSpeech with no engine package, so
+            // devices whose DEFAULT engine is a third-party TTS with English-
+            // only packs silently spoke every language switch in English
+            // (switchToLocale logged LANG_NOT_SUPPORTED and kept going).
+            if (isGoogleTtsInstalled()) {
+                try {
+                    Log.i(TAG, "bootstrapEngine: forcing Google TTS engine ($GOOGLE_TTS_PACKAGE)")
+                    usedGoogleEngine = true
+                    engine = TextToSpeech(appContext, { status -> onInit(status) }, GOOGLE_TTS_PACKAGE)
+                    constructed = true
+                } catch (e: Throwable) {
+                    usedGoogleEngine = false
+                    Log.w(TAG, "bootstrapEngine: Google TTS construction failed: ${e.message} — falling back to system default")
+                }
+            } else {
+                Log.i(TAG, "bootstrapEngine: Google TTS not installed — using system default engine")
+            }
+            if (!constructed) {
+                try {
+                    Log.i(TAG, "bootstrapEngine: constructing TextToSpeech...")
+                    engine = TextToSpeech(appContext) { status -> onInit(status) }
+                } catch (e: Throwable) {
+                    Log.e(TAG, "bootstrapEngine: TextToSpeech construction failed", e)
+                    engineInitInFlight = false
+                    if (!missingModelWarningShown) {
+                        missingModelWarningShown = true
+                        CrashLogFile.log(TAG, "TTS startup: platform TextToSpeech unavailable (${e.message})")
+                    }
                 }
             }
+        }
+    }
+
+    /** True when the Google TTS engine app is present on the device. */
+    private fun isGoogleTtsInstalled(): Boolean {
+        return try {
+            appContext.packageManager.getPackageInfo(GOOGLE_TTS_PACKAGE, 0) != null
+        } catch (e: Throwable) {
+            false
         }
     }
 
@@ -187,6 +227,20 @@ class TTSManager private constructor(context: Context) {
     fun onInit(status: Int) {
         engineInitInFlight = false
         if (status != TextToSpeech.SUCCESS) {
+            // Language FIX: if the FORCED Google engine failed to bind, retry
+            // once with the system default engine instead of staying mute.
+            if (usedGoogleEngine && !defaultEngineRetryTried) {
+                defaultEngineRetryTried = true
+                usedGoogleEngine = false
+                engine = null
+                try {
+                    Log.w(TAG, "onInit: Google TTS engine failed (status=$status) — retrying with system default engine")
+                    engine = TextToSpeech(appContext) { s -> onInit(s) }
+                    return
+                } catch (e: Throwable) {
+                    Log.e(TAG, "onInit: default-engine retry failed: ${e.message}")
+                }
+            }
             Log.w(TAG, "onInit: TextToSpeech init FAILED (status=$status)")
             if (!missingModelWarningShown) {
                 missingModelWarningShown = true
@@ -827,7 +881,19 @@ class TTSManager private constructor(context: Context) {
         }
 
         try {
-            val result = engine?.setLanguage(locale)
+            var result = engine?.setLanguage(locale)
+            // Language FIX: Google TTS on many builds exposes Malay/Chinese as
+            // the bare language ("ms", "zh") while the exact region variant
+            // (ms-MY, zh-CN) reports LANG_MISSING_DATA / LANG_NOT_SUPPORTED.
+            // Retry language-only before declaring the switch unusable —
+            // without this, mirrored switches silently kept the old voice.
+            if (result == TextToSpeech.LANG_MISSING_DATA ||
+                result == TextToSpeech.LANG_NOT_SUPPORTED
+            ) {
+                val languageOnly = Locale(locale.language)
+                result = engine?.setLanguage(languageOnly)
+                Log.i(TAG, "switchToLocale: region variant rejected — retried language-only $languageOnly → result=$result")
+            }
             Log.i(TAG, "switchToLocale: setLanguage($locale) → result=$result")
             if (result == TextToSpeech.LANG_MISSING_DATA ||
                 result == TextToSpeech.LANG_NOT_SUPPORTED
@@ -1070,6 +1136,9 @@ class TTSManager private constructor(context: Context) {
         const val ENGINE_SETTLE_DELAY_MS = 200L
         const val DRAIN_RETRY_INTERVAL_MS = 200L
         const val DRAIN_RETRY_MS = 5000L
+
+        /** Google TTS engine package — forced per whitepaper §7.2. */
+        private const val GOOGLE_TTS_PACKAGE = "com.google.android.tts"
 
         private val ENGLISH_PRONUNCIATION_OVERRIDES = mapOf(
             "maggi" to "Mayghee"

@@ -711,8 +711,25 @@ class CameraFragment : Fragment() {
                     // route them to that instead of parsing a yes/no answer.
                     handleVoiceInstallAnswer(spokenText)
                 } else {
-                    activity.interruptTts()
-                    coreController.setUserLocale(detectedLocale)
+                    // ── BARGE-IN GUARD (voice session fix) ──────────────
+                    // Only a REAL user query (app idle or listening) may stop
+                    // the current speech AND steer the language state. In
+                    // ANALYZING/SPEAKING the noise gate below DROPS this
+                    // result as ambient noise — stopping TTS there cut the
+                    // answer off mid-sentence: the SpeechRecognizer's
+                    // end-of-session drift kept capturing the tail of the
+                    // just-spoken ANSWER, and that stale transcription
+                    // re-entered here and barged in.
+                    // setUserLocale is gated identically: a dropped result
+                    // detected as device-English would otherwise REVERT the
+                    // mirrored Malay/Chinese TTS voice mid-answer, and the
+                    // rest of the answer would play with the wrong voice.
+                    if (appState == AppState.ANALYZING || appState == AppState.SPEAKING) {
+                        Log.d(TAG, "Speech result during $appState — skipping barge-in + locale change (noise gate will drop)")
+                    } else {
+                        activity.interruptTts()
+                        coreController.setUserLocale(detectedLocale)
+                    }
 
                     when {
                         // ── REPORT MODE: speech is the report content ──
@@ -743,6 +760,10 @@ class CameraFragment : Fragment() {
                                 // user's in-flight query — otherwise ambient
                                 // chat makes the response come back "lost" and
                                 // restarts the recognition beep loop.
+                                // Voice session fix: a dropped result must NOT
+                                // flip keepMicOpenAfterAnswer to false — the
+                                // window flag belongs to the user's original
+                                // gesture, not to the dropped noise.
                                 Log.d(TAG, "Speech result during $appState — dropping (possible ambient noise)")
                             } else if (coreController.isTextOnlyQuery(spokenText)) {
                                 // ── TEXT-ONLY Q&A ────────────────────────
@@ -847,13 +868,25 @@ class CameraFragment : Fragment() {
         // it and stay quiet until the user taps to analyze.
         activity.onNoiseDetected = {
             if (isAdded && _fragmentCameraBinding != null) {
-                Log.w(TAG, "Noisy room detected — ending conversation window")
+                Log.w(TAG, "Noisy room detected")
                 stopVoiceAuditionIfActive()
-                endFollowUpWindow()
-                updateStatus("Noisy — tap or double tap to continue")
-                try {
-                    ttsManager.speakQueued("The room is noisy. Tap once to look, or double tap to ask.")
-                } catch (_: Throwable) {}
+                // Voice session fix: never kill a follow-up window while a
+                // query is in flight — the noise rejection that increment
+                // rejectedCycleCount was DROPPED ambient noise (see the
+                // noise gate above), not a failed user attempt. Ending the
+                // window here cut hands-free double-tap sessions after the
+                // first answer while single-tap flow kept working.
+                if (appState == AppState.ANALYZING || appState == AppState.SPEAKING) {
+                    Log.d(TAG, "Noise detected during $appState — window kept open until answer finishes")
+                } else {
+                    endFollowUpWindow()
+                    updateStatus("Noisy — tap or double tap to continue")
+                    // Announcement only when quiet: speakQueued() escalates to
+                    // QUEUE_FLUSH, which would cut the in-flight answer.
+                    try {
+                        ttsManager.speakQueued("The room is noisy. Tap once to look, or double tap to ask.")
+                    } catch (_: Throwable) {}
+                }
             }
         }
     }
@@ -1841,8 +1874,16 @@ class CameraFragment : Fragment() {
         /** Interval (ms) between auto-snapshot captures in continuous mode. */
         private const val AUTO_SNAPSHOT_INTERVAL_MS = 4000L
 
-        /** Safety timeout (ms) — force IDLE if TTS doesn't finish in time. */
-        private const val SPEAKING_TIMEOUT_MS = 10_000L
+        /**
+         * Safety timeout (ms) — force IDLE if TTS doesn't finish in time.
+         * Voice session fix: 10s truncated the state machine under long
+         * read-backs (an OCR label paragraph runs well past 10s, Malay TTS
+         * is slower still), so the app flipped to IDLE while the answer was
+         * still speaking and follow-up window logic acted on stale state.
+         * 30s still bounds a dead onDone callback but never fires under
+         * legitimate long answers.
+         */
+        private const val SPEAKING_TIMEOUT_MS = 30_000L
 
         /**
          * After continuous mode runs for this long, throttle the capture interval

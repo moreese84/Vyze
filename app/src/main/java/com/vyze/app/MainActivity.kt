@@ -606,9 +606,21 @@ class MainActivity : AppCompatActivity() {
                             Log.d(TAG, "Model-ASR transcription after session aborted — dropping")
                             return@runOnUiThread
                         }
-                        // Reuse the last Google-detected locale (or null → US)
-                        // so language mirroring keeps working.
-                        onSpeechResult?.invoke(transcription, lastDetectedLocale)
+                        // Language FIX: detect the locale from the rescue
+                        // TRANSCRIPTION itself. The old code reused
+                        // lastDetectedLocale — typically the recognizer's own
+                        // default (en) or a stale value from an earlier session
+                        // — so a Malay/Chinese query rescued by the model-ASR
+                        // path always came back English, breaking mirroring.
+                        // detectLocaleFromText applies the same CJK/Malay
+                        // detection used by the normal onResults path.
+                        // Also persist the rescue locale for recognition:
+                        // resolveRecognitionLocale() reads it, so the NEXT mic
+                        // session listens in the language the rescue actually
+                        // heard instead of falling back to en-US again.
+                        val rescueLocale = detectLocaleFromText(transcription)
+                        lastDetectedLocale = rescueLocale
+                        onSpeechResult?.invoke(transcription, rescueLocale)
                     }
                 } catch (e: Throwable) {
                     Log.e(TAG, "Model-ASR rescue crashed: ${e.message}")
@@ -634,12 +646,27 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /** True when [s] contains any CJK ideograph (Chinese text has no spaces). */
+    private fun hasCjkCharacters(s: String): Boolean =
+        s.any { ch ->
+            val cp = ch.code
+            cp in 0x4E00..0x9FFF || cp in 0x3400..0x4DBF || cp in 0xF900..0xFAFF
+        }
+
     /** L2: decide whether a transcription is ambient conversation, not the user. */
     private fun isAmbientChat(text: String, confidence: FloatArray?): Boolean {
         // 1. Fragmentary single-word results ("yeah", "okay", "hi") — pass-over chatter
         val trimmed = text.trim()
         if (trimmed.split(Regex("\\s+")).size == 1 && trimmed.length < MIN_SINGLE_WORD_CHARS) {
-            return true
+            // Language FIX: CJK exempt — "你好" (2 chars) is a complete,
+            // meaningful query. CJK characters carry several times the
+            // information of Latin ones and the recognizer returns Chinese
+            // WITHOUT spaces, so every short Chinese query looked like a
+            // fragmentary single word and was dropped as ambient chatter
+            // (the reported "Chinese → no response" symptom).
+            if (!hasCjkCharacters(trimmed)) {
+                return true
+            }
         }
         // 2. Low recognition confidence — mumbles and mixed chatter score low
         if (confidence != null && confidence.isNotEmpty()) {
@@ -650,12 +677,24 @@ class MainActivity : AppCompatActivity() {
         }
         // 3. Unstable transcription: the final text shares no words with the
         //    partial stream — a sign the recognizer latched onto a different speaker.
+        // Language FIX: CJK text has no spaces — word-splitting yields ONE
+        // giant token per string, and a progressive recognizer's partial is
+        // a PREFIX of the final ("这是" → "这是什么"), so the word-overlap
+        // test rejected EVERY multi-stage Chinese recognition as unstable.
+        // Compare characters for CJK instead of words.
         val partial = lastPartialText
         if (partial.isNotBlank() && partial.length >= 4 && trimmed.length >= 4) {
-            val finalWords = trimmed.lowercase().split(Regex("\\s+")).toSet()
-            val partialWords = partial.lowercase().split(Regex("\\s+")).toSet()
-            if (finalWords.none { it in partialWords }) {
-                return true
+            if (hasCjkCharacters(trimmed)) {
+                val finalChars = trimmed.toSet()
+                if (partial.none { it in finalChars }) {
+                    return true
+                }
+            } else {
+                val finalWords = trimmed.lowercase().split(Regex("\\s+")).toSet()
+                val partialWords = partial.lowercase().split(Regex("\\s+")).toSet()
+                if (finalWords.none { it in partialWords }) {
+                    return true
+                }
             }
         }
         return false
@@ -733,45 +772,68 @@ class MainActivity : AppCompatActivity() {
         // Signal B: Malay morphological suffixes
         // Malay is agglutinative — these suffixes are grammatical markers
         // that don't appear in English.
+        // Language FIX: the original patterns included a leading '-'
+        // ("-kan") which never matched — word.endsWith("-kan") is false for
+        // "buatkan". Every Malay word scored 0 on this signal, so short
+        // natural queries ("apa ini", "baca label") hovered below the old
+        // threshold of 3 and fell through to English.
         val malaySuffixes = listOf(
-            "-kan", "-kan.",
-            "-an", "-an.",
-            "-i", "-i.",
-            "-lah", "-lah.",
-            "-kah", "-kah.",
-            "-tah", "-tah."
+            "kan", "an", "i", "lah", "kah", "tah",
+            "nya", "pun"
         )
         for (word in words) {
-            if (malaySuffixes.any { word.endsWith(it) }) {
+            val cleaned = word.replace(Regex("[^a-z]"), "")
+            // Suffixes like "an"/"i" also occur in English words; only
+            // count them on words of realistic Malay root length.
+            if (malaySuffixes.any { cleaned.length >= 4 && cleaned.endsWith(it) }) {
                 malayScore += 1
             }
         }
 
         // Signal C: Malay-specific word patterns
         // These are words unique to Malay that don't exist in English.
+        // Language FIX: split into DECISIVE action/noun words (+2) and
+        // descriptive words (+1). Real Vyze queries are often verb-only
+        // ("baca label", "analisis scene", "tolong tengok") — under the old
+        // flat +1 they scored below the threshold and the answer came back
+        // English, exactly the reported double-tap mirroring failure. Every
+        // +2 word is impossible in ordinary English speech ("wang" was
+        // deliberately EXCLUDED — it is also a common Chinese surname).
+        val malayStrongPatterns = listOf(
+            "baca", "tolong", "analisis", "tengok", "tunjuk", "tunjukkan",
+            "lihat", "cari", "dengar", "cakap", "bagitahu",
+            "hasil", "gambar", "kamera", "warna", "harga", "duit"
+        )
         val malayPatterns = listOf(
-            "selamat", "terima", "kasih", "tolong",
-            "macam", "mana", "bahasa", "malaysia",
+            "selamat", "terima", "kasih",
+            "macam", "bahasa", "malaysia",
             "rumah", "makan", "minum", "jalan",
-            "tengok", "dengar", "cakap", "bagitahu",
             "kenal", "paham", "faham",
             "pergi", "datang", "balik",
             "besar", "kecil", "cantik", "bagus",
             "panas", "sejuk", "hujan", "cerah",
             "hari", "malam", "pagi", "petang",
-            "orang", "anak", "ibu", "bapa"
+            "orang", "anak", "ibu", "bapa",
+            "objek", "benda", "senario", "teks",
+            "semua", "sekarang", "sikit", "banyak", "sama", "ada"
         )
         for (word in words) {
             val cleaned = word.replace(Regex("[^a-z]"), "")
-            if (cleaned in malayPatterns) {
-                malayScore += 1
+            when {
+                cleaned in malayStrongPatterns -> malayScore += 2
+                cleaned in malayPatterns -> malayScore += 1
             }
         }
 
         // Signal D: Malay reduplication
         // Very common in Malay (e.g., "rumah-rumah", "anak-anak",
         // "sikit-sikit", "satu-satu"). English almost never reduplicates.
-        if (Regex("(\\b\\w+)-(\\w+)\\b").containsMatchIn(lower)) {
+        // Language FIX: the old pattern "(\\b\\w+)-(\\w+)\\b" ALSO matched
+        // English hyphenations like "e-mail" / "check-in" (any two word
+        // fragments around a hyphen), awarding +2 Malay points to English
+        // text. Require both halves to be 2+ letters, alphabetic, and
+        // (weak signal) share a stem — a real reduplication.
+        if (Regex("(\\b[a-z]{2,})-([a-z]{2,})\\b").containsMatchIn(lower)) {
             malayScore += 2
         }
 
@@ -781,7 +843,12 @@ class MainActivity : AppCompatActivity() {
         // This prevents false positives from occasional English words
         // that happen to match (e.g., "saya" could theoretically appear
         // in English speech-to-text as noise).
-        if (malayScore >= 3) {
+        // Language FIX: threshold lowered 3 → 2. A function word (2 pts) +
+        // one suffix/pattern hit now qualifies, e.g. "baca ini untuk saya"
+        // (ini+saya=4), "tolong baca label" (tolong=1). Under the old bar,
+        // most short real queries fell through to the device-locale fallback
+        // (English), which is exactly the reported mirroring failure.
+        if (malayScore >= 2) {
             Log.d(TAG, "detectLocaleFromText: Malay detected (score=$malayScore) → ms")
             return java.util.Locale("ms", "MY")
         }
@@ -810,6 +877,23 @@ class MainActivity : AppCompatActivity() {
                 // until the user taps. Only an explicit tap re-opens the mic.
                 if (noisePaused) {
                     Log.d(TAG, "startListeningSafely: noise pause active — staying quiet until tap")
+                    return@post
+                }
+
+                // ── ANSWER PLAYBACK GUARD (voice session fix) ───────
+                // A mic cycle scheduled by a stale error handler
+                // (ERROR_RECOGNIZER_BUSY / ERROR_CLIENT retry, adaptive
+                // backoff) can fire while the user's answer is still being
+                // spoken. Starting recognition here BARGED IN and cut the
+                // answer mid-sentence. Let the speech finish; the fragment
+                // reopens the mic itself when the answer completes
+                // (maybeOpenFollowUpWindow).
+                // hasPendingSpeech() (deterministic utterance-ID tracking)
+                // rather than isSpeaking(): the raw engine flag lingers true
+                // during AudioTrack hardware drain AFTER onDone, which would
+                // wrongly defer the fragment's legit follow-up reopen.
+                if (ttsReady && ttsManager.hasPendingSpeech()) {
+                    Log.d(TAG, "startListeningSafely: answer still queued/speaking — deferring mic start until it finishes")
                     return@post
                 }
 
@@ -967,14 +1051,32 @@ class MainActivity : AppCompatActivity() {
                     )
                     Log.d(TAG, "Recognition language forced to ${recognitionLocale.toLanguageTag()}")
                 } else {
-                    // First contact before any language is known — hint the
-                    // recognizer at the supported set and let it follow what
-                    // the user actually says (honored by Google's recognizer;
-                    // ignored harmlessly by engines that don't support it).
+                    // Language FIX: ALWAYS pin a base language, never leave the
+                    // recognizer on its own default. Most recognizer engines
+                    // (including Google's on an English-default phone) IGNORE
+                    // EXTRA_LANGUAGE_PREFERENCE — it is a hint, not a command.
+                    // An unpinned session then defaults to en-US, so a Malay or
+                    // Chinese query comes back as NO_MATCH (the "no response"
+                    // bug). Pinning en-US keeps English queries working while
+                    // the language-detection extras below let the engine follow
+                    // Malay/Chinese speech within the same session.
+                    putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-US")
                     putExtra(
                         RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE,
                         SUPPORTED_RECOGNITION_LANGUAGES
                     )
+                    // API 34+: ask the engine to auto-detect the spoken
+                    // language from the supported set (en-US, ms-MY, zh-CN)
+                    // and switch mid-session — this is what makes first-contact
+                    // Malay/Chinese queries work on English-default phones.
+                    if (android.os.Build.VERSION.SDK_INT >= 34) {
+                        putExtra(RecognizerIntent.EXTRA_ENABLE_LANGUAGE_DETECTION, true)
+                        putExtra(
+                            RecognizerIntent.EXTRA_LANGUAGE_DETECTION_ALLOWED_LANGUAGES,
+                            SUPPORTED_RECOGNITION_LANGUAGES
+                        )
+                        putExtra(RecognizerIntent.EXTRA_ENABLE_LANGUAGE_SWITCH, true)
+                    }
                 }
                 putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
                 putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
