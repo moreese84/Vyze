@@ -23,9 +23,13 @@ Vyze speaks what the camera sees — instantly, privately, offline.
 - **Medicine Lookup** — Cross-references OCR against a local drug database to answer "what medicine is this?"
 - **Multi-Language** — Auto-detects your spoken language and responds in it (English, Malay, Chinese, and more)
 - **Text-Only Q&A** — Answers general-knowledge questions ("what is paracetamol used for?") without the camera
-- **Gesture Map** — Single tap: look · Double tap: ask by voice · Long press: light check · Triple tap: color · Triple tap + hold: SOS
+- **Barcode & QR Detection** — ML Kit barcode scanning runs alongside OCR on every text query; retail products and banknotes are identified by their barcode and logged to scan history
+- **Conversational Follow-ups** — "What is this?" → "A red Maggi packet" → "What about the one behind it?" — recent voice exchanges are remembered so pronouns resolve and answers stay conversational
+- **Auto-Learned Brevity** — Interrupt answers repeatedly and Vyze quietly learns to answer in fewer sentences; let answers play and it relaxes again. No settings, no UI
+- **Gesture Map** — Single tap: look (grid-tagged) · Double tap: ask by voice · Long press: light check · Triple tap: color · Triple tap + hold: SOS
 - **Hands-Free Voice Sessions** — After a double-tap question the mic stays open for follow-ups; pick your voice by voice ("voice settings")
-- **Noisy-Room Rescue** — When the recognizer gets lost in a crowd, Gemma's own audio encoder transcribes your repeat, fully offline
+- **Noisy-Room Rescue** — When the recognizer gets lost in a crowd, Gemma's own audio encoder transcribes your repeat, fully offline. Malay/Chinese first queries on English phones are retried automatically in ms-MY/zh-CN before giving up
+- **Precise Code Reading** — Vehicle plates, serial and reference numbers are spoken character by character ("Q L B, three four six nine") — never as a quantity
 - **Voice Bug Reporting** — Say "I want to make a report" to file issues hands-free
 - **Audio** — Speaks through the media stream at exactly your phone's volume, so the hardware volume buttons work normally
 
@@ -54,9 +58,9 @@ Camera Frame ──→ ML Kit OCR ──→ DynamicPromptBuilder
 | **VyzeCoreController** | `VyzeCoreController.kt` | Pipeline orchestrator, session isolation, sentence streaming |
 | **DynamicPromptBuilder** | `DynamicPromptBuilder.kt` | Intent-based prompt construction, language mirroring |
 | **OcrHelper** | `OcrHelper.kt` | ML Kit on-device OCR (Latin + Chinese) |
-| **TTSManager** | `TTSManager.kt` | Offline Sherpa-ONNX TTS (Kokoro EN/ZH + Meta MMS Malay), utterance tracking, voice switching |
-| **SherpaTtsManager** | `SherpaTtsManager.kt` | Sherpa-ONNX engine, Kokoro & MMS model loading, AudioTrack playback |
-| **OfflineTts** | `Tts.kt` | JNI wrapper for sherpa-onnx native speech synthesis |
+| **TTSManager** | `TTSManager.kt` | Platform TextToSpeech (Google TTS engine preferred), utterance tracking, voice switching, prosody & pronunciation smoothing |
+| **BarcodeHelper** | `BarcodeHelper.kt` | ML Kit on-device 1D/2D barcode detection (EAN/UPC/QR/Data Matrix) |
+| **PreferenceLearner** | `memory/PreferenceLearner.kt` | Silent behavioral adaptation — learns answer brevity from speech-active interrupts |
 | **CameraSetupDelegate** | `CameraSetupDelegate.kt` | CameraX frame extraction, snapshot capture |
 | **CameraFragment** | `CameraFragment.kt` | UI, speech callbacks, auto-snapshot loop |
 | **MemoryRepository** | `MemoryRepository.kt` | Vector similarity search, adaptive intelligence |
@@ -80,6 +84,15 @@ All inference runs on-device — including the TTS engine. No cloud APIs, no dat
 ### Adaptive Memory
 After every scan Vyze stores a lightweight visual fingerprint plus the scene description in a local Room database. Before analyzing a new frame it searches recent fingerprints; when a frame strongly matches a scan from the last 24 hours, the prior description is injected into the prompt as context — so the answer can open with "this looks like the box you scanned earlier" instead of describing from zero. Memory is context, never a substitute: every scan still analyzes the live frame fresh.
 
+### Conversational Follow-ups (Dialogue Memory)
+During hands-free voice sessions Vyze remembers the last two exchanges and injects them into follow-up prompts, so pronouns resolve across turns ("what about the one behind it?") and the model answers the follow-up directly instead of re-describing the scene. Dialogue memory expires when the conversation window closes or after 60 s of silence, is capped at ~150 tokens, and is skipped entirely for tap, continuous, currency and bank-card reads. Follow-up answers also generate faster — a shorter answer is fewer tokens to synthesize on low-end phones.
+
+### Auto-Learned Brevity (Preference Learning)
+Vyze silently adapts answer length to observed behavior: a capture triggered while the previous answer is still being spoken counts as an interruption. Three interrupts within five minutes shifts to concise answers, nine to one-sentence answers — enforced both in the prompt and by tightening the output-token budget (fewer tokens = faster generation). Every answer that plays to completion erodes one step of interrupt evidence. Upward adaptation persists in the memory database; decay never writes. Continuous auto-captures never count as interruptions — leaning back and listening is not impatience.
+
+### Scan History
+OCR text, barcodes/QR, currency reads, bank cards and color analyses are persisted to a Room-backed scan history at detection time — including on the OCR fast-path and OCR-fallback paths.
+
 ### Multi-Language
 Automatically detects your spoken language via SpeechRecognizer and mirrors it to both Gemma's output and the TTS voice. Supports English, Malay, Chinese, and any language with an installed TTS voice pack. No hardcoded language lists — uses Android's dynamic Locale resolution.
 
@@ -90,10 +103,10 @@ ML Kit handles fast text extraction (80-150ms), Gemma handles interpretation and
 Gemma 4 handles dynamic aspect ratios natively via its vision token budget. Bitmaps are proportionally downscaled without rigid center-cropping, preserving spatial accuracy.
 
 ### Sentence-Buffered TTS Streaming
-Tokens stream directly to TTS as they generate. First audio fires after just 3 characters — no waiting for full response. Punctuation in model output (commas, periods) triggers natural clause-level pauses.
+Tokens stream directly to TTS as they generate. First audio fires after just a few characters — no waiting for full response. Post-first flushes coalesce ~2 sentences into one utterance (eliminating the per-utterance hardware seam between sentences), and the optional first-fragment fast-start joins its continuation with listing intonation instead of a full-stop seam.
 
 ### Continuous Mode
-Point-and-describe loop with thermal safety — automatically throttles capture interval from 4s to 8s after 3 minutes of continuous use to prevent SoC throttling.
+Point-and-describe loop with thermal safety — automatically throttles capture interval from 4s to 8s after 3 minutes of continuous use to prevent SoC throttling. Each auto-capture is first gated by a ~1 ms visual-similarity check against the last spoken scene: unchanged scenes skip the multi-second Gemma run entirely (huge battery and latency saving), while any real change triggers a fresh description.
 
 ### Voice Bug Reporting
 Say "I want to make a report" (English/Malay/Chinese) to enter report mode. Speak your issue, and the app saves a device-annotated report file and pre-fills an email — one tap to send.
@@ -113,13 +126,8 @@ When Android's recognizer gives up (no match, timeout, audio error — the class
 ### Reading Whole Panels
 Tap or ask about dense packaging and the full text is read to the end: an adaptive output budget is sized to the OCR text actually found (up to ~800 words), the inference watchdog re-arms while tokens are still flowing so long reads are never cut off mid-way, and the prompt forbids letter-by-letter spelling and premature stops. Brand pronunciation is corrected before synthesis ("Maggi" is spoken MAY-ghee, not MAY-jee).
 
-### Offline TTS (No Google Dependency)
-Vyze uses **Sherpa-ONNX** with two models for fully offline speech synthesis — no Google TTS, no network, no voice-pack installs:
-
-- **Kokoro** (MIT license, 325 MB) — neural-quality English and Chinese voices. Auto-selected for `en` and `zh` locales.
-- **Meta MMS** (CC-BY-NC, 114 MB) — functional-quality Malay voice plus multilingual fallback. Auto-selected for `ms` and other locales.
-
-Both models ship in `app/src/main/assets/` and are extracted on first launch. Audio plays through the media stream via `AudioTrack` so the hardware volume buttons work normally. Queue-based speech with barge-in support: a tap or new voice query immediately interrupts any active utterance.
+### Offline TTS
+Vyze speaks through the Android platform TextToSpeech engine, preferring the Google TTS engine for voice quality and language coverage (system-default fallback), with fully on-device voice packs — no network, no subscriptions. Queue-based speech with barge-in support: a tap or new voice query immediately interrupts any active utterance.
 
 ---
 
@@ -146,8 +154,9 @@ GPU kernels are pre-compiled during warm-up to eliminate first-inference cold-st
 |---|---|
 | **VLM Engine** | Gemma 4 E2B (2.59 GB, multimodal) via LiteRT-LM 0.16.1 |
 | **OCR** | Google ML Kit Text Recognition (Latin + Chinese) |
+| **Barcode** | Google ML Kit Barcode Scanning (1D + 2D) |
 | **Camera** | CameraX 1.3.1 |
-| **TTS** | Sherpa-ONNX (Kokoro EN/ZH + Meta MMS Malay), fully offline, no Google dependency |
+| **TTS** | Android platform TextToSpeech (Google TTS engine preferred), offline voice packs |
 | **Speech Recognition** | Android SpeechRecognizer + Gemma 4 E2B native ASR fallback (offline) |
 | **Database** | Room 2.7.0 (adaptive memory + vector search) |
 | **Coroutines** | kotlinx-coroutines 1.10.1 |
@@ -194,6 +203,8 @@ Vyze needs two sets of models:
    - **Meta MMS** (114 MB) — Malay & multilingual voice
    - **Sherpa-ONNX JNI libraries** (26 MB) — native speech engine
 
+> **Note:** the Sherpa-ONNX TTS pipeline was removed in v1.2 — Vyze now uses the platform TextToSpeech engine and this setup script is no longer required.
+
 ### Install
 
 ```bash
@@ -229,6 +240,8 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 | Aggressive speech endpoints (300ms) | Faster voice query recognition |
 | Session isolation (UUID gating) | Prevents stale results from previous queries |
 | Watchdog timer (15s) | Prevents indefinite ANALYZING state |
+| Scene-unchanged gating (continuous mode) | Skips Gemma when similarity ≥ 0.9 vs last spoken scene |
+| Coalesced sentence flushing | ~2 sentences per utterance — removes inter-sentence seams |
 | Continuous mode thermal safety (3min) | Prevents SoC throttling on mid-tier chips |
 | NPU → GPU fallback chain | Optimal backend per device capability |
 | Pre-flight RAM check | Prevents OOM crashes on constrained devices |

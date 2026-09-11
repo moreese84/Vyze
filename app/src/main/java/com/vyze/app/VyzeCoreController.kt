@@ -8,6 +8,7 @@ import android.speech.tts.TextToSpeech
 import android.util.Log
 import com.vyze.app.data.InteractionDao
 import com.vyze.app.data.MemoryDao
+import com.vyze.app.embedding.EmbeddingEngine
 import com.vyze.app.memory.MemoryRepository
 import com.vyze.app.memory.PreferenceLearner
 import com.vyze.app.memory.SimilarInteraction
@@ -94,6 +95,36 @@ class VyzeCoreController(
 
     @Volatile
     private var lastDescribedTime: Long = 0L
+
+    // ── Dialogue Memory (conversational follow-ups) ───────────────
+    // Bounded ring buffer of recent voice exchanges. Injected into voice
+    // query prompts so pronouns resolve across turns ("what about the one
+    // BEHIND it?"). Dropped when the follow-up window closes or after
+    // DIALOGUE_TTL_MS of silence. Deliberately SMALL: 2 turns × ~100 chars
+    // ≈ 120-150 prompt tokens — negligible prefill even on low-RAM phones.
+    private val dialogueTurns = ArrayDeque<Pair<String, String>>(MAX_DIALOGUE_TURNS)
+
+    /** Timestamp of the last recorded exchange (for TTL expiry). */
+    @Volatile
+    private var lastDialogueAt = 0L
+
+    /** True while the hands-free conversation window is open. */
+    @Volatile
+    private var conversationWindowOpen = false
+
+    // ── Continuous-Mode Scene Gating (battery) ────────────────────
+    // Baseline embedding of the scene as of the last SPOKEN description.
+    // Auto-captures that are visually unchanged vs this baseline skip the
+    // multi-second Gemma run entirely — same audible outcome, big battery
+    // and latency saving. Uses EmbeddingEngine (~1ms per frame).
+    @Volatile
+    private var lastContinuousEmbedding: FloatArray? = null
+
+    @Volatile
+    private var lastContinuousDescriptionAt = 0L
+
+    /** Fired when a continuous auto-capture is skipped (scene unchanged). */
+    var onContinuousSkip: (() -> Unit)? = null
 
     private val DEBOUNCE_GAP_MS = 4000L
 
@@ -635,6 +666,30 @@ class VyzeCoreController(
         return null
     }
 
+    // ── Tap Grid Tagging (structured spatial prompting) ───────────
+
+    /** Matches the "(x, y)" pair inside a tap query string. */
+    private val TAP_COORDS_REGEX = Regex("\\((\\d+),\\s*(\\d+)\\)")
+
+    /**
+     * Map raw tap coordinates to a 3x3 grid sector of the camera frame.
+     * Small VLMs ground coarse positional tags far better than raw pixel
+     * numbers — this turns "(120, 400)" into "Center-Left".
+     */
+    private fun gridSectorFor(x: Int, y: Int, frameW: Int, frameH: Int): String {
+        val col = when {
+            x < frameW / 3 -> "Left"
+            x < frameW * 2 / 3 -> "Center"
+            else -> "Right"
+        }
+        val row = when {
+            y < frameH / 3 -> "Top"
+            y < frameH * 2 / 3 -> "Middle"
+            else -> "Bottom"
+        }
+        return "$row-$col"
+    }
+
     // ── Full Pipeline Reset ────────────────────────────────────────
 
     /**
@@ -686,6 +741,9 @@ class VyzeCoreController(
         lastDescribedTime = 0L
         currencyModeActive = false
         bankCardModeActive = false
+        // A deliberate user action invalidates the continuous-mode scene
+        // baseline — the next auto-capture should describe fresh.
+        lastContinuousEmbedding = null
     }
 
     // ── Snapshot Trigger ───────────────────────────────────────────
@@ -739,16 +797,65 @@ class VyzeCoreController(
         // actually finds text — see the post-OCR dimension decision below).
         // Standard scene queries use 256x256 for faster inference.
         val isTapQuery = query?.contains(TAP_POSITION_MARKER) == true
+        // Dialogue memory only for GENUINE spoken follow-ups — taps and
+        // precise-read modes must not inherit conversational context.
+        val isVoiceFollowUpCandidate = !isTapQuery && !query.isNullOrBlank()
         val currencyQuery = isCurrencyQuery(query)
-        currencyModeActive = currencyQuery
         val bankCardQuery = isBankCardQuery(query)
+        // Deterministic at trigger time — the volatile mode flags are reset in
+        // onComplete before the record step runs.
+        val isPreciseRead = currencyQuery || bankCardQuery
+        if (isVoiceFollowUpCandidate) {
+            // Lightweight TTL prune on every voice trigger.
+            if (System.currentTimeMillis() - lastDialogueAt > DIALOGUE_TTL_MS) {
+                dialogueTurns.clear()
+            }
+        }
+        currencyModeActive = currencyQuery
         bankCardModeActive = bankCardQuery
+
+        // ── TAP GRID TAG (structured spatial prompting) ───────────
+        // Raw pixel coords mean nothing to a small VLM — it ignores them.
+        // Translate the tap into a 3x3 sector tag so the model knows WHERE
+        // the user is asking about without doing pixel math.
+        val tapSector = if (isTapQuery) {
+            query?.let { q ->
+                TAP_COORDS_REGEX.find(q)?.destructured?.let { (xs, ys) ->
+                    gridSectorFor(xs.toInt(), ys.toInt(), bitmap.width, bitmap.height)
+                }
+            }
+        } else null
+        val taggedQuery = if (tapSector != null && query != null) {
+            "$query [Target location: $tapSector of the camera frame]"
+        } else query
         // Pointing questions ("what is this", "apa ini", "这是什么") point at a
         // real object, usually packaged goods with labels — give them the
         // high-resolution + OCR pre-pass so the brand and text are read from
         // ground truth instead of a 256px guess.
         val isTextQuery = isTextExtractionQuery(query) || isTapQuery || currencyQuery ||
             bankCardQuery || isPointingQuery(query)
+
+        // ── CONTINUOUS-MODE SCENE GATING (battery) ────────────────
+        // A tap/voice query must ALWAYS run. Continuous auto-captures run
+        // Gemma only when the scene CHANGED since the last spoken
+        // description (~1ms embedding check vs multi-second inference —
+        // this is the battery/latency saver).
+        if (continuousMode) {
+            val baseline = lastContinuousEmbedding
+            if (baseline != null) {
+                val candidate = EmbeddingEngine.generateEmbedding(bitmap)
+                val similarity = EmbeddingEngine.cosineSimilarity(candidate, baseline)
+                if (similarity >= CONTINUOUS_SKIP_SIMILARITY) {
+                    Log.d(TAG, "Scene gating: unchanged scene (sim=$similarity) — skipping inference")
+                    isInferring.set(false)
+                    mainHandler.post {
+                        onContinuousSkip?.invoke()
+                        onStatusUpdate?.invoke("Ready [scene unchanged]")
+                    }
+                    return
+                }
+            }
+        }
 
         onStatusUpdate("Analyzing snapshot...")
 
@@ -977,17 +1084,25 @@ class VyzeCoreController(
                 }
 
                 val brevityLevel = preferenceLearner.getBrevityLevel()
-                CrashLogFile.log(TAG, "Building prompt... (brevity=${brevityLevel.label})")
+                // Conversational context ONLY for genuine voice follow-ups —
+                // never for taps, continuous mode, currency or bank-card reads.
+                val dialogueContext = if (isVoiceFollowUpCandidate &&
+                    !continuousMode && !currencyModeActive && !bankCardModeActive
+                ) {
+                    dialogueContextForPrompt()
+                } else null
+                CrashLogFile.log(TAG, "Building prompt... (brevity=${brevityLevel.label}, dialogue=${dialogueContext != null})")
                 val basePrompt = promptBuilder.buildPrompt(
-                    snapshotDescription = query ?: "User triggered a camera snapshot.",
-                    queryOverride = query,
+                    snapshotDescription = taggedQuery ?: "User triggered a camera snapshot.",
+                    queryOverride = taggedQuery,
                     continuousMode = continuousMode,
                     userLocale = activeUserLocale,
                     ocrText = ocrText,
                     currencyMode = currencyModeActive,
                     bankCardMode = bankCardModeActive,
                     memoryContext = memoryContext,
-                    brevityLevel = brevityLevel
+                    brevityLevel = brevityLevel,
+                    dialogueContext = dialogueContext
                 )
                 CrashLogFile.log(TAG, "Base prompt built: ${basePrompt.length} chars")
 
@@ -1072,6 +1187,32 @@ class VyzeCoreController(
                         if (normalized.isNotBlank()) {
                             lastDescribedObject = normalized
                             lastDescribedTime = System.currentTimeMillis()
+                        }
+                        // Record the exchange for conversational follow-ups.
+                        if (isVoiceFollowUpCandidate && !isPreciseRead) {
+                            recordDialogueTurn(query ?: "", response)
+                        }
+
+                        // Continuous mode: refresh the scene baseline so the
+                        // NEXT auto-capture can skip if the scene is unchanged.
+                        if (continuousMode) {
+                            try {
+                                lastContinuousEmbedding = EmbeddingEngine.generateEmbedding(bitmap)
+                                lastContinuousDescriptionAt = System.currentTimeMillis()
+                            } catch (e: Throwable) {
+                                CrashLogFile.logError(TAG, "Scene baseline update failed: ${e.message}", e)
+                            }
+                        }
+
+                        // Continuous mode: refresh the scene baseline so the
+                        // NEXT auto-capture can skip if the scene is unchanged.
+                        if (continuousMode) {
+                            try {
+                                lastContinuousEmbedding = EmbeddingEngine.generateEmbedding(bitmap)
+                                lastContinuousDescriptionAt = System.currentTimeMillis()
+                            } catch (e: Throwable) {
+                                CrashLogFile.logError(TAG, "Scene baseline update failed: ${e.message}", e)
+                            }
                         }
                     }
                 }
@@ -1269,6 +1410,7 @@ class VyzeCoreController(
                     } catch (e: Throwable) {
                         CrashLogFile.logError(TAG, "Text interaction store failed: ${e.message}", e)
                     }
+                    recordDialogueTurn(query, response)
                     // Completion (speak + IDLE) fires via the shared onComplete
                     // callback with session gating — same as image responses.
                 }
@@ -1562,6 +1704,55 @@ class VyzeCoreController(
         }
     }
 
+    // ── Dialogue Memory API ───────────────────────────────────────
+
+    /** Called when the hands-free follow-up window OPENS. */
+    fun onConversationWindowOpened() {
+        conversationWindowOpen = true
+    }
+
+    /** Called when the follow-up window CLOSES — dialogue expires. */
+    fun onConversationWindowClosed() {
+        conversationWindowOpen = false
+        if (dialogueTurns.isNotEmpty()) {
+            dialogueTurns.clear()
+            Log.d(TAG, "Dialogue memory expired (window closed)")
+        }
+    }
+
+    /**
+     * Record a completed voice exchange. Keeps at most [MAX_DIALOGUE_TURNS]
+     * turns, each answer trimmed — bounded RAM, bounded prompt cost.
+     */
+    private fun recordDialogueTurn(userQuery: String, response: String) {
+        val q = userQuery.trim().take(MAX_DIALOGUE_TURN_CHARS)
+        val a = response.trim().take(MAX_DIALOGUE_TURN_CHARS)
+        if (q.isBlank() || a.isBlank()) return
+        synchronized(dialogueTurns) {
+            while (dialogueTurns.size >= MAX_DIALOGUE_TURNS) dialogueTurns.removeFirst()
+            dialogueTurns.addLast(q to a)
+        }
+        lastDialogueAt = System.currentTimeMillis()
+    }
+
+    /**
+     * Snapshot of recent dialogue for prompt injection, or null when there is
+     * nothing usable (no window open, expired TTL, or empty buffer).
+     */
+    private fun dialogueContextForPrompt(): String? {
+        if (!conversationWindowOpen) return null
+        if (dialogueTurns.isEmpty()) return null
+        // TTL expiry: silence longer than DIALOGUE_TTL_MS invalidates context —
+        // the conversation topic is almost certainly stale by then.
+        if (System.currentTimeMillis() - lastDialogueAt > DIALOGUE_TTL_MS) {
+            dialogueTurns.clear()
+            return null
+        }
+        return synchronized(dialogueTurns) {
+            dialogueTurns.joinToString("\n") { (q, a) -> "User: $q\nVyze: $a" }
+        }
+    }
+
     companion object {
         private const val TAG = "VyzeCoreController"
 
@@ -1618,6 +1809,22 @@ class VyzeCoreController(
         // ── Dynamic Token Limits ────────────────────────────────
         /** Scene queries: concise descriptions (raised — avoids mid-sentence cutoffs). */
         private const val SCENE_QUERY_MAX_TOKENS = 128
+
+        /** Max dialogue turns kept for conversational follow-ups. */
+        private const val MAX_DIALOGUE_TURNS = 2
+
+        /** Per-turn char cap — keeps the injected block ~120-150 tokens. */
+        private const val MAX_DIALOGUE_TURN_CHARS = 100
+
+        /** Dialogue expires after this much silence even mid-window. */
+        private const val DIALOGUE_TTL_MS = 60_000L
+
+        /**
+         * Continuous auto-captures with cosine similarity at or above this vs
+         * the last SPOKEN scene skip Gemma entirely (scene-unchanged skip).
+         * Conservative — a slightly-different scene still re-describes.
+         */
+        private const val CONTINUOUS_SKIP_SIMILARITY = 0.9f
 
         /**
          * Floor for text queries with no OCR text found (scene tap with no

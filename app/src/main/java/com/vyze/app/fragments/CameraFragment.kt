@@ -1083,6 +1083,18 @@ class CameraFragment : Fragment() {
                         return@takeSnapshot
                     }
 
+                    // Scene-unchanged gating: the controller skips the Gemma
+                    // run and fires onContinuousSkip instead of a full answer.
+                    // Return the state machine to IDLE so the auto-capture
+                    // loop keeps running without a spoken response.
+                    coreController.onContinuousSkip = {
+                        activity?.runOnUiThread {
+                            if (appState == AppState.ANALYZING) {
+                                appState = AppState.IDLE
+                                updateStatus("Scene unchanged")
+                            }
+                        }
+                    }
                     coreController.triggerSnapshot(bitmap, null, continuousMode = true)
                 } catch (e: Throwable) {
                     try { bitmap.recycle() } catch (_: Throwable) {}
@@ -1815,6 +1827,7 @@ class CameraFragment : Fragment() {
         conversationDeadlineMs = android.os.SystemClock.elapsedRealtime() + CONVERSATION_WINDOW_MS
         mainHandler.removeCallbacks(conversationWatchdog)
         mainHandler.postDelayed(conversationWatchdog, CONVERSATION_WINDOW_TICK_MS)
+        coreController.onConversationWindowOpened()
 
         stopVoiceListening() // clear any stale recognition session first
         appState = AppState.LISTENING
@@ -1855,6 +1868,9 @@ class CameraFragment : Fragment() {
         inConversationWindow = false
         mainHandler.removeCallbacks(conversationWatchdog)
         stopVoiceListening()
+        // Dialogue memory expires with the window — the next voice query
+        // after idle starts a fresh conversation, not a stale follow-up.
+        coreController.onConversationWindowClosed()
         if (appState == AppState.LISTENING) {
             appState = AppState.IDLE
             updateStatus("Ready")

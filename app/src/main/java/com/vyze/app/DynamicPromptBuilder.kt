@@ -31,7 +31,8 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
         bankCardMode: Boolean = false,
         memoryContext: String? = null,
         textOnlyMode: Boolean = false,
-        brevityLevel: com.vyze.app.memory.PreferenceLearner.BrevityLevel = com.vyze.app.memory.PreferenceLearner.BrevityLevel.NORMAL
+        brevityLevel: com.vyze.app.memory.PreferenceLearner.BrevityLevel = com.vyze.app.memory.PreferenceLearner.BrevityLevel.NORMAL,
+        dialogueContext: String? = null
     ): String {
         return try {
             val sb = StringBuilder()
@@ -81,6 +82,18 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
                     sb.appendLine()
                 }
                 com.vyze.app.memory.PreferenceLearner.BrevityLevel.NORMAL -> { /* no adaptation */ }
+            }
+
+            // 2c-pre. DIALOGUE MEMORY — recent voice exchanges for follow-ups.
+            //     Enables pronoun resolution across turns ("what about the one
+            //     behind it?") and lets the model answer CONVERSATIONALLY
+            //     instead of re-describing the whole scene from scratch.
+            //     Injected only for genuine voice follow-ups (see controller).
+            if (!dialogueContext.isNullOrBlank()) {
+                sb.appendLine("Recent conversation:")
+                sb.appendLine(dialogueContext)
+                sb.appendLine("This is a follow-up in an ongoing conversation. Resolve words like 'it', 'that', 'the one' using the conversation above. Answer the follow-up directly — do NOT re-describe the whole scene.")
+                sb.appendLine()
             }
 
             // 2c. Prior scene memory (context injection — never a substitute)
