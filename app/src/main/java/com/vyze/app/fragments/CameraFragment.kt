@@ -211,9 +211,21 @@ class CameraFragment : Fragment() {
             mainHandler.post {
                 try {
                     if (isNowOn) {
-                        ttsManager.speakQueued("It is dark. Flashlight is on.")
+                        ttsManager.speakQueued(
+                            ttsManager.localized(
+                                "It is dark. Flashlight is on.",
+                                "Gelap. Lampu suluh dihidupkan.",
+                                "光线很暗，已打开手电筒。"
+                            )
+                        )
                     } else {
-                        ttsManager.speakQueued("Light is sufficient. Flashlight is off.")
+                        ttsManager.speakQueued(
+                            ttsManager.localized(
+                                "Light is sufficient. Flashlight is off.",
+                                "Cahaya mencukupi. Lampu suluh dimatikan.",
+                                "光线充足，手电筒已关闭。"
+                            )
+                        )
                     }
                 } catch (_: Throwable) {}
             }
@@ -652,7 +664,16 @@ class CameraFragment : Fragment() {
                         if (isAdded && _fragmentCameraBinding != null) {
                             if (appState != AppState.ANALYZING) appState = AppState.ANALYZING
                             updateStatus("Analyzing...")
-                            (activity as? MainActivity)?.announceStatus("Analyzing scene...")
+                            (activity as? MainActivity)?.announceStatus(
+                                // Language FIX: follow the TTS voice, not the device
+                                // locale — hardcoded English under the Malay/Chinese
+                                // voice is what produced "analising sin".
+                                ttsManager.localized(
+                                    "Analyzing scene...",
+                                    "Menganalisis pemandangan...",
+                                    "正在分析画面"
+                                )
+                            )
                         }
                     }
 
@@ -682,7 +703,13 @@ class CameraFragment : Fragment() {
                     if (isAdded && _fragmentCameraBinding != null) {
                         appState = AppState.IDLE
                         updateStatus("Capture failed")
-                        ttsManager.speakImmediate("Could not capture the scene. Please try again.")
+                        ttsManager.speakImmediate(
+                            ttsManager.localized(
+                                "Could not capture the scene. Please try again.",
+                                "Tidak dapat merakam pemandangan. Sila cuba lagi.",
+                                "无法拍摄画面，请再试一次。"
+                            )
+                        )
                     }
                 }
             }
@@ -808,9 +835,17 @@ class CameraFragment : Fragment() {
                     val mainActivity = activity as? MainActivity
                     if (mainActivity != null) {
                         val hint = if (voiceAuditionLangStep) {
-                            "Say English, Malay, or Chinese, or say cancel."
+                            ttsManager.localized(
+                                "Say English, Malay, or Chinese, or say cancel.",
+                                "Sebut English, Melayu, atau Chinese, atau sebut batal.",
+                                "请说“英语”、“马来语”或“中文”，或说“取消”。"
+                            )
                         } else {
-                            "Say next, use this, or cancel."
+                            ttsManager.localized(
+                                "Say next, use this, or cancel.",
+                                "Sebut seterusnya, guna ini, atau batal.",
+                                "请说“下一个”、“用这个”或“取消”。"
+                            )
                         }
                         mainActivity.speakThenCallback(hint) {
                             mainHandler.postDelayed({ startVoiceListening() }, VOICE_SESSION_OPEN_DELAY_MS)
@@ -855,7 +890,13 @@ class CameraFragment : Fragment() {
                         // ends quietly instead of auto-restarting the mic forever.
                         if (wasVoiceSession) {
                             try {
-                                ttsManager.speakQueued("I did not catch that. Double tap and try again.")
+                                ttsManager.speakQueued(
+                                    ttsManager.localized(
+                                        "I did not catch that. Double tap and try again.",
+                                        "Saya tidak dengar itu. Sentuh dua kali dan cuba lagi.",
+                                        "我没有听清，请双击屏幕再试一次。"
+                                    )
+                                )
                             } catch (_: Throwable) {}
                         }
                     }
@@ -884,7 +925,13 @@ class CameraFragment : Fragment() {
                     // Announcement only when quiet: speakQueued() escalates to
                     // QUEUE_FLUSH, which would cut the in-flight answer.
                     try {
-                        ttsManager.speakQueued("The room is noisy. Tap once to look, or double tap to ask.")
+                        ttsManager.speakQueued(
+                            ttsManager.localized(
+                                "The room is noisy. Tap once to look, or double tap to ask.",
+                                "Bunyi bising. Sentuh sekali untuk melihat, atau sentuh dua kali untuk bertanya.",
+                                "周围很吵，单击看画面，或双击提问。"
+                            )
+                        )
                     } catch (_: Throwable) {}
                 }
             }
@@ -1144,9 +1191,21 @@ class CameraFragment : Fragment() {
             if (dark) {
                 // If the auto-torch hasn't flipped yet, apply it now
                 if (!torchOn) flashlightManager.toggleTorch(true)
-                ttsManager.speakQueued("It is dark. Flashlight is on.")
+                ttsManager.speakQueued(
+                    ttsManager.localized(
+                        "It is dark. Flashlight is on.",
+                        "Gelap. Lampu suluh dihidupkan.",
+                        "光线很暗，已打开手电筒。"
+                    )
+                )
             } else {
-                ttsManager.speakQueued("Light is sufficient. Flashlight is off.")
+                ttsManager.speakQueued(
+                    ttsManager.localized(
+                        "Light is sufficient. Flashlight is off.",
+                        "Cahaya mencukupi. Lampu suluh dimatikan.",
+                        "光线充足，手电筒已关闭。"
+                    )
+                )
             }
         } catch (_: Throwable) {}
         updateStatus(if (dark) "Dark — flashlight on" else "Light sufficient")
@@ -1530,7 +1589,13 @@ class CameraFragment : Fragment() {
                 appState = AppState.IDLE
                 updateStatus("Ready")
                 try {
-                    ttsManager.speakImmediate("Voice selection cancelled.")
+                    ttsManager.speakImmediate(
+                        ttsManager.localized(
+                            "Voice selection cancelled.",
+                            "Pemilihan suara dibatalkan.",
+                            "已取消语音选择。"
+                        )
+                    )
                 } catch (_: Throwable) {}
             }
             else -> {
@@ -1647,13 +1712,25 @@ class CameraFragment : Fragment() {
                 appState = AppState.IDLE
                 updateStatus("Ready")
                 try {
-                    ttsManager.speakImmediate("Voice selection cancelled.")
+                    ttsManager.speakImmediate(
+                        ttsManager.localized(
+                            "Voice selection cancelled.",
+                            "Pemilihan suara dibatalkan.",
+                            "已取消语音选择。"
+                        )
+                    )
                 } catch (_: Throwable) {}
             }
             else -> {
                 // Unclear — re-hint inside the audition
                 val mainActivity = activity as? MainActivity
-                mainActivity?.speakThenCallback("I did not catch that. Say next, use this, or cancel.") {
+                mainActivity?.speakThenCallback(
+                    ttsManager.localized(
+                        "I did not catch that. Say next, use this, or cancel.",
+                        "Saya tidak dengar itu. Sebut seterusnya, guna ini, atau batal.",
+                        "我没有听清。说“下一个”、“用这个”或“取消”。"
+                    )
+                ) {
                     mainHandler.postDelayed({ startVoiceListening() }, VOICE_SESSION_OPEN_DELAY_MS)
                 }
             }
@@ -1756,7 +1833,9 @@ class CameraFragment : Fragment() {
                 // long cue (e.g. the old "...or say voice settings..." hint)
                 // delayed the mic by ~5s, so users who spoke early lost their
                 // query and heard nothing back.
-                mainActivity.speakThenCallback("Listening.") {
+                mainActivity.speakThenCallback(
+                    ttsManager.localized("Listening.", "Silalah.", "请讲。")
+                ) {
                     // Open the mic AFTER the cue finishes so it is never captured.
                     mainHandler.postDelayed({ startVoiceListening() }, VOICE_SESSION_OPEN_DELAY_MS)
                 }

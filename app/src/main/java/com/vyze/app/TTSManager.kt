@@ -359,7 +359,7 @@ class TTSManager private constructor(context: Context) {
             val utteranceId = nextUtteranceId()
 
             if (engine != null) {
-                val enhanced = enhanceForNaturalProsody(applyPronunciationOverrides(text))
+                val enhanced = prepareForEngine(text)
                 pendingUtteranceIds.add(utteranceId)
                 speakWithEngine(
                     enhanced, utteranceId,
@@ -428,8 +428,8 @@ class TTSManager private constructor(context: Context) {
         lastSpeechTime = now
         lastSpokenText = text
 
-        // Enhance text with pronunciation overrides + natural prosody pauses
-        val enhancedText = enhanceForNaturalProsody(applyPronunciationOverrides(text))
+        // Pronunciation overrides + language smoothing + prosody pauses
+        val enhancedText = prepareForEngine(text)
 
         if (queueMode == TextToSpeech.QUEUE_FLUSH) {
             notifyFlushed()
@@ -475,8 +475,8 @@ class TTSManager private constructor(context: Context) {
         lastSpeechTime = now
         lastSpokenText = text
 
-        // Enhance text with pronunciation overrides + natural prosody pauses
-        val enhancedText = enhanceForNaturalProsody(applyPronunciationOverrides(text))
+        // Pronunciation overrides + language smoothing + prosody pauses
+        val enhancedText = prepareForEngine(text)
 
         // QUEUE_FLUSH semantics: barge-in — report the flushed utterances as
         // errors so waiting listeners can resume.
@@ -821,7 +821,134 @@ class TTSManager private constructor(context: Context) {
         speakImmediate("Testing audio playback 1 2 3")
     }
 
-    // ── Natural Prosody Enhancement ───────────────────────────────
+    // ── Engine Text Interception (pronunciation + language smoothing) ─
+
+    /**
+     * Single text interceptor that every speak() entry point funnels through.
+     * Runs, in order:
+     *  1. [applyPronunciationOverrides] — curated respellings (brand names,
+     *     phonetic repairs for English loans read by the wrong voice).
+     *  2. [applyLanguageSmoothing] — per-language flow fixes: Malay liaison
+     *     and Chinese trailing particle so sentences do not sound like
+     *     isolated word blocks with dead air between them.
+     *  3. [enhanceForNaturalProsody] — whitespace/punctuation normalization.
+     */
+    private fun prepareForEngine(text: String): String {
+        if (text.isBlank()) return text
+        var out = applyPronunciationOverrides(text)
+        out = applyLanguageSmoothing(out)
+        out = enhanceForNaturalProsody(out)
+        return out
+    }
+
+    /**
+     * True when [text] is predominantly CJK (Chinese). Used to route text to
+     * the Chinese smoothing rules even when the ACTIVE voice is a different
+     * language (e.g. a VLM answer containing embedded Chinese).
+     */
+    private fun isChineseText(text: String): Boolean {
+        var cjk = 0
+        var letters = 0
+        for (ch in text) {
+            if (ch.code in 0x4E00..0x9FFF || ch.code in 0x3400..0x4DBF) cjk++
+            if (ch.isLetter()) letters++
+        }
+        return letters > 0 && cjk * 2 >= letters
+    }
+
+    /**
+     * Per-language flow smoothing — fixes plosology (sharp, disconnected
+     * word sounds) that violates natural speech timing.
+     *
+     * ## Chinese (zh-CN voice)
+     * The voice reads each character in isolation with hard boundaries when
+     * text lacks natural prosody anchors. Two fixes:
+     *  - Normalize ASCII punctuation ("," ":" ";" "!" "?") to full-width
+     *    Chinese equivalents so the voice inserts native micro-pauses and
+     *    connects syllables instead of stuttering at ASCII boundaries.
+     *  - Append the soft trailing tail "，请稍等。" ("…please wait.") to
+     *    short status phrases (≤ 14 chars, e.g. "正在分析画面"). The tail
+     *    gives the voice a falling, completed intonation contour, so the
+     *    audio flows out instead of stopping abruptly on the last word.
+     *    Longer open sentences just get a closing 。; sentences with their
+     *    own terminal punctuation are left untouched.
+     *
+     * ## Malay (ms-MY voice)
+     * Google's ms-MY voice is a thin English-leaning pack: it reads English
+     * loans letter-by-letter with pauses between every word ("gas station"
+     * becomes two isolated words). Fix:
+     *  - Respell common English/technical loans with Malay phonetics so the
+     *    voice blends them into one fluid sound (see the table).
+     *  - Append the soft closing particle " ya." ("…okay.") to short phrases
+     *    so the last word lands in a natural falling contour instead of an
+     *    abrupt English-style full stop.
+     */
+    private fun applyLanguageSmoothing(text: String): String {
+        if (text.isBlank()) return text
+        return when {
+            currentLocale.language == "zh" || isChineseText(text) -> smoothChinese(text)
+            currentLocale.language == "ms" -> smoothMalay(text)
+            else -> text
+        }
+    }
+
+    /** Chinese-specific smoothing — see [applyLanguageSmoothing]. */
+    private fun smoothChinese(text: String): String {
+        // Ellipses (status strings end with “…”) read as an awkward dead-air
+        // hold or get merged with the next chunk — strip them first.
+        var out = text
+            .replace("\u2026", "")   // …
+            .replace("...", "")
+            // Decimal guard: "3.5" / "1,000" must keep their ASCII marks —
+            // the zh voice reads them natively but stumbles on 3。5.
+            .replace(Regex("(?<!\\d),(?!\\d)"), "\uff0c")   // , → ，
+            .replace(":", "\uff1a")      // : → ：
+            .replace(";", "\uff1b")      // ; → ；
+            .replace("!", "\uff01")      // ! → ！
+            .replace("?", "\uff1f")      // ? → ？
+            .replace(Regex("(?<!\\d)\\.(?!\\d)"), "\u3002")  // . → 。
+            // Collapse duplicated terminators left by the replacements above.
+            .replace("\u3002\u3002", "\u3002")
+            .replace("\u3002\uff01", "\uff01")
+            .replace("\u3002\uff1f", "\uff1f")
+            .trim()
+
+        if (out.isEmpty()) return out
+
+        val endsOpen = out.last() != '\u3002' && out.last() != '\uff01' && out.last() != '\uff1f'
+        if (endsOpen && out.length <= 14) {
+            // Short status phrase (“正在分析画面”) — close it with a soft,
+            // natural tail so the voice lands in a falling contour and the
+            // audio flows out instead of stopping abruptly.
+            out = "${out}\uff0c\u8bf7\u7a0d\u7b49\u3002"   // ，请稍等。
+        } else if (endsOpen) {
+            out = "${out}\u3002"
+        }
+        return out
+    }
+
+    /** Malay-specific smoothing — see [applyLanguageSmoothing]. */
+    private fun smoothMalay(text: String): String {
+        var out = text
+            .replace("\u2026", ".")   // … → . (ms voice reads U+2026 poorly)
+            .replace("...", ".")
+        // Phonetic respelling of English loans the ms voice stutters on.
+        // Whole-word, case-insensitive.
+        for ((from, to) in MALAY_PHONETIC_RESPELLINGS) {
+            out = out.replace(Regex("(?i)\\b" + Regex.escape(from) + "\\b"), to)
+        }
+        out = out.trim()
+
+        // Soft closing particle for short status-like phrases: a gentle
+        // " ya." tail gives the voice a completed intonation contour instead
+        // of an abrupt stop, blending the last word into a natural fall.
+        if (out.isNotEmpty() && out.length < 48 &&
+            !out.last().let { it == '.' || it == '!' || it == '?' }
+        ) {
+            out = "$out ya."
+        }
+        return out
+    }
 
     /**
      * Apply curated pronunciation overrides for brand/product names that
@@ -852,6 +979,10 @@ class TTSManager private constructor(context: Context) {
         if (text.isBlank()) return text
 
         var enhanced = text.trim()
+
+        // CJK text is handled by [smoothChinese] (full-width punctuation);
+        // the Latin-oriented spacing rules below would corrupt it.
+        if (isChineseText(enhanced)) return enhanced
 
         // Ensure sentence terminators are followed by a space
         enhanced = enhanced.replace(Regex("([.!?])([A-Za-z0-9])"), "$1 $2")
@@ -995,6 +1126,25 @@ class TTSManager private constructor(context: Context) {
     }
 
     fun getCurrentLanguageKey(): String = keyFromLocale(currentLocale)
+
+    /**
+     * Pick a spoken prompt variant for the ACTIVE TTS language.
+     *
+     * Status announcements in the gesture flow ("Analyzing scene…",
+     * "Listening.", …) must follow the TTS voice — NOT the device locale
+     * (R.string follows the device, which silently diverges from the
+     * mirrored/persisted voice language). Feeding English text to the Malay
+     * or Chinese voice is what produced the "analising sin" mispronunciations.
+     *
+     * Same contract as the audition prompts: one variant per supported
+     * language, keyed on [getCurrentLanguageKey].
+     */
+    fun localized(english: String, malay: String, chinese: String): String =
+        when (getCurrentLanguageKey()) {
+            LANGUAGE_MALAY -> malay
+            LANGUAGE_CHINESE -> chinese
+            else -> english
+        }
 
     fun getCurrentLanguageDisplayName(context: Context): String {
         return when (keyFromLocale(currentLocale)) {
@@ -1142,6 +1292,28 @@ class TTSManager private constructor(context: Context) {
 
         private val ENGLISH_PRONUNCIATION_OVERRIDES = mapOf(
             "maggi" to "Mayghee"
+        )
+
+        /**
+         * Phonetic respellings applied when the ACTIVE TTS voice is MALAY.
+         * Google's ms-MY voice is a thin English-leaning pack: plain English
+         * loans come out as letter-by-letter, disconnected sounds (the
+         * "analising sin" bug). Respelling the words in Malay orthography
+         * forces the engine to blend them into one fluid sound.
+         *
+         * Example: "analyzing screen" → "analising sin" — exactly how the
+         * engine should SAY it. Keep entries lowercase; matching is
+         * whole-word and case-insensitive.
+         */
+        private val MALAY_PHONETIC_RESPELLINGS = mapOf(
+            "analyzing" to "analising",
+            "analyze" to "analisis",
+            "screen" to "skrin",
+            "camera" to "kamera",
+            "image" to "imej",
+            "photo" to "foto",
+            "object" to "objek",
+            "battery" to "bateri"
         )
         private const val WARM_PITCH = 0.96f
         private const val WARM_RATE = 0.98f

@@ -104,7 +104,13 @@ class GestureRouter(
     // ── Color Analysis ────────────────────────────────────────────────
 
     private fun performColorAnalysis(containerView: View) {
-        ttsManager.speakImmediate(context.getString(R.string.color_analyzing))
+        ttsManager.speakImmediate(
+            ttsManager.localized(
+                context.getString(R.string.color_analyzing),
+                "Menganalisis warna...",
+                "正在分析颜色"
+            )
+        )
 
         try {
             val bitmap = Bitmap.createBitmap(
@@ -127,14 +133,26 @@ class GestureRouter(
             }
         } catch (e: Exception) {
             Log.e(TAG, "Color analysis failed", e)
-            ttsManager.speakImmediate("Color analysis failed.")
+            ttsManager.speakImmediate(
+                ttsManager.localized(
+                    "Color analysis failed.",
+                    "Analisis warna gagal.",
+                    "颜色分析失败。"
+                )
+            )
         }
     }
 
     // ── Emergency SOS ─────────────────────────────────────────────────
 
     private fun triggerEmergencySOS() {
-        ttsManager.speakImmediate(context.getString(R.string.sos_activated))
+        ttsManager.speakImmediate(
+            ttsManager.localized(
+                context.getString(R.string.sos_activated),
+                "Mod kecemasan diaktifkan. Membuka dialer.",
+                "紧急模式已激活，正在打开拨号器。"
+            )
+        )
 
         mainHandler.postDelayed({
             try {

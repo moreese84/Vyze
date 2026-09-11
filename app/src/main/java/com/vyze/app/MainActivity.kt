@@ -350,8 +350,13 @@ class MainActivity : AppCompatActivity() {
         CrashLogFile.log(TAG, "Playing onboarding announcement")
 
         ttsManager.speakImmediate(
-            "Vyze model ready. Tap anywhere or speak to ask a question, " +
-            "such as what is in front of me. Tap again to interrupt or ask a new question."
+            ttsManager.localized(
+                "Vyze model ready. Tap anywhere or speak to ask a question, " +
+                "such as what is in front of me. Tap again to interrupt or ask a new question.",
+                "Model Vyze sedia. Sentuh di mana-mana atau bercakap untuk bertanya soalan, " +
+                "contohnya apa yang ada di hadapan saya. Sentuh lagi untuk ganggu atau tanya soalan baharu.",
+                "Vyze模型已就绪。点击任意位置或说话提问，例如我前面有什么。再次点击可打断或提出新问题。"
+            )
         )
     }
 
@@ -565,7 +570,13 @@ class MainActivity : AppCompatActivity() {
 
         // Cue the user to repeat, then record + transcribe on the IO scope.
         // speakThenCallback fires onDone on the UI thread.
-        speakThenCallback("Please say that again.") {
+        speakThenCallback(
+            ttsManager.localized(
+                "Please say that again.",
+                "Sila sebut sekali lagi.",
+                "请再说一遍。"
+            )
+        ) {
             asrScope.launch {
                 try {
                     val audio = AudioCapture.recordSpeech()
