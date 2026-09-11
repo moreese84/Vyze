@@ -161,6 +161,8 @@ dependencies {
     implementation("com.google.mlkit:text-recognition:16.0.1")
     // Chinese script: Simplified + Traditional Chinese
     implementation("com.google.mlkit:text-recognition-chinese:16.0.1")
+    // Barcode scanning: 1D/2D — EAN/UPC (banknotes, products), QR, Data Matrix
+    implementation("com.google.mlkit:barcode-scanning:17.3.0")
     // Coroutines adapter for ML Kit Task API (provides .await())
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.7.3")
 

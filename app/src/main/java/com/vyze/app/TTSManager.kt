@@ -117,6 +117,15 @@ class TTSManager private constructor(context: Context) {
     @Volatile
     private var callerListener: UtteranceProgressListener? = null
 
+    /**
+     * Additive, engine-global callback fired ONLY for utterances that played
+     * to completion — never for speech flushed by stop()/QUEUE_FLUSH (those
+     * are reported as onError instead). Unlike [setOnUtteranceProgressListener]
+     * this does not replace the caller listener; multiple concerns can observe
+     * completion independently. Used by the preference learner.
+     */
+    var onUtteranceCompleted: ((utteranceId: String) -> Unit)? = null
+
     // ── Utterance ID Tracking ─────────────────────────────────────
     // Thread-safe set of utterance IDs currently queued or playing.
     // Every speak() call adds an ID; onDone/onError removes it.
@@ -590,6 +599,7 @@ class TTSManager private constructor(context: Context) {
     /** Utterance finished playing — untrack and forward. */
     private fun onUtteranceDone(id: String) {
         pendingUtteranceIds.remove(id)
+        try { onUtteranceCompleted?.invoke(id) } catch (_: Throwable) {}
         val listener = callerListener
         mainHandler.post { listener?.onDone(id) }
     }
@@ -836,9 +846,45 @@ class TTSManager private constructor(context: Context) {
     private fun prepareForEngine(text: String): String {
         if (text.isBlank()) return text
         var out = applyPronunciationOverrides(text)
+        out = expandIdentifierCodes(out)
         out = applyLanguageSmoothing(out)
         out = enhanceForNaturalProsody(out)
         return out
+    }
+
+    /**
+     * Identifier codes (vehicle plates, serial/reference numbers) must be
+     * spoken CHARACTER BY CHARACTER — "QLB 3469" as "Q L B, three four six
+     * nine", never "three thousand four hundred sixty-nine". The prompt now
+     * instructs the model to do this; this TTS-layer net catches whatever the
+     * model still emits in compact form (or verbatim OCR echoes).
+     *
+     * Matches letter-prefix + digits tokens ("QLB 3469", "QLB3469", "W 1234")
+     * and spaces out every character. Currency/unit prefixes ("RM12.90",
+     * "12kg") are explicitly excluded so prices and quantities are untouched.
+     */
+    private fun expandIdentifierCodes(text: String): String {
+        // Letters (1-3) + optional space/hyphen + digits (1-4) + optional
+        // trailing letter — the common plate/code shapes.
+        val codeRegex = Regex("\\b([A-Za-z]{1,3})[- ]?(\\d{1,4})([A-Za-z])?\\b")
+        return codeRegex.replace(text) { m ->
+            val prefix = m.groupValues[1].uppercase()
+            val trailing = m.groupValues[3]
+            // Price/quantity guard: currency prefixes (RM12, USD99) and units
+            // (kg25 is rare, but “No12”-style refs stay untouched) are never
+            // expanded; neither is a price decimal (“RM12.90”).
+            val next = m.range.last + 1
+            val followedByDecimal =
+                next < text.length && text[next] == '.' &&
+                    next + 1 < text.length && text[next + 1].isDigit()
+            if (prefix in CURRENCY_AND_UNIT_PREFIXES || followedByDecimal) {
+                m.value
+            } else {
+                val letters = m.groupValues[1].uppercase().toCharArray().joinToString(" ")
+                val digits = m.groupValues[2].toCharArray().joinToString(" ")
+                if (trailing.isNotBlank()) "$letters $digits ${trailing.uppercase()}" else "$letters $digits"
+            }
+        }
     }
 
     /**
@@ -993,9 +1039,13 @@ class TTSManager private constructor(context: Context) {
         // Ensure colons/semicolons are followed by a space
         enhanced = enhanced.replace(Regex("([:;])([A-Za-z0-9])"), "$1 $2")
 
-        // Add trailing period if missing
+        // Add trailing period if missing. A trailing ',' is already valid
+        // punctuation for TTS and marks a mid-sentence fast-start fragment —
+        // stamping a period there would force full-stop intonation and a
+        // dead-air seam into the middle of a flowing sentence.
         if (enhanced.isNotEmpty() && !enhanced.last().isWhitespace() &&
-            enhanced.last() !in charArrayOf('.', '!', '?')) {
+            enhanced.last() !in charArrayOf('.', '!', '?', ',')
+        ) {
             enhanced = "$enhanced."
         }
 
@@ -1245,6 +1295,17 @@ class TTSManager private constructor(context: Context) {
 
     companion object {
         private const val TAG = "[TTSManager]"
+
+        /**
+         * Prefixes that mark a letter+digit token as currency/quantity, not an
+         * identifier code — "RM12.90" must stay "twelve ringgit", while
+         * "QLB 3469" must be spelled out.
+         */
+        private val CURRENCY_AND_UNIT_PREFIXES = setOf(
+            "RM", "RP", "SGD", "USD", "EUR", "GBP", "IDR", "MYR", "HKD",
+            "NT", "RS", "R", "US", "AU", "NZ", "CA", "HK", "S",
+            "KG", "CM", "MM", "KM", "ML", "MG", "OZ", "LB", "NO", "NUM"
+        )
 
         @Volatile
         private var instance: TTSManager? = null

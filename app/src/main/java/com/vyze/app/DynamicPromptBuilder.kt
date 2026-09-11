@@ -30,7 +30,8 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
         currencyMode: Boolean = false,
         bankCardMode: Boolean = false,
         memoryContext: String? = null,
-        textOnlyMode: Boolean = false
+        textOnlyMode: Boolean = false,
+        brevityLevel: com.vyze.app.memory.PreferenceLearner.BrevityLevel = com.vyze.app.memory.PreferenceLearner.BrevityLevel.NORMAL
     ): String {
         return try {
             val sb = StringBuilder()
@@ -51,8 +52,8 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
                 // a scene, and stay concise for spoken delivery.
                 textOnlyMode -> sb.appendLine(TEXT_ONLY_RULES)
                 continuousMode -> sb.appendLine(CONTINUOUS_MODE_RULES)
-                isDirectQuery -> sb.appendLine(BASE_RULES_DIRECT_QUERY)
-                else -> sb.appendLine(BASE_RULES_NAVIGATION)
+                isDirectQuery -> sb.appendLine(directQueryRulesFor(userLocale.language))
+                else -> sb.appendLine(navigationRulesFor(userLocale.language))
             }
 
             // 2. OCR pre-extracted text (if available — feeds clean text to model)
@@ -64,6 +65,22 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
                 sb.appendLine("The OCR text above is the ground truth. Read it as whole words and " +
                     "continuous sentences — never spell it letter by letter. When asked to read " +
                     "text, read ALL of it in reading order; do not summarize, skip, or stop early.")
+            }
+
+            // 2b-bis. LEARNED BREVITY — silently adapted answer length.
+            //     (Placed after OCR so the reading directive above always wins
+            //     for text reads: OCR reading is ground-truth playback and
+            //     must never be cut short, regardless of brevity.)
+            when (brevityLevel) {
+                com.vyze.app.memory.PreferenceLearner.BrevityLevel.BRIEF -> {
+                    sb.appendLine("LENGTH: Keep your answer concise — at most 2 short sentences. The user is pressed for time.")
+                    sb.appendLine()
+                }
+                com.vyze.app.memory.PreferenceLearner.BrevityLevel.TERSE -> {
+                    sb.appendLine("LENGTH: Answer in ONE short sentence. The user consistently prefers minimal answers.")
+                    sb.appendLine()
+                }
+                com.vyze.app.memory.PreferenceLearner.BrevityLevel.NORMAL -> { /* no adaptation */ }
             }
 
             // 2c. Prior scene memory (context injection — never a substitute)
@@ -183,44 +200,109 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
         /**
          * NAVIGATION MODE — used for generic taps and automatic spatial descriptions.
          */
-        private const val BASE_RULES_NAVIGATION =
+        private const val NAV_RULES_PROSE =
             "Describe the scene in 1-2 DENSE sentences — more useful detail per word, never wordy prose. " +
             "For each key object say what it is plus the details you can ACTUALLY SEE: " +
             "color, size, material, and state (open/closed, full/empty, lying/standing). " +
             "Add left/center/right + distance when it places the object for the user. " +
             "For a packaged product (packet, box, bottle, can), first say its BRAND name " +
             "and product type exactly as printed, then its details. " +
-            "Read printed text verbatim in ORIGINAL language as whole words — never spell letter by letter. " +
+            "Read printed words verbatim in ORIGINAL language as whole words — never spell them letter by letter. " +
+            "Vehicle plates, codes, serial and phone numbers are read CHARACTER BY CHARACTER — letters one by one, digits one by one ('QLB 3469' is spoken 'Q L B, three four six nine'), never as a quantity. " +
             "No filler phrases ('there is', 'I see', 'in the image', 'it appears'). " +
             "Use clear punctuation: periods to end sentences, commas to separate details. " +
             "If unsure about an object, say 'not clearly visible'. Do NOT guess or hallucinate. " +
-            "Mirrors/glass: describe the surface itself.\n" +
-            "Examples:\n" +
-            "Input: door in front. Output: Brown wooden door, closed, center, about 2 steps ahead.\n" +
-            "Input: person nearby. Output: Person on your left, about 1 step away.\n" +
-            "Input: sofa scene. Output: Grey fabric sofa, soft cushions, about 3 steps ahead. Low wooden table in front of it.\n" +
-            "Input: bottle on table. Output: Clear glass water bottle, half full, on the table about 1 step ahead.\n" +
-            "Input: dark room. Output: Dark room. No obstacles detected within 3 steps.\n" +
-            "Input: red packet on table. Output: Small red Maggi instant noodle packet, closed, on the table about 1 step ahead — label reads Maggi Kari."
+            "Mirrors/glass: describe the surface itself.\n"
 
-        private const val BASE_RULES_DIRECT_QUERY =
+        private const val DIRECT_RULES_PROSE =
             "Answer directly in the first sentence. " +
             "Name the object and give compact, useful details — size, color, material, " +
             "state (open/closed, full/empty) — only what you can ACTUALLY see, never long prose. " +
             "If it is a packaged product (packet, box, bottle, can), first say its BRAND name and product type " +
             "exactly as printed on it, then its details. " +
             "Read text verbatim in ORIGINAL language as whole words and sentences — never spell letter by letter. " +
+            "Vehicle plates, codes, serial and phone numbers are read CHARACTER BY CHARACTER — letters one by one, digits one by one ('QLB 3469' is spoken 'Q L B, three four six nine'), never as a quantity. " +
             "When asked to read text, read the ENTIRE text in reading order; never stop halfway or summarize. " +
             "Keep the whole answer to 1-3 short spoken sentences. " +
             "Use clear punctuation: periods to end sentences, commas for pauses between details. " +
             "If text is blurry or unreadable, say 'Text is unclear' — NEVER guess. " +
             "If no text visible, say 'No text visible'. " +
-            "Only what you see in THIS image.\n" +
+            "Only what you see in THIS image.\n"
+
+        // ── Language-matched few-shot examples ────────────────────────
+        // For a small on-device model, in-context examples dominate abstract
+        // instructions. English-only examples taught structure but pulled the
+        // OUTPUT language toward English even when the language directives
+        // said otherwise. The examples below are the SAME six/four scenes
+        // rendered in Malay / Chinese, so the demonstrated structure AND the
+        // demonstrated output language always match the user's spoken
+        // language. Natural Malaysian loanwords (Maggi, cushion-style mixing)
+        // are kept where locals actually speak that way.
+
+        private const val NAV_EXAMPLES_EN =
+            "Examples:\n" +
+            "Input: door in front. Output: Brown wooden door, closed, center, about 2 steps ahead.\n" +
+            "Input: person nearby. Output: Person on your left, about 1 step away.\n" +
+            "Input: sofa scene. Output: Grey fabric sofa, soft cushions, about 3 steps ahead. Low wooden table in front of it.\n" +
+            "Input: bottle on table. Output: Clear glass water bottle, half full, on the table about 1 step ahead.\n" +
+            "Input: dark room. Output: Dark room. No obstacles detected within 3 steps.\n" +
+            "Input: red packet on table. Output: Small red Maggi instant noodle packet, closed, on the table about 1 step ahead — label reads Maggi Kari.\n" +
+            "Input: car plate ahead. Output: Vehicle plate Q L B, three four six nine."
+
+        private const val NAV_EXAMPLES_MS =
+            "Examples:\n" +
+            "Input: pintu di hadapan. Output: Pintu kayu perang, tertutup, di tengah, kira-kira 2 langkah di hadapan.\n" +
+            "Input: orang berdekatan. Output: Orang di sebelah kiri anda, kira-kira 1 langkah.\n" +
+            "Input: sofa. Output: Sofa kain kelabu, cushion lembut, kira-kira 3 langkah di hadapan. Meja kayu rendah di hadapannya.\n" +
+            "Input: botol di atas meja. Output: Botol air kaca lutsinar, separuh penuh, di atas meja kira-kira 1 langkah.\n" +
+            "Input: bilik gelap. Output: Bilik gelap. Tiada halangan dikesan dalam 3 langkah.\n" +
+            "Input: paket merah di atas meja. Output: Paket mi Maggi merah kecil, tertutup, di atas meja kira-kira 1 langkah — label tertulis Maggi Kari.\n" +
+            "Input: plat kereta di hadapan. Output: Plat kenderaan Q L B, tiga empat enam sembilan."
+
+        private const val NAV_EXAMPLES_ZH =
+            "Examples:\n" +
+            "Input: 前面有门。Output: 棕色木门，关着，在正前方，大约两步远。\n" +
+            "Input: 附近有人。Output: 有人在你的左边，大约一步远。\n" +
+            "Input: 沙发。Output: 灰色布沙发，软垫，大约三步远。前面有一张矮木桌。\n" +
+            "Input: 桌上有瓶子。Output: 透明玻璃水瓶，半满，在桌上，大约一步远。\n" +
+            "Input: 黑暗的房间。Output: 黑暗的房间。三步内没有检测到障碍物。\n" +
+            "Input: 桌上有红色包装。Output: 桌上有一包红色的小包装Maggi快熟面，封着口——标签写着Maggi Kari。\n" +
+            "Input: 前面有车牌。Output: 车牌Q L B，数字是三、四、六、九。"
+
+        private const val DIRECT_EXAMPLES_EN =
             "Examples:\n" +
             "Input: what is this? Image shows a red packet. Output: Small red Maggi instant noodle packet, closed. Label reads Maggi Kari — noodles and seasoning sachets inside.\n" +
             "Input: what medicine is this? Image shows Diclac Retard box. Output: Diclac Retard, diclofenac sodium 100 milligram. Take one tablet daily after meals.\n" +
             "Input: read this label. Image shows price tag RM12.90. Output: Price is 12 Ringgit and 90 sen.\n" +
             "Input: what does this sign say? Image blurry. Output: Text is unclear."
+
+        private const val DIRECT_EXAMPLES_MS =
+            "Examples:\n" +
+            "Input: apa ini? Imej menunjukkan paket mi merah. Output: Paket mi Maggi merah kecil, tertutup. Label tertulis Maggi Kari — mi dan sachet perencah di dalamnya.\n" +
+            "Input: ubat apa ini? Imej menunjukkan kotak Diclac Retard. Output: Diclac Retard, diklofenak natrium 100 miligram. Ambil satu tablet sehari selepas makan.\n" +
+            "Input: baca label ini. Imej menunjukkan tag harga RM12.90. Output: Harganya 12 Ringgit dan 90 sen.\n" +
+            "Input: apa yang tertulis di papan tanda ini? Imej kabur. Output: Teks tidak jelas."
+
+        private const val DIRECT_EXAMPLES_ZH =
+            "Examples:\n" +
+            "Input: 这是什么？图像显示一个红色包装。Output: 一包红色的小包装Maggi快熟面，封着口。标签写着Maggi Kari——里面是面条和调味包。\n" +
+            "Input: 这是什么药？图像显示Diclac Retard药盒。Output: Diclac Retard，双氯芬酸钠100毫克。每天饭后服用一片。\n" +
+            "Input: 读一下这个标签。图像显示价格标签RM12.90。Output: 价格是12令吉90仙。\n" +
+            "Input: 这个牌子上写什么？图像模糊。Output: 文字不清楚。"
+
+        /** Navigation rules with few-shot examples in the user's language. */
+        private fun navigationRulesFor(language: String): String = when (language) {
+            "ms" -> NAV_RULES_PROSE + NAV_EXAMPLES_MS
+            "zh" -> NAV_RULES_PROSE + NAV_EXAMPLES_ZH
+            else -> NAV_RULES_PROSE + NAV_EXAMPLES_EN
+        }
+
+        /** Direct-query rules with few-shot examples in the user's language. */
+        private fun directQueryRulesFor(language: String): String = when (language) {
+            "ms" -> DIRECT_RULES_PROSE + DIRECT_EXAMPLES_MS
+            "zh" -> DIRECT_RULES_PROSE + DIRECT_EXAMPLES_ZH
+            else -> DIRECT_RULES_PROSE + DIRECT_EXAMPLES_EN
+        }
 
         private const val DEFAULT_NAVIGATION_QUERY =
             "Describe environment: obstacles, doors, people, text."

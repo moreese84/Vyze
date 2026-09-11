@@ -9,6 +9,7 @@ import android.util.Log
 import com.vyze.app.data.InteractionDao
 import com.vyze.app.data.MemoryDao
 import com.vyze.app.memory.MemoryRepository
+import com.vyze.app.memory.PreferenceLearner
 import com.vyze.app.memory.SimilarInteraction
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -52,6 +53,9 @@ class VyzeCoreController(
     private val vlmEngine = VlmEngineManager(context, memoryRepository)
     private val promptBuilder = DynamicPromptBuilder(memoryDao)
     private val ocrHelper = OcrHelper()
+    private val barcodeHelper = BarcodeHelper()
+    private val scanRepository by lazy { com.vyze.app.data.ScanRepository(context.applicationContext) }
+    private val preferenceLearner = PreferenceLearner(memoryDao)
 
     private val isInferring = AtomicBoolean(false)
 
@@ -113,6 +117,15 @@ class VyzeCoreController(
     // spoken after the whole generation finished (or stalled entirely on long
     // answers), which users perceived as "no response" for Chinese queries.
     private val SENTENCE_TERMINATORS = charArrayOf('.', '!', '?', '\n', '。', '！', '？', '；')
+
+    private var flushCountersSent = 0
+
+    /** True while the CURRENT flush is a mid-sentence fast-start fragment. */
+    @Volatile
+    private var fastStartFragment = false
+
+    /** Chars accumulated before a post-first coalesced flush may fire. */
+    private val COALESCED_FLUSH_CHARS = 110
 
     private val minFlushChars = 10
 
@@ -419,10 +432,14 @@ class VyzeCoreController(
             .trim()
 
         // Enforce trailing punctuation — Android TTS clips phonemes on
-        // unpunctuated final words. Append '.' if missing.
+        // unpunctuated final words. Append '.' if missing. A trailing ',' is
+        // kept as-is: it is already punctuation (anti-clipping satisfied), and
+        // it marks a fast-start mid-sentence fragment whose continuation must
+        // flow — stamping a period there would force full-stop intonation and
+        // a dead-air seam into the middle of a sentence.
         if (cleaned.isNotEmpty()) {
             val lastChar = cleaned.last()
-            if (lastChar != '.' && lastChar != '!' && lastChar != '?') {
+            if (lastChar != '.' && lastChar != '!' && lastChar != '?' && lastChar != ',') {
                 cleaned = "$cleaned."
             }
         }
@@ -485,14 +502,52 @@ class VyzeCoreController(
                 val spaceIdx = text.lastIndexOf(' ', FAST_START_CHARS - 1)
                 if (spaceIdx >= FAST_START_MIN_CHARS) {
                     cut = spaceIdx
+                    // Continuity FIX: do NOT let sanitizeForTts stamp a period
+                    // onto this mid-sentence fragment. A period gives the
+                    // continuation full-stop intonation + a dead-air seam
+                    // ("Brown wooden door. …closed, center…"). A comma keeps
+                    // the voice in listing intonation, so the rest of the
+                    // sentence flows as one natural continuation.
+                    fastStartFragment = true
                 }
             }
-            if (cut < 0) return
+            if (cut < 0) {
+                return
+            }
             // Keep buffering tiny fragments ("Yes.") so a one-word sentence
             // doesn't become its own clipped utterance — it joins the next one.
             if (cut + 1 < minFlushChars) return
 
-            chunk = sanitizeForTts(text.substring(0, cut + 1))
+            // ── COALESCED FLUSH (post-first utterances) ───────────
+            // After the first flush, accumulate ~2 short sentences (or one
+            // long one) before speaking again. Android TTS leaves a 100-300ms
+            // hardware seam between separate utterances — one utterance per
+            // sentence made longer answers sound like stop-start reading.
+            // Coalescing turns most answers into 1-2 flowing utterances at
+            // the cost of ~0.5-1s extra wait on LATER sentences only (the
+            // first flush still speaks at the earliest possible moment).
+            if (firstChunkSent && flushCountersSent >= 1 && !fastStartFragment) {
+                val lastIdx = lastSentenceTerminatorIndex(text)
+                val coalescedLen = (lastIdx?.plus(1)) ?: text.length
+                if (coalescedLen < COALESCED_FLUSH_CHARS &&
+                    text.length < readAheadCeiling
+                ) {
+                    return // keep buffering — more sentences will join this utterance
+                }
+                // Coalescing target reached: cut at the LAST terminator so
+                // maximum content rides in this one utterance. (Past the hard
+                // ceiling the cut is already forced — speak now, boundary or not.)
+                if (lastIdx != null && text.length < readAheadCeiling) {
+                    cut = lastIdx
+                }
+            }
+
+            val cutEnd = cut + 1
+            chunk = sanitizeForTts(
+                text.substring(0, cutEnd) + if (fastStartFragment) "," else ""
+            )
+            fastStartFragment = false
+            flushCountersSent++
 
             sentenceBuffer.delete(0, cut + 1)
             while (sentenceBuffer.isNotEmpty() && sentenceBuffer[0] == ' ') {
@@ -566,8 +621,18 @@ class VyzeCoreController(
             sentenceBuffer.clear()
         }
         firstChunkSent = false
+        flushCountersSent = 0
+        fastStartFragment = false
         tokenConfidenceBuffer.clear()
         confidenceCheckPassed = false
+    }
+
+    /** Index of the LAST sentence terminator in [text], or null if none. */
+    private fun lastSentenceTerminatorIndex(text: String): Int? {
+        for (i in text.length - 1 downTo 0) {
+            if (text[i] in SENTENCE_TERMINATORS) return i
+        }
+        return null
     }
 
     // ── Full Pipeline Reset ────────────────────────────────────────
@@ -581,7 +646,28 @@ class VyzeCoreController(
      *
      * Must be called BEFORE [triggerSnapshot] to guarantee isolation.
      */
+    init {
+        // Answer-completion signal for the preference learner: fires ONLY for
+        // utterances that played to the end — never for flushed/stopped speech
+        // (notifyFlushed reports those as onError). Each fully-heard answer is
+        // evidence the current verbosity is acceptable and erodes one step of
+        // interrupt evidence.
+        ttsManager.onUtteranceCompleted = { _ ->
+            scope.launch { preferenceLearner.recordAnswerCompleted() }
+        }
+    }
+
     fun resetForNewCapture() {
+        // 0. PREFERENCE SIGNAL: a user-initiated capture while speech is still
+        //    playing = impatience evidence ("that answer was longer than I
+        //    needed"). MUST be read before ttsManager.stop() below, which
+        //    clears the pending-utterance state. Continuous-mode auto-captures
+        //    never pass through this method, so leaning back and listening can
+        //    never be misread as impatience.
+        if (ttsManager.hasPendingSpeech()) {
+            scope.launch { preferenceLearner.recordInterruptWhileSpeaking() }
+        }
+
         // 1. Stop any active TTS — cancel lingering audio
         ttsManager.stop()
 
@@ -756,6 +842,7 @@ class VyzeCoreController(
                 // text (medicine boxes, signs), so taps always OCR.
                 var ocrText: String? = null
                 var ocrConfidence = 0f
+                var barcodeResult: Pair<String, String>? = null
 
                 if (isTextQuery) {
                     CrashLogFile.log(TAG, "Text query detected — running ML Kit OCR...")
@@ -763,6 +850,44 @@ class VyzeCoreController(
                     ocrText = ocrResult.first
                     ocrConfidence = ocrResult.second
                     CrashLogFile.log(TAG, "OCR result: ${ocrText?.take(100) ?: "(none)"} confidence=$ocrConfidence")
+
+                    // ── BARCODE PRE-PASS (runs alongside OCR) ─────────
+                    // ~50-120ms. Runs on every text/tap query so retail
+                    // products and banknotes are identified by their barcode
+                    // even when printed labels are unreadable to OCR.
+                    try {
+                        barcodeResult = barcodeHelper.scan(inferenceBitmap)
+                        if (barcodeResult != null) {
+                            CrashLogFile.log(TAG, "Barcode detected: ${barcodeResult?.second} — ${barcodeResult?.first?.take(60)}")
+                        }
+                    } catch (e: Throwable) {
+                        CrashLogFile.logError(TAG, "Barcode pre-pass failed: ${e.message}", e)
+                    }
+
+                    // ── SCAN HISTORY PERSISTENCE ─────────────────────
+                    // Fire-and-forget (sibling on the controller scope, so an
+                    // inference cancel can't lose the write): the scan DID
+                    // happen once OCR/barcode recognized content. Covers the
+                    // OCR fast-path, VLM-path and OCR-fallback completions
+                    // without duplicating per completion path.
+                    val ocrToPersist = ocrText
+                    val barcodeToPersist = barcodeResult
+                    if (!ocrToPersist.isNullOrBlank() || barcodeToPersist != null) {
+                        scope.launch {
+                            try {
+                                ocrToPersist?.let {
+                                    scanRepository.saveOcrScan(it)
+                                    CrashLogFile.log(TAG, "OCR scan saved: ${it.take(60)}")
+                                }
+                                barcodeToPersist?.let { (rawValue, format) ->
+                                    scanRepository.saveBarcodeScan(rawValue, format)
+                                    CrashLogFile.log(TAG, "Barcode scan saved: $format — ${rawValue.take(60)}")
+                                }
+                            } catch (e: Throwable) {
+                                CrashLogFile.logError(TAG, "Scan history save failed: ${e.message}", e)
+                            }
+                        }
+                    }
 
                     // ── MEDICINE LOOKUP: cross-reference OCR against local DB ──
                     // If OCR text matches a known medicine, inject structured drug
@@ -851,7 +976,8 @@ class VyzeCoreController(
                     CrashLogFile.log(TAG, "Memory context injected: ${memoryContext.take(80)}...")
                 }
 
-                CrashLogFile.log(TAG, "Building prompt...")
+                val brevityLevel = preferenceLearner.getBrevityLevel()
+                CrashLogFile.log(TAG, "Building prompt... (brevity=${brevityLevel.label})")
                 val basePrompt = promptBuilder.buildPrompt(
                     snapshotDescription = query ?: "User triggered a camera snapshot.",
                     queryOverride = query,
@@ -860,7 +986,8 @@ class VyzeCoreController(
                     ocrText = ocrText,
                     currencyMode = currencyModeActive,
                     bankCardMode = bankCardModeActive,
-                    memoryContext = memoryContext
+                    memoryContext = memoryContext,
+                    brevityLevel = brevityLevel
                 )
                 CrashLogFile.log(TAG, "Base prompt built: ${basePrompt.length} chars")
 
@@ -878,7 +1005,14 @@ class VyzeCoreController(
                 val inferenceMaxTokens = if (isTextQuery) {
                     textQueryTokenBudget(ocrText)
                 } else {
-                    SCENE_QUERY_MAX_TOKENS
+                    // Learned brevity tightens the output budget so short
+                    // answers also finish GENERATING sooner, not just read
+                    // shorter — first-audio latency improves with it.
+                    when (brevityLevel) {
+                        PreferenceLearner.BrevityLevel.NORMAL -> SCENE_QUERY_MAX_TOKENS
+                        PreferenceLearner.BrevityLevel.BRIEF -> (SCENE_QUERY_MAX_TOKENS * 4) / 5
+                        PreferenceLearner.BrevityLevel.TERSE -> (SCENE_QUERY_MAX_TOKENS * 3) / 5
+                    }
                 }
                 val response = vlmEngine.analyzeImage(
                     bitmap = inferenceBitmap,
@@ -1094,7 +1228,8 @@ class VyzeCoreController(
                     ocrText = null,
                     currencyMode = false,
                     bankCardMode = false,
-                    memoryContext = null
+                    memoryContext = null,
+                    brevityLevel = preferenceLearner.getBrevityLevel()
                 )
                 CrashLogFile.log(TAG, "Text prompt built: ${basePrompt.length} chars")
 
@@ -1285,6 +1420,7 @@ class VyzeCoreController(
     fun destroy() {
         vlmEngine.close()
         ocrHelper.close()
+        barcodeHelper.close()
         scope.cancel()
         Log.d(TAG, "VyzeCoreController destroyed")
     }
