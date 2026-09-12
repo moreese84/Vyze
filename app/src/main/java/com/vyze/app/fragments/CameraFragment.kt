@@ -135,6 +135,15 @@ class CameraFragment : Fragment() {
     @Volatile
     private var lastConfidence = 1f
 
+    /**
+     * Consecutive grey-band confirmation asks without a confirmed result.
+     * Caps the loop: if the user's retry ALSO lands in the grey band, the
+     * pipeline runs it anyway instead of asking forever — a probable mis-hear
+     * is better than dead air for a blind user.
+     */
+    @Volatile
+    private var consecutiveConfirmationAsks = 0
+
     /** Debounce: prevents duplicate triggers from gesture + click overlap or speech re-trigger. */
     private var lastTriggerTime = 0L
     private val TRIGGER_DEBOUNCE_MS = 1000L
@@ -332,9 +341,37 @@ class CameraFragment : Fragment() {
                     }
                     appState = AppState.IDLE
                     updateStatus("Error: $error")
-                    // Don't speak the error — just log it. Speaking errors during
-                    // rapid tapping causes "Failed to capture" double-speak.
                     Log.e(TAG, "VLM error (not spoken to user): $error")
+                    // ── VOICE-QUERY RECOVERY ────────────────────────
+                    // A voice query that dies (null model response, timeout,
+                    // crash) must NEVER end in silence — the user is waiting
+                    // for an answer with no screen to look at. Speak a short
+                    // recovery cue and reopen the follow-up mic. Tap flows stay
+                    // silent (the original rapid-tap double-speak concern).
+                    lastConfidence = 1f
+                    consecutiveConfirmationAsks = 0
+                    if (keepMicOpenAfterAnswer) {
+                        val mainActivity = activity as? MainActivity
+                        if (mainActivity != null) {
+                            mainActivity.speakThenCallback(
+                                ttsManager.localized(
+                                    "Sorry, I did not get an answer. Please ask again.",
+                                    "Maaf, tiada jawapan diterima. Sila tanya semula.",
+                                    "抱歉，没有得到答案。请再问一次。"
+                                )
+                            ) {
+                                appState = AppState.LISTENING
+                                updateStatus("Listening...")
+                                mainHandler.postDelayed(
+                                    { startVoiceListening() },
+                                    FOLLOW_UP_OPEN_DELAY_MS
+                                )
+                            }
+                            return@runOnUiThread
+                        }
+                    }
+                    // Don't speak errors for tap flows — rapid tapping caused
+                    // "Failed to capture" double-speak.
                 }
             }
         }
@@ -835,9 +872,21 @@ class CameraFragment : Fragment() {
                                 } else if (coreController.detectInstantAnswer(spokenText)) {
                                     Log.d(TAG, "Instant answer: \"$spokenText\"")
                                     coreController.triggerInstantAnswer(spokenText)
-                                    // Stay in the current listening state — the
-                                    // mic stays open and the next utterance flows.
-                                } else if (lastConfidence in 0.35f..CONFIRM_ABOVE_CONFIDENCE) {
+                                    // Proper speech lifecycle: speakQueued flushed
+                                    // the active recognizer session (tts.stop), so
+                                    // "staying listening" left dead air. Run the
+                                    // SPEAKING state, drain the utterance, then
+                                    // reopen the follow-up mic like any answer.
+                                    appState = AppState.SPEAKING
+                                    updateStatus("Ready [instant]")
+                                    consecutiveConfirmationAsks = 0
+                                    waitForTtsDrain {
+                                        appState = AppState.IDLE
+                                        maybeOpenFollowUpWindow()
+                                    }
+                                } else if (lastConfidence in 0.35f..CONFIRM_ABOVE_CONFIDENCE &&
+                                    consecutiveConfirmationAsks < MAX_CONFIRMATION_ASKS
+                                ) {
                                     askQueryConfirmation(spokenText, detectedLocale)
                                 } else if (coreController.isTextOnlyQuery(spokenText)) {
                                     // ── TEXT-ONLY Q&A ────────────────────
@@ -845,11 +894,13 @@ class CameraFragment : Fragment() {
                                     // paracetamol used for?") — no camera frame
                                     // needed. Faster + cheaper than image inference.
                                     Log.d(TAG, "Text-only query: \"$spokenText\"")
+                                    consecutiveConfirmationAsks = 0
                                     coreController.resetForNewCapture()
                                     appState = AppState.ANALYZING
                                     updateStatus("Answering...")
                                     coreController.triggerTextQuery(spokenText)
                                 } else {
+                                    consecutiveConfirmationAsks = 0
                                     coreController.resetForNewCapture()
                                     appState = AppState.IDLE
                                     updateStatus("Heard: \"$spokenText\"")
@@ -1879,6 +1930,7 @@ class CameraFragment : Fragment() {
         val mainActivity = activity as? MainActivity ?: return
         pendingConfirmationText = text
         pendingConfirmationLocale = locale
+        consecutiveConfirmationAsks++
         appState = AppState.LISTENING
         val preview = text.take(60)
         Log.d(TAG, "Low-confidence transcript — asking confirmation: \"$preview\"")
@@ -1893,6 +1945,11 @@ class CameraFragment : Fragment() {
             // without another gesture. Expire after a short silence.
             confirmationExpiryRunnable = Runnable { cancelConfirmation() }
             mainHandler.postDelayed(confirmationExpiryRunnable!!, CONFIRMATION_WINDOW_MS)
+            // CRITICAL: speakThenCallback called tts.stop() before speaking the
+            // ask, which ended the active recognizer session. Without reopening
+            // the mic there is NO session to catch the yes/no — dead air until
+            // the window expires and the original query is lost entirely.
+            mainHandler.postDelayed({ startVoiceListening() }, FOLLOW_UP_OPEN_DELAY_MS)
         }
     }
 
@@ -1916,6 +1973,7 @@ class CameraFragment : Fragment() {
             Log.d(TAG, "Confirmation: user confirmed \"$original\"")
             // Re-enter the normal routing with trusted confidence.
             lastConfidence = 1f
+            consecutiveConfirmationAsks = 0
             mainActivity.onSpeechResult?.invoke(original, originalLocale, 1f)
         } else {
             Log.d(TAG, "Confirmation: user rejected \"$original\" — re-asking")
@@ -1925,7 +1983,10 @@ class CameraFragment : Fragment() {
                     "Baik, sila sebut lagi.",
                     "好的，请再说一遍。"
                 )
-            ) { /* mic stays open in the follow-up window for the retry */ }
+            ) {
+                // Reopen the mic — the retry prompt's stop() ended the session.
+                mainHandler.postDelayed({ startVoiceListening() }, FOLLOW_UP_OPEN_DELAY_MS)
+            }
         }
     }
 
@@ -2117,6 +2178,12 @@ class CameraFragment : Fragment() {
 
         /** Transcriptions at or above this confidence are trusted — no confirmation ask. */
         private const val CONFIRM_ABOVE_CONFIDENCE = 0.6f
+
+        /**
+         * Max consecutive grey-band confirmation asks before the pipeline
+         * runs the query anyway — dead air is worse than a probable mis-hear.
+         */
+        private const val MAX_CONFIRMATION_ASKS = 1
 
         /** Hands-free follow-up window: mic stays open this long after each answer. */
         private const val CONVERSATION_WINDOW_MS = 12_000L
