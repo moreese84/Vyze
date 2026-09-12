@@ -82,3 +82,7 @@ playstore-screenshots/
 
 # Local doc/pitch-deck generator scripts
 tools/
+
+# AI-tool local config dirs
+.commandcode/
+.claude/
