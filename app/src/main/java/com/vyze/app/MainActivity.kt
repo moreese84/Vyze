@@ -1040,21 +1040,30 @@ class MainActivity : AppCompatActivity() {
     fun isTtsSpeaking(): Boolean = ttsReady && ttsManager.isSpeaking()
 
     /**
-     * Which language the recognizer should listen for, when known:
-     * 1. A Malay or Chinese voice chosen in Vyze's voice settings — the user
-     *    DECLARED that language, so recognition must match it even when the
-     *    phone itself is English (the device default otherwise hears Malay as
-     *    garbage / NO_MATCH).
-     * 2. Otherwise the language most recently recognized this session, once it
-     *    is Malay or Chinese (adaptive — a Malay speaker recognized once keeps
-     *    getting Malay recognition for the rest of the session).
-     * English (declared or detected) returns null → the recognizer uses its
-     * own device default, which is English on English phones.
+     * Which language the recognizer should be PINNED to, when known:
+     * only a Malay or Chinese voice DECLARED in Vyze's voice settings —
+     * the user explicitly chose that language, so recognition must match
+     * it even when the phone itself is English (the device default
+     * otherwise hears Malay as garbage / NO_MATCH).
+     *
+     * Deliberately NOT adaptive: pinning to the last DETECTED ms/zh
+     * locale made back-and-forth code-switching fail (one Malay query
+     * pinned every later session to ms-MY). Unpinned sessions with the
+     * auto-detect extras follow the actual spoken language per query.
+     * English (declared or detected) returns null → the recognizer uses
+     * its own device default, which is English on English phones.
      */
     private fun resolveRecognitionLocale(): java.util.Locale? {
+        // ONLY the user's DECLARED Vyze voice language pins recognition.
+        // The previous adaptive pin (last detected ms/zh locale) broke
+        // back-and-forth code-switching: after ONE Malay query every later
+        // session was pinned ms-MY, so the next English query went through
+        // the Malay acoustic model and came back garbled. Unpinned sessions
+        // + auto-detect extras let the recognizer follow the ACTUAL spoken
+        // language per query; per-query mirroring is driven by the result
+        // locale + text detection, not by a lagging pin.
         val stored = TTSManager.storedLanguageLocale(this)
-        if (stored.language == "ms" || stored.language == "zh") return stored
-        return lastDetectedLocale?.takeIf { it.language == "ms" || it.language == "zh" }
+        return stored.takeIf { it.language == "ms" || it.language == "zh" }
     }
 
     // ── Internal Listening ────────────────────────────────────────
@@ -1087,11 +1096,9 @@ class MainActivity : AppCompatActivity() {
     private fun startListeningAfterTtsStop() {
         try {
             // ── LOCALE FALLBACK LADDER ───────────────────────────
-            // If a previous English-pinned session failed and no ms/zh voice
-            // is declared/detected yet, transparently retry in the ladder's
-            // next language instead of surfacing "No speech detected". This
-            // breaks the chicken-and-egg where adaptive detection (which needs
-            // ONE successful ms/zh result) never engages on the first query.
+            // If a previous session failed and no ms/zh voice is declared,
+            // transparently retry in the ladder's next language instead of
+            // surfacing "No speech detected".
             // ── SESSION LANGUAGE SELECTION ───────────────────
             // 1. LADDER ACTIVE (a previous session NO_MATCHed while the user
             //    demonstrably spoke): pin the ladder's next language — the
@@ -1099,11 +1106,11 @@ class MainActivity : AppCompatActivity() {
             //    language. Works even when a ms/zh locale is pinned by
             //    [resolveRecognitionLocale]: the previous session's language
             //    already failed, retrying it would reproduce the NO_MATCH.
-            // 2. Pinned ms/zh (declared voice or adaptive detection): honor
+            // 2. Pinned ms/zh (DECLARED voice only — never adaptive): honor
             //    it — but remember the pin so the ladder can skip it.
-            // 3. Otherwise: pin en-US with auto-detect extras so first-contact
-            //    English queries work on any phone and ms/zh can switch
-            //    mid-session (API 34+).
+            // 3. Otherwise: UNPINNED with auto-detect extras (API 34+) — the
+            //    engine follows the actual spoken language per query, which
+            //    is what makes back-and-forth code-switching work.
             val pinned = resolveRecognitionLocale()
             val ladderLocale = if (localeFallbackIndex > 0 &&
                 localeFallbackIndex < FALLBACK_RECOGNITION_LOCALES.size
@@ -1240,17 +1247,29 @@ class MainActivity : AppCompatActivity() {
                 // declared/detected ms/zh voice falls through to normal
                 // handling (including the model-ASR rescue).
                 if (error == SpeechRecognizer.ERROR_NO_MATCH && speechAttempted &&
-                    // Guard: once an ENGLISH transcription has been accepted
-                    // this session, NO_MATCH is likely real silence/noise, not
-                    // a language mismatch — an English user must never get
-                    // stuck cycling the ladder.
-                    lastDetectedLocale?.language != "en" &&
+                    // No "accepted English" guard here: blocking retries after
+                    // an English success also blocks the Malay/Chinese rescue
+                    // in exactly the code-switch window where it is needed.
+                    // The ladder is bounded (3 steps, resets on acceptance,
+                    // abort, and every new session) so it cannot loop.
                     localeFallbackIndex < FALLBACK_RECOGNITION_LOCALES.size
                 ) {
                     // [localeFallbackIndex] points at the NEXT locale to
-                    // try. Skip past the locale the failed session was pinned
-                    // to — re-running the language that just NO_MATCHed would
-                    // only reproduce the same failure.
+                    // try. Two skips, in order:
+                    // (a) Unpinned session (no API 34+ auto-detect): the
+                    //     device-default language just failed — start the
+                    //     ladder at the LAST SUCCESSFULLY SPOKEN language
+                    //     when known. Bounded retry-path heuristic, NOT a
+                    //     pin: it only orders the retries after a failure,
+                    //     every new session starts fresh and unpinned.
+                    // (b) Skip the locale the failed session was pinned to —
+                    //     re-running it would reproduce the same NO_MATCH.
+                    if (lastPinnedLocaleTag == null && localeFallbackIndex == 0) {
+                        val idx = FALLBACK_RECOGNITION_LOCALES.indexOfFirst {
+                            it.language == lastDetectedLocale?.language
+                        }
+                        if (idx > 0) localeFallbackIndex = idx
+                    }
                     if (FALLBACK_RECOGNITION_LOCALES[localeFallbackIndex]
                         .toLanguageTag() == lastPinnedLocaleTag
                     ) {
