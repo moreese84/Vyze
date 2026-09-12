@@ -123,6 +123,13 @@ class VyzeCoreController(
     @Volatile
     private var lastContinuousDescriptionAt = 0L
 
+    // ── Speech Intelligence (instant answers + conversation verbs) ──
+    // Last frame retained for "tell me more" — expands the PREVIOUS answer
+    // on the SAME frame instead of re-capturing: zero capture latency, and
+    // the detail describes what the user actually just heard about.
+    // Owned bitmap (separate instance from the pipeline's recycled ones).
+    private var lastSnapshotBitmap: Bitmap? = null
+
     /** Fired when a continuous auto-capture is skipped (scene unchanged). */
     var onContinuousSkip: (() -> Unit)? = null
 
@@ -746,6 +753,36 @@ class VyzeCoreController(
         lastContinuousEmbedding = null
     }
 
+    // ── Retained-Frame Helpers (conversation verbs) ───────────────
+
+    /**
+     * Owned downscaled copy of the frame retained for "tell me more".
+     * Returns null when the source frame is unusable — retention is
+     * best-effort and must never disturb the main pipeline.
+     */
+    private fun downscaleForRetention(source: Bitmap): Bitmap? {
+        return try {
+            if (source.isRecycled) return null
+            val w = source.width
+            val h = source.height
+            if (w <= 0 || h <= 0) return null
+            val scale = RETAINED_FRAME_DIM.toFloat() / maxOf(w, h)
+            if (scale >= 1f) {
+                source.copy(source.config ?: Bitmap.Config.ARGB_8888, false)
+            } else {
+                Bitmap.createScaledBitmap(
+                    source,
+                    (w * scale).toInt().coerceAtLeast(1),
+                    (h * scale).toInt().coerceAtLeast(1),
+                    true
+                )
+            }
+        } catch (e: Throwable) {
+            CrashLogFile.logError(TAG, "downscaleForRetention failed: ${e.message}", e)
+            null
+        }
+    }
+
     // ── Snapshot Trigger ───────────────────────────────────────────
 
     fun triggerSnapshot(bitmap: Bitmap, query: String? = null, continuousMode: Boolean = false) {
@@ -1203,17 +1240,6 @@ class VyzeCoreController(
                                 CrashLogFile.logError(TAG, "Scene baseline update failed: ${e.message}", e)
                             }
                         }
-
-                        // Continuous mode: refresh the scene baseline so the
-                        // NEXT auto-capture can skip if the scene is unchanged.
-                        if (continuousMode) {
-                            try {
-                                lastContinuousEmbedding = EmbeddingEngine.generateEmbedding(bitmap)
-                                lastContinuousDescriptionAt = System.currentTimeMillis()
-                            } catch (e: Throwable) {
-                                CrashLogFile.logError(TAG, "Scene baseline update failed: ${e.message}", e)
-                            }
-                        }
                     }
                 }
 
@@ -1244,6 +1270,28 @@ class VyzeCoreController(
                     } catch (_: Throwable) {}
                 }
 
+                // ── LAST-FRAME RETENTION (conversation verbs) ────────
+                // Keep an OWNED copy of the frame so "tell me more" can
+                // expand on THIS scene without a fresh capture. The original
+                // and downsampled bitmaps are recycled below — the retained
+                // frame must be a separate instance.
+                try {
+                    val keep = if (inferenceBitmap !== bitmap && !inferenceBitmap.isRecycled) {
+                        inferenceBitmap
+                    } else {
+                        downscaleForRetention(bitmap)
+                    }
+                    if (keep != null) {
+                        val old = lastSnapshotBitmap
+                        lastSnapshotBitmap = keep
+                        if (old != null && old !== keep) {
+                            try { old.recycle() } catch (_: Throwable) {}
+                        }
+                    }
+                } catch (e: Throwable) {
+                    CrashLogFile.logError(TAG, "Frame retention failed: ${e.message}", e)
+                }
+
                 CrashLogFile.log(TAG, "finally block — recycling original bitmap")
                 try {
                     if (!bitmap.isRecycled) {
@@ -1262,6 +1310,287 @@ class VyzeCoreController(
 
     fun triggerWithQuery(bitmap: Bitmap, query: String) {
         triggerSnapshot(bitmap, query)
+    }
+
+    // ── Speech Intelligence: instant answers + conversation verbs ──
+    // The same tiering philosophy as OCR fast-path and barcode pre-pass,
+    // extended to SPEECH: queries the phone already knows the answer to are
+    // served locally in milliseconds instead of a multi-second Gemma run.
+
+    /**
+     * Build the localized instant answer for a system-status query (time,
+     * date, battery level), or null when the query is not an instant answer.
+     * Detection and answering share this single source of truth — they can
+     * never disagree.
+     *
+     * Deliberately CONSERVATIVE keyword lists: a false instant answer is
+     * worse than a slow Gemma answer, so forms that can be part of a bigger
+     * knowledge question ("what time does the store open", "how do I save
+     * battery") fall through to the normal pipelines.
+     */
+    private fun instantAnswerFor(query: String): String? {
+        val lower = query.lowercase().trim()
+        val words = lower.split(Regex("\\s+")).size
+
+        val timeQ =
+            lower.contains("what time is it") || lower.contains("what's the time") ||
+                lower.contains("whats the time") ||
+                (lower.contains("what time") && (lower.contains("now") || words <= 3)) ||
+                lower.contains("pukul berapa sekarang") || lower.contains("pukul berapa ini") ||
+                lower.contains("sekarang pukul") || lower.contains("jam berapa sekarang") ||
+                (lower.contains("jam berapa") && words <= 3) ||
+                (lower.contains("pukul berapa") && words <= 3) ||
+                lower.contains("现在几点") || lower.contains("几点了") || lower == "几点"
+
+        val dateQ =
+            (lower.contains("what day is") &&
+                (lower.contains("today") || lower.contains("hari ini") || lower.contains("今天"))) ||
+                lower.contains("what date") || lower.contains("today's date") ||
+                lower.contains("todays date") || lower.contains("tarikh hari ini") ||
+                lower.contains("ini hari apa") || lower.contains("hari apa hari ini") ||
+                lower.contains("今天几号") || lower.contains("今天是几号") ||
+                lower.contains("今天是星期几") || lower.contains("今天星期几") ||
+                lower.contains("今天几月")
+
+        // Status asks only — knowledge questions about batteries stay on the
+        // text-only pipeline.
+        val batteryQ =
+            lower.contains("how much battery") || lower.contains("battery level") ||
+                lower.contains("battery percentage") || lower.contains("battery status") ||
+                lower.contains("battery left") || lower.contains("is my battery") ||
+                lower == "battery" || lower == "bateri" ||
+                lower.contains("bateri berapa") || lower.contains("berapa bateri") ||
+                lower.contains("bateri peratus") || lower.contains("bateri ada berapa") ||
+                lower.contains("电量多少") || lower.contains("电池还有多少") ||
+                lower.contains("电量还有多少")
+
+        if (!timeQ && !dateQ && !batteryQ) return null
+
+        val isMalay = activeUserLocale.language == "ms"
+        val isChinese = activeUserLocale.language == "zh"
+
+        return when {
+            timeQ -> {
+                val now = java.util.Calendar.getInstance()
+                val time = java.text.DateFormat.getTimeInstance(
+                    java.text.DateFormat.SHORT, activeUserLocale
+                ).format(now.time)
+                when {
+                    isMalay -> "Pukul $time."
+                    isChinese -> "现在是$time。"
+                    else -> "It's $time."
+                }
+            }
+            dateQ -> {
+                val date = java.text.DateFormat.getDateInstance(
+                    java.text.DateFormat.LONG, activeUserLocale
+                ).format(java.util.Calendar.getInstance().time)
+                when {
+                    isMalay -> "Hari ini $date."
+                    isChinese -> "今天是$date。"
+                    else -> "Today is $date."
+                }
+            }
+            else -> {
+                val bm = context.getSystemService(Context.BATTERY_SERVICE) as? android.os.BatteryManager
+                val level = bm?.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: -1
+                if (level < 0) {
+                    when {
+                        isMalay -> "Tahap bateri tidak dapat dibaca."
+                        isChinese -> "无法读取电量。"
+                        else -> "Battery level is unavailable right now."
+                    }
+                } else {
+                    val status = try {
+                        context.registerReceiver(
+                            null,
+                            android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED)
+                        )?.getIntExtra(android.os.BatteryManager.EXTRA_STATUS, -1) ?: -1
+                    } catch (_: Throwable) { -1 }
+                    val charging = status == android.os.BatteryManager.BATTERY_STATUS_CHARGING ||
+                        status == android.os.BatteryManager.BATTERY_STATUS_FULL
+                    when {
+                        isMalay && charging -> "Bateri pada $level peratus, sedang mengecas."
+                        isMalay -> "Bateri pada $level peratus."
+                        isChinese && charging -> "电量为$level%，正在充电。"
+                        isChinese -> "电量为$level%。"
+                        charging -> "Battery is at $level percent, charging."
+                        else -> "Battery is at $level percent."
+                    }
+                }
+            }
+        }
+    }
+
+    /** True when [query] is answerable locally without any model inference. */
+    fun detectInstantAnswer(query: String?): Boolean {
+        if (query.isNullOrBlank()) return false
+        return instantAnswerFor(query) != null
+    }
+
+    /** Speak the instant answer immediately — no capture, no inference. */
+    fun triggerInstantAnswer(query: String) {
+        val answer = instantAnswerFor(query) ?: return
+        CrashLogFile.log(TAG, "Instant answer — inference skipped: \"${answer.take(60)}\"")
+        ttsManager.speakQueued(answer)
+        onStatusUpdate?.invoke("Ready [instant]")
+    }
+
+    /**
+     * Verbs that ask Vyze to EXPAND or REPEAT the previous answer. Bare
+     * "lagi" / "more" are deliberately EXCLUDED — they are too ambiguous in
+     * everyday speech ("apa lagi") and must never hijack the normal pipeline.
+     */
+    private val EXPANSION_VERBS = listOf(
+        // English
+        "more detail", "more details", "tell me more", "expand", "elaborate",
+        "go on", "say again", "repeat that", "repeat it", "what did you say",
+        "in detail", "more about", "describe more", "what else",
+        // Malay
+        "lebih detail", "lebih terperinci", "terangkan lagi", "cerita lagi",
+        "lagi detail", "bagitahu lagi", "cakap lagi", "ulang", "sebut lagi",
+        "lebih banyak", "lagi banyak", "apa lagi",
+        // Chinese
+        "详细一点", "再详细", "详细说明", "多说一点", "再说一遍", "再说一次",
+        "再讲一遍", "重复", "多一点", "还有什么"
+    )
+
+    /**
+     * True when the query is a conversation verb ("tell me more" / "lagi
+     * terperinci" / "详细一点") about the answer just given. Requires a recent
+     * spoken answer (lastDescribedTime) and the retained frame — without both,
+     * the query falls through to the normal pipeline.
+     */
+    fun detectConversationVerb(query: String?): Boolean {
+        if (query.isNullOrBlank()) return false
+        if (lastDescribedObject.isBlank() ||
+            System.currentTimeMillis() - lastDescribedTime > EXPANSION_MAX_AGE_MS
+        ) return false
+        val frame = lastSnapshotBitmap ?: return false
+        if (frame.isRecycled) return false
+        val lower = query.lowercase().trim()
+        return EXPANSION_VERBS.any { lower.contains(it) }
+    }
+
+    /**
+     * Expand the PREVIOUS answer on the RETAINED frame — no re-capture, so
+     * zero camera latency and the detail describes exactly what the user just
+     * heard about. Learned brevity is overridden on purpose: the user asked
+     * for MORE. Completion (speak + follow-up window) fires via the shared
+     * onComplete callback, exactly like an image response.
+     */
+    fun triggerExpandedAnswer() {
+        val frame = lastSnapshotBitmap
+        if (frame == null || frame.isRecycled) return
+        if (!engineReady) {
+            Log.w(TAG, "triggerExpandedAnswer called but engine not ready")
+            return
+        }
+        if (!isInferring.compareAndSet(false, true)) {
+            Log.d(TAG, "Expanded answer: inference already in progress — ignoring")
+            return
+        }
+        activeSessionId = UUID.randomUUID().toString()
+        val currentSessionId = activeSessionId
+        resetSentenceBuffer()
+
+        lastInferenceActivityMs = System.currentTimeMillis()
+        val watchdogRunnable = object : Runnable {
+            override fun run() {
+                if (isInferring.get() && activeSessionId == currentSessionId) {
+                    val idleMs = System.currentTimeMillis() - lastInferenceActivityMs
+                    if (idleMs < WATCHDOG_TIMEOUT_MS) {
+                        mainHandler.postDelayed(this, WATCHDOG_TIMEOUT_MS)
+                    } else {
+                        Log.e(TAG, "Watchdog: no expanded output for ${WATCHDOG_TIMEOUT_MS}ms — force resetting")
+                        isInferring.set(false)
+                        cancelInference()
+                        resetSentenceBuffer()
+                        mainHandler.post {
+                            onStatusUpdate?.invoke("Inference timed out")
+                            onError?.invoke("Inference timed out. Please try again.")
+                        }
+                    }
+                }
+            }
+        }
+        mainHandler.postDelayed(watchdogRunnable, WATCHDOG_TIMEOUT_MS)
+
+        inferenceJob = scope.launch {
+            try {
+                if (!isActive) {
+                    Log.d(TAG, "Expansion job cancelled before start — aborting")
+                    return@launch
+                }
+                CrashLogFile.log(TAG, "=== EXPANDED ANSWER (session=$currentSessionId) ===")
+                val prior = lastDescribedObject
+                val expansionDirective =
+                    "The user asks for MORE detail about the previous answer: \"$prior\". " +
+                    "Describe the scene in MORE depth: objects you did not mention before, " +
+                    "colors, textures, positions, distances, and any visible text. " +
+                    "Do NOT repeat the previous answer. Do NOT invent objects that are not visible."
+                val basePrompt = promptBuilder.buildPrompt(
+                    snapshotDescription = expansionDirective,
+                    queryOverride = expansionDirective,
+                    continuousMode = false,
+                    userLocale = activeUserLocale,
+                    ocrText = null,
+                    currencyMode = false,
+                    bankCardMode = false,
+                    memoryContext = null,
+                    brevityLevel = PreferenceLearner.BrevityLevel.NORMAL,
+                    dialogueContext = dialogueContextForPrompt()
+                )
+                if (!isActive) return@launch
+                CrashLogFile.log(TAG, "Expansion prompt built: ${basePrompt.length} chars")
+                val response = vlmEngine.analyzeImage(
+                    bitmap = frame,
+                    prompt = basePrompt,
+                    memoryContext = null,
+                    similarInteractions = emptyList(),
+                    sessionId = currentSessionId,
+                    targetDimension = 512,
+                    maxTokens = SCENE_QUERY_MAX_TOKENS
+                )
+                if (!isActive) {
+                    Log.d(TAG, "Expansion job cancelled after VLM call — discarding")
+                    return@launch
+                }
+                if (response.isNullOrBlank()) {
+                    flushRemainingSentenceBuffer()
+                    if (currentSessionId == activeSessionId) {
+                        mainHandler.post {
+                            onStatusUpdate?.invoke("Inference returned empty response")
+                            onError?.invoke("No response from model")
+                        }
+                    }
+                } else {
+                    // The prior-answer anchor is deliberately LEFT pointing at
+                    // the ORIGINAL description: updating it here would make
+                    // the fragment's isDuplicateDescription compare the
+                    // expansion against ITSELF (a self-duplicate race that
+                    // can swallow the speech). Repeated "tell me more" still
+                    // works — the anchor stays fresh from the original answer,
+                    // and dialogue memory carries the prior expansions.
+                    recordDialogueTurn("more detail", response)
+                }
+            } catch (e: Throwable) {
+                CrashLogFile.logError(TAG, "Expanded answer FAILED: ${e.javaClass.simpleName}: ${e.message}", e)
+                isInferring.set(false)
+                flushRemainingSentenceBuffer()
+                if (currentSessionId == activeSessionId) {
+                    mainHandler.post {
+                        onStatusUpdate?.invoke("Error: ${e.message}")
+                        onError?.invoke("Inference crashed: ${e.message}")
+                    }
+                }
+            } finally {
+                // DEFENSIVE: never leave isInferring true
+                isInferring.set(false)
+                mainHandler.removeCallbacks(watchdogRunnable)
+                CrashLogFile.log(TAG, "=== EXPANDED ANSWER DONE ===")
+            }
+        }
     }
 
     // ── Text-Only Q&A (no camera needed) ──────────────────────────
@@ -1563,6 +1892,8 @@ class VyzeCoreController(
         vlmEngine.close()
         ocrHelper.close()
         barcodeHelper.close()
+        try { lastSnapshotBitmap?.recycle() } catch (_: Throwable) {}
+        lastSnapshotBitmap = null
         scope.cancel()
         Log.d(TAG, "VyzeCoreController destroyed")
     }
@@ -1908,6 +2239,12 @@ class VyzeCoreController(
 
         /** Marker in tap queries — "User tapped at position (x, y)". */
         private const val TAP_POSITION_MARKER = "tapped at position"
+
+        /** Age limit (ms) for "tell me more" on the retained frame. */
+        private const val EXPANSION_MAX_AGE_MS = 90_000L
+
+        /** Max dimension of the retained frame kept for "tell me more". */
+        private const val RETAINED_FRAME_DIM = 512
 
         /** Keywords that trigger currency reading (banknotes + coins). */
         private val CURRENCY_KEYWORDS = listOf(

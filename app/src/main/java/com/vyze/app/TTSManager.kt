@@ -544,6 +544,26 @@ class TTSManager private constructor(context: Context) {
     ): Boolean {
         val tts = engine ?: return false
         return try {
+            // Critical-info pacing: money amounts and medication doses are
+            // safety-critical for a blind user — spoken ~15% slower so the
+            // figures land clearly. Rate is applied per utterance via the
+            // engine (KEY_PARAM_RATE is not public API) and restored when the
+            // utterance finishes, so the user's global rate is untouched.
+            val critical = isCriticalInfoText(text)
+            val targetRate = if (critical) {
+                criticalUtteranceIds.add(utteranceId)
+                cachedRate * CRITICAL_INFO_RATE_FACTOR
+            } else {
+                cachedRate
+            }
+            try {
+                if (engineRateApplied != targetRate) {
+                    tts.setSpeechRate(targetRate)
+                    engineRateApplied = targetRate
+                }
+            } catch (e: Throwable) {
+                Log.w(TAG, "speakWithEngine: setSpeechRate($targetRate) failed: ${e.message}")
+            }
             val params = Bundle().apply {
                 putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, cachedVolume)
             }
@@ -555,6 +575,11 @@ class TTSManager private constructor(context: Context) {
             @Suppress("UNUSED_EXPRESSION")
             onDone
             val result = tts.speak(text, queueMode, params, utteranceId)
+            if (result != TextToSpeech.SUCCESS) {
+                // Rejected at submission — the completion callbacks may never
+                // fire, so untrack the critical-rate marker here.
+                criticalUtteranceIds.remove(utteranceId)
+            }
             result == TextToSpeech.SUCCESS
         } catch (e: Throwable) {
             Log.e(TAG, "speakWithEngine failed: ${e.javaClass.simpleName}: ${e.message}")
@@ -590,6 +615,22 @@ class TTSManager private constructor(context: Context) {
     // the OLD utterance's onError to the NEW listener — firing its onDone
     // before the new utterance even starts.
 
+    /** Utterance IDs currently playing at the slowed critical-info rate. */
+    private val criticalUtteranceIds = ConcurrentHashMap.newKeySet<String>()
+
+    /** Rate last applied to the engine (avoids redundant setSpeechRate calls). */
+    private var engineRateApplied = DEFAULT_SPEECH_RATE
+
+    /** Restore the user's normal rate after a critical-info utterance ends. */
+    private fun restoreNormalRateAfterCritical(id: String) {
+        if (criticalUtteranceIds.remove(id)) {
+            try {
+                engine?.setSpeechRate(cachedRate)
+                engineRateApplied = cachedRate
+            } catch (_: Throwable) {}
+        }
+    }
+
     /** Utterance started processing — forward to the caller listener. */
     private fun onUtteranceStart(id: String) {
         val listener = callerListener
@@ -599,6 +640,7 @@ class TTSManager private constructor(context: Context) {
     /** Utterance finished playing — untrack and forward. */
     private fun onUtteranceDone(id: String) {
         pendingUtteranceIds.remove(id)
+        restoreNormalRateAfterCritical(id)
         try { onUtteranceCompleted?.invoke(id) } catch (_: Throwable) {}
         val listener = callerListener
         mainHandler.post { listener?.onDone(id) }
@@ -607,6 +649,7 @@ class TTSManager private constructor(context: Context) {
     /** Utterance failed (or was flushed) — untrack and forward. */
     private fun onUtteranceError(id: String) {
         pendingUtteranceIds.remove(id)
+        restoreNormalRateAfterCritical(id)
         val listener = callerListener
         mainHandler.post { listener?.onError(id) }
     }
@@ -885,6 +928,32 @@ class TTSManager private constructor(context: Context) {
                 if (trailing.isNotBlank()) "$letters $digits ${trailing.uppercase()}" else "$letters $digits"
             }
         }
+    }
+
+    /**
+     * True when [text] carries safety-critical readouts — money amounts or
+     * medication doses. Such answers are spoken ~15% slower ([CRITICAL_INFO_RATE_FACTOR])
+     * so the user can register the exact figures. Detection is shape-based
+     * (currency symbol + digits, digits + unit word) so it works regardless
+     * of answer language, and deliberately narrow to avoid slowing ordinary
+     * scene chatter that merely contains a number ("about 2 steps ahead").
+     */
+    private fun isCriticalInfoText(text: String): Boolean {
+        // Currency symbol/prefix directly on digits: "RM12.90", "USD 99"
+        if (Regex("(?i)(rm|rp|usd|sgd|eur|gbp|myr)\\s*\\d").containsMatchIn(text)) return true
+        // Digits + money word: "12.90 ringgit", "99 dollars", "5 sen"
+        if (Regex("(?i)\\d([.,]\\d{1,2})?\\s*(ringgit|sen|rupiah|dollar|euro|yuan|令吉|块|元|仙)")
+                .containsMatchIn(text)
+        ) return true
+        // CJK money markers directly adjacent to digits: "12令吉90仙"
+        if (Regex("\\d(令吉|块|元|毛|仙|分)").containsMatchIn(text)) return true
+        // Medication dosing: "500 mg", "5 ml", "2 tablets"
+        if (Regex("(?i)\\d\\s*(mg|mcg|ml|milligram|tablet|tablets|kapsul|kaplet|pil)\\b")
+                .containsMatchIn(text)
+        ) return true
+        // CJK dosing: "500毫克", "5毫升"
+        if (Regex("\\d\\s*(毫克|毫升|微克)").containsMatchIn(text)) return true
+        return false
     }
 
     /**
@@ -1208,6 +1277,7 @@ class TTSManager private constructor(context: Context) {
 
     fun setSpeechRate(rate: Float) {
         cachedRate = rate.coerceIn(0.5f, 2.0f)
+        engineRateApplied = cachedRate
         try {
             engine?.setSpeechRate(cachedRate)
         } catch (e: Throwable) {
@@ -1344,6 +1414,10 @@ class TTSManager private constructor(context: Context) {
         }
 
         const val DEBOUNCE_MS = 1500L
+
+        /** Speech-rate multiplier for safety-critical readouts (money, medication). */
+        private const val CRITICAL_INFO_RATE_FACTOR = 0.85f
+
         const val ENGINE_SETTLE_DELAY_MS = 200L
         const val DRAIN_RETRY_INTERVAL_MS = 200L
         const val DRAIN_RETRY_MS = 5000L

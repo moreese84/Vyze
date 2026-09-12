@@ -118,6 +118,23 @@ class CameraFragment : Fragment() {
     private val voiceAuditionVoices = ArrayList<android.speech.tts.Voice>()
     private var voiceAuditionIndex = 0
 
+    // ── Speech Intelligence: low-confidence confirmation loop ─────
+    // A transcription in the 0.35-0.6 grey band scores above the chatter
+    // floor but is still often a mis-hear. While a "Did you say X?" is
+    // outstanding, the next yes/no answer resolves it instead of running
+    // the full query routing on a probable mistake.
+    @Volatile
+    private var pendingConfirmationText: String? = null
+
+    @Volatile
+    private var pendingConfirmationLocale: java.util.Locale? = null
+
+    private var confirmationExpiryRunnable: Runnable? = null
+
+    /** Confidence of the last accepted transcription (routing + confirmation). */
+    @Volatile
+    private var lastConfidence = 1f
+
     /** Debounce: prevents duplicate triggers from gesture + click overlap or speech re-trigger. */
     private var lastTriggerTime = 0L
     private val TRIGGER_DEBOUNCE_MS = 1000L
@@ -723,7 +740,11 @@ class CameraFragment : Fragment() {
     private fun wireSpeechCallbacks() {
         val activity = requireActivity() as? MainActivity ?: return
 
-        activity.onSpeechResult = { spokenText, detectedLocale ->
+        activity.onSpeechResult = { spokenText, detectedLocale, recognizerConfidence ->
+            // Recognizer confidence for the grey-band confirmation ask (D).
+            // Model-ASR rescue passes 0 — flagged so it never chains a
+            // second "did you say" on top of the repeat it already required.
+            lastConfidence = recognizerConfidence
             if (spokenText.isNotBlank()) {
                 Log.i(TAG, "Speech result: \"$spokenText\" lang=$detectedLocale")
                 if (voiceAuditionActive) {
@@ -792,21 +813,48 @@ class CameraFragment : Fragment() {
                                 // window flag belongs to the user's original
                                 // gesture, not to the dropped noise.
                                 Log.d(TAG, "Speech result during $appState — dropping (possible ambient noise)")
-                            } else if (coreController.isTextOnlyQuery(spokenText)) {
-                                // ── TEXT-ONLY Q&A ────────────────────────
-                                // General-knowledge question ("what is
-                                // paracetamol used for?") — no camera frame
-                                // needed. Faster + cheaper than image inference.
-                                Log.d(TAG, "Text-only query: \"$spokenText\"")
-                                coreController.resetForNewCapture()
-                                appState = AppState.ANALYZING
-                                updateStatus("Answering...")
-                                coreController.triggerTextQuery(spokenText)
+                            } else if (pendingConfirmationText != null) {
+                                // ── CONFIRMATION ANSWER ─────────────────
+                                // A "Did you say X?" is outstanding — the next
+                                // utterance is a yes/no answer, NOT a new query.
+                                handleConfirmationAnswer(spokenText)
                             } else {
-                                coreController.resetForNewCapture()
-                                appState = AppState.IDLE
-                                updateStatus("Heard: \"$spokenText\"")
-                                triggerVlmSnapshot(spokenText)
+                                // ── SPEECH-INTELLIGENCE ROUTING ────────
+                                // 1. Conversation verbs ("tell me more") —
+                                //    reuse the retained frame, no re-capture.
+                                //    MUST be checked before resetForNewCapture:
+                                //    the reset wipes the prior-answer anchor.
+                                // 2. Instant answers (time/date/battery) —
+                                //    local, no capture, no inference.
+                                // 3. Normal pipelines (existing behavior).
+                                if (coreController.detectConversationVerb(spokenText)) {
+                                    Log.d(TAG, "Conversation verb: \"$spokenText\" — expanding on retained frame")
+                                    appState = AppState.ANALYZING
+                                    updateStatus("Answering...")
+                                    coreController.triggerExpandedAnswer()
+                                } else if (coreController.detectInstantAnswer(spokenText)) {
+                                    Log.d(TAG, "Instant answer: \"$spokenText\"")
+                                    coreController.triggerInstantAnswer(spokenText)
+                                    // Stay in the current listening state — the
+                                    // mic stays open and the next utterance flows.
+                                } else if (lastConfidence in 0.35f..CONFIRM_ABOVE_CONFIDENCE) {
+                                    askQueryConfirmation(spokenText, detectedLocale)
+                                } else if (coreController.isTextOnlyQuery(spokenText)) {
+                                    // ── TEXT-ONLY Q&A ────────────────────
+                                    // General-knowledge question ("what is
+                                    // paracetamol used for?") — no camera frame
+                                    // needed. Faster + cheaper than image inference.
+                                    Log.d(TAG, "Text-only query: \"$spokenText\"")
+                                    coreController.resetForNewCapture()
+                                    appState = AppState.ANALYZING
+                                    updateStatus("Answering...")
+                                    coreController.triggerTextQuery(spokenText)
+                                } else {
+                                    coreController.resetForNewCapture()
+                                    appState = AppState.IDLE
+                                    updateStatus("Heard: \"$spokenText\"")
+                                    triggerVlmSnapshot(spokenText)
+                                }
                             }
                         }
                     }
@@ -1821,6 +1869,74 @@ class CameraFragment : Fragment() {
      * @param cue true when the user explicitly asked (double-tap) — a spoken
      *            "Listening" prompt is played; follow-up reopens stay silent.
      */
+    /**
+     * Ask "Did you say X?" for a grey-band transcript (0.35-0.6): above the
+     * chatter floor but still often a mis-hear. Confirming costs one short
+     * exchange; guessing wrong costs a multi-second inference on garbage plus
+     * a wrong answer the user may act on.
+     */
+    private fun askQueryConfirmation(text: String, locale: java.util.Locale?) {
+        val mainActivity = activity as? MainActivity ?: return
+        pendingConfirmationText = text
+        pendingConfirmationLocale = locale
+        appState = AppState.LISTENING
+        val preview = text.take(60)
+        Log.d(TAG, "Low-confidence transcript — asking confirmation: \"$preview\"")
+        mainActivity.speakThenCallback(
+            ttsManager.localized(
+                "Did you say, $preview ?",
+                "Adakah anda kata, $preview ?",
+                "你是说，$preview 吗？"
+            )
+        ) {
+            // Mic stays open inside the follow-up window so the yes/no lands
+            // without another gesture. Expire after a short silence.
+            confirmationExpiryRunnable = Runnable { cancelConfirmation() }
+            mainHandler.postDelayed(confirmationExpiryRunnable!!, CONFIRMATION_WINDOW_MS)
+        }
+    }
+
+    /** Resolve the outstanding confirmation with the user's yes/no answer. */
+    private fun handleConfirmationAnswer(spokenText: String) {
+        val mainActivity = activity as? MainActivity ?: return
+        val original = pendingConfirmationText ?: return
+        val originalLocale = pendingConfirmationLocale
+        val text = spokenText.trim().lowercase()
+        val yes = listOf(
+            "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "correct",
+            "ya", "betul", "好", "是", "对"
+        ).any { text.contains(it) }
+        val no = listOf(
+            "no", "nope", "wrong", "tak", "tidak", "salah", "bukan",
+            "不用", "不对", "不是"
+        ).any { text.contains(it) }
+        val confirmed = yes && !no
+        cancelConfirmation()
+        if (confirmed) {
+            Log.d(TAG, "Confirmation: user confirmed \"$original\"")
+            // Re-enter the normal routing with trusted confidence.
+            lastConfidence = 1f
+            mainActivity.onSpeechResult?.invoke(original, originalLocale, 1f)
+        } else {
+            Log.d(TAG, "Confirmation: user rejected \"$original\" — re-asking")
+            mainActivity.speakThenCallback(
+                ttsManager.localized(
+                    "Okay, please say it again.",
+                    "Baik, sila sebut lagi.",
+                    "好的，请再说一遍。"
+                )
+            ) { /* mic stays open in the follow-up window for the retry */ }
+        }
+    }
+
+    /** Clear any outstanding confirmation ask (expiry or window close). */
+    private fun cancelConfirmation() {
+        confirmationExpiryRunnable?.let { mainHandler.removeCallbacks(it) }
+        confirmationExpiryRunnable = null
+        pendingConfirmationText = null
+        pendingConfirmationLocale = null
+    }
+
     private fun startFollowUpWindow(cue: Boolean) {
         if (!isAdded) return
         inConversationWindow = true
@@ -1867,6 +1983,7 @@ class CameraFragment : Fragment() {
     private fun endFollowUpWindow() {
         inConversationWindow = false
         mainHandler.removeCallbacks(conversationWatchdog)
+        cancelConfirmation()
         stopVoiceListening()
         // Dialogue memory expires with the window — the next voice query
         // after idle starts a fresh conversation, not a stale follow-up.
@@ -1994,6 +2111,12 @@ class CameraFragment : Fragment() {
 
         /** Delay (ms) between the "Listening" cue and opening the mic. */
         private const val VOICE_SESSION_OPEN_DELAY_MS = 500L
+
+        /** Window (ms) for the user to confirm/reject a low-confidence query. */
+        private const val CONFIRMATION_WINDOW_MS = 6_000L
+
+        /** Transcriptions at or above this confidence are trusted — no confirmation ask. */
+        private const val CONFIRM_ABOVE_CONFIDENCE = 0.6f
 
         /** Hands-free follow-up window: mic stays open this long after each answer. */
         private const val CONVERSATION_WINDOW_MS = 12_000L

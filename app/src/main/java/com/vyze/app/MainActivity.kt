@@ -134,8 +134,15 @@ class MainActivity : AppCompatActivity() {
      */
     private var localeFallbackIndex = 0
 
-    /** Callback invoked when speech recognition completes with final text + detected language. */
-    var onSpeechResult: ((String, java.util.Locale?) -> Unit)? = null
+    /**
+     * Callback invoked when speech recognition completes with final text +
+     * detected language + recognizer confidence (0.0–1.0). Confidence lets
+     * the fragment run a "Did you say X?" confirmation on grey-band
+     * transcripts instead of burning an inference on a probable mis-hear.
+     * The model-ASR rescue passes 0 — that path already asked the user to
+     * repeat once, so it must never chain another confirmation ask.
+     */
+    var onSpeechResult: ((String, java.util.Locale?, Float) -> Unit)? = null
 
     /** Callback invoked with partial (live) transcription text for UI feedback. */
     var onPartialSpeechResult: ((String) -> Unit)? = null
@@ -640,7 +647,9 @@ class MainActivity : AppCompatActivity() {
                         // heard instead of falling back to en-US again.
                         val rescueLocale = detectLocaleFromText(transcription)
                         lastDetectedLocale = rescueLocale
-                        onSpeechResult?.invoke(transcription, rescueLocale)
+                        // Confidence 0: the rescue already asked the user to
+                        // repeat once — never chain another confirmation ask.
+                        onSpeechResult?.invoke(transcription, rescueLocale, 0f)
                     }
                 } catch (e: Throwable) {
                     Log.e(TAG, "Model-ASR rescue crashed: ${e.message}")
@@ -1348,7 +1357,7 @@ class MainActivity : AppCompatActivity() {
                 CrashLogFile.log(TAG, "Speech result: \"$bestMatch\" lang=$finalLocale")
                 lastDetectedLocale = finalLocale
                 localeFallbackIndex = 0 // a session succeeded — ladder back to start
-                onSpeechResult?.invoke(bestMatch, finalLocale)
+                onSpeechResult?.invoke(bestMatch, finalLocale, confidence?.firstOrNull() ?: 1f)
             }
 
             override fun onPartialResults(partialResults: Bundle?) {
