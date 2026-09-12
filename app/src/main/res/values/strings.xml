@@ -199,4 +199,28 @@
     <string name="accessibility_service_description">Vyze accessibility service provides TalkBack integration and gesture support for visually impaired users.</string>
     <string name="accessibility_service_enabled">Vyze accessibility service enabled.</string>
     <string name="accessibility_service_disabled">Vyze accessibility service disabled.</string>
+
+    <!-- ── Loading screen (display strings; spoken lines live alongside) ── -->
+    <string name="loading_permissions_ok">Permissions OK</string>
+    <string name="loading_requesting_permissions">Requesting permissions…</string>
+    <string name="loading_requesting_storage">Requesting storage access…</string>
+    <string name="loading_storage_ok">Storage access OK</string>
+    <string name="loading_storage_granted">Storage access granted</string>
+    <string name="loading_storage_denied">Storage not granted — loading from app assets</string>
+    <string name="loading_waking_up">Waking up…</string>
+    <string name="loading_ready">Ready</string>
+    <string name="loading_retry">Retry</string>
+    <string name="loading_retrying">Retrying…</string>
+    <string name="loading_prefix_error">Error</string>
+    <string name="loading_copying_model">Copying model…</string>
+    <string name="loading_init_failed">Init failed: %1$s</string>
+    <string name="loading_spoken_start">Starting Vyze.</string>
+    <string name="loading_spoken_start_ms">Memulakan Vyze.</string>
+    <string name="loading_spoken_start_zh">正在启动Vyze。</string>
+    <string name="loading_spoken_error">Vyze could not start. Tap anywhere to try again.</string>
+    <string name="loading_spoken_error_ms">Vyze tidak dapat dimulakan. Sentuh di mana-mana untuk mencuba lagi.</string>
+    <string name="loading_spoken_error_zh">Vyze无法启动。点按任意位置重试。</string>
+    <string name="loading_still_working">Still working — opening the camera anyway.</string>
+    <string name="loading_still_working_ms">Masih beroperasi — membuka kamera juga.</string>
+    <string name="loading_still_working_zh">仍在工作——现在打开相机。</string>
 </resources>

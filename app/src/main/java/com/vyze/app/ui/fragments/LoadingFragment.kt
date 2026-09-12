@@ -6,6 +6,8 @@ import android.Manifest
 import android.animation.ObjectAnimator
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.AudioAttributes
+import android.media.SoundPool
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
@@ -24,6 +26,7 @@ import androidx.navigation.Navigation
 import com.vyze.app.R
 import com.vyze.app.VyzeApplication
 import com.vyze.app.databinding.FragmentLoadingBinding
+import com.vyze.app.speech.TTSManager
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -35,6 +38,17 @@ import kotlinx.coroutines.launch
  * [VyzeCoreController] signals "VLM ready" (100% success).
  * If GPU fails → tries CPU. If both fail → red error + Retry button.
  * NO navigation happens on failure.
+ *
+ * ## Blind-first UX
+ * The whole screen is invisible to a blind user, so every meaningful
+ * state has an audio counterpart:
+ * - a short startup motif plays on entry,
+ * - the TTS announces the start of loading,
+ * - a rising chime + spoken onboarding mark readiness (CameraFragment),
+ * - errors are SPOKEN (never visual-only) and the WHOLE screen becomes
+ *   the retry target (tap anywhere — the app's gesture language).
+ * The 60s safety timeout speaks before navigating, never dumps the user
+ * into a dead camera in silence.
  */
 class LoadingFragment : Fragment() {
 
@@ -48,6 +62,20 @@ class LoadingFragment : Fragment() {
 
     /** Guard: prevents duplicate init or premature navigation. */
     private var initStarted = false
+
+    /** True once an init error is showing — root taps then trigger retry. */
+    @Volatile
+    private var showErrorState = false
+
+    /** Safety timeout posted to the root view; cancelled on success/error. */
+    private var safetyTimeoutRunnable: Runnable? = null
+
+    // ── Audio cues (blind-first feedback) ──────────────────────────
+    private var soundPool: SoundPool? = null
+    private var startupSoundId = 0
+    private var readySoundId = 0
+    private var errorSoundId = 0
+    private var soundsLoaded = false
 
     // ══════════════════════════════════════════════════════════════════
     // Permission Launchers
@@ -69,9 +97,9 @@ class LoadingFragment : Fragment() {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
                     Environment.isExternalStorageManager()
                 ) {
-                    updateStatus("Storage access granted", 5)
+                    updateStatus(getString(R.string.loading_storage_granted), 5)
                 } else {
-                    updateStatus("Storage not granted — loading from app assets", 5)
+                    updateStatus(getString(R.string.loading_storage_denied), 5)
                 }
             }
             safeRun { initVlm() }
@@ -90,10 +118,12 @@ class LoadingFragment : Fragment() {
         super.onViewCreated(view, savedInstanceState)
         CrashLogFile.log(TAG, "onViewCreated")
 
+        initSoundPool()
+
         // Show logo pulse immediately
         safeRun { startPulseAnimation() }
 
-        // Wire retry button
+        // Wire retry button (visual affordance for sighted users)
         safeRun {
             binding.retryButton.setOnClickListener {
                 resetErrorState()
@@ -101,14 +131,50 @@ class LoadingFragment : Fragment() {
             }
         }
 
-        // Safety timeout: if stuck for 60s, navigate anyway
+        // Tap-anywhere retry once an error is showing — the whole screen
+        // is the button, matching the app's tap-anywhere gesture language.
         safeRun {
-            binding.root.postDelayed({
+            binding.root.setOnClickListener {
+                if (showErrorState) {
+                    CrashLogFile.log(TAG, "Tap-anywhere retry")
+                    resetErrorState()
+                    safeRun { startInitPipeline() }
+                }
+            }
+        }
+
+        // Safety timeout: if stuck for 60s, speak a warning and navigate
+        // anyway (previously a SILENT dump into a dead camera).
+        safeRun {
+            val timeout = Runnable {
                 if (isAdded && _binding != null && !initStarted) {
-                    CrashLogFile.log(TAG, "Safety timeout — navigating to camera")
+                    CrashLogFile.log(TAG, "Safety timeout — speaking warning, navigating to camera")
+                    playCue(errorSoundId)
+                    appTts()?.speakQueued(
+                        appTts()?.localized(
+                            getString(R.string.loading_still_working),
+                            getString(R.string.loading_still_working_ms),
+                            getString(R.string.loading_still_working_zh)
+                        ) ?: ""
+                    )
                     navigateToCamera()
                 }
-            }, 60_000L)
+            }
+            safetyTimeoutRunnable = timeout
+            binding.root.postDelayed(timeout, 60_000L)
+        }
+
+        // Startup feedback: sound cue + spoken announcement. The TTS may
+        // not be initialized yet — speak() buffers until it is.
+        safeRun { playCue(startupSoundId) }
+        safeRun {
+            appTts()?.speakQueued(
+                appTts()?.localized(
+                    getString(R.string.loading_spoken_start),
+                    getString(R.string.loading_spoken_start_ms),
+                    getString(R.string.loading_spoken_start_zh)
+                ) ?: ""
+            )
         }
 
         // ═══ DEFER ALL INIT 500ms ═══
@@ -124,9 +190,51 @@ class LoadingFragment : Fragment() {
         stopPulseAnimation()
         pulseAnimator?.cancel()
         pulseAnimator = null
+        safetyTimeoutRunnable?.let { binding.root.removeCallbacks(it) }
+        safetyTimeoutRunnable = null
+        releaseSoundPool()
         _binding = null
         super.onDestroyView()
     }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Audio cues
+    // ══════════════════════════════════════════════════════════════════
+
+    private fun initSoundPool() {
+        try {
+            val attrs = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_ASSISTANCE_SONIFICATION)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                .build()
+            soundPool = SoundPool.Builder().setMaxStreams(2).setAudioAttributes(attrs).build()
+            soundPool?.setOnLoadCompleteListener { _, _, status -> if (status == 0) soundsLoaded = true }
+            startupSoundId = soundPool?.load(requireContext(), R.raw.startup, 1) ?: 0
+            readySoundId = soundPool?.load(requireContext(), R.raw.ready, 1) ?: 0
+            errorSoundId = soundPool?.load(requireContext(), R.raw.error, 1) ?: 0
+        } catch (e: Throwable) {
+            CrashLogFile.logError(TAG, "SoundPool init failed: ${e.message}", e)
+        }
+    }
+
+    private fun releaseSoundPool() {
+        try {
+            soundPool?.release()
+        } catch (_: Throwable) {
+        }
+        soundPool = null
+        soundsLoaded = false
+    }
+
+    private fun playCue(soundId: Int) {
+        try {
+            if (soundId != 0 && soundsLoaded) soundPool?.play(soundId, 0.8f, 0.8f, 1, 0, 1f)
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun appTts(): TTSManager? =
+        (activity?.applicationContext as? VyzeApplication)?.ttsManager
 
     // ══════════════════════════════════════════════════════════════════
     // Init Pipeline (called once, deferred 500ms)
@@ -144,7 +252,7 @@ class LoadingFragment : Fragment() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
             !Environment.isExternalStorageManager()
         ) {
-            updateStatus("Requesting storage access...", 3)
+            updateStatus(getString(R.string.loading_requesting_storage), 3)
             Toast.makeText(
                 requireContext(),
                 "Grant 'All files access' to load the VLM model from Downloads",
@@ -160,7 +268,7 @@ class LoadingFragment : Fragment() {
                 initVlm()
             }
         } else {
-            updateStatus("Storage access OK", 4)
+            updateStatus(getString(R.string.loading_storage_ok), 4)
             initVlm()
         }
     }
@@ -179,10 +287,10 @@ class LoadingFragment : Fragment() {
             ContextCompat.checkSelfPermission(requireContext(), it) != PackageManager.PERMISSION_GRANTED
         }
         if (missing.isEmpty()) {
-            updateStatus("Permissions OK", 2)
+            updateStatus(getString(R.string.loading_permissions_ok), 2)
             afterPermissions()
         } else {
-            updateStatus("Requesting permissions...", 1)
+            updateStatus(getString(R.string.loading_requesting_permissions), 1)
             cameraPermissionLauncher.launch(missing.toTypedArray())
         }
     }
@@ -212,7 +320,7 @@ class LoadingFragment : Fragment() {
                     if (isAdded && _binding != null) {
                         binding.progressBar.progress = percent
                         binding.progressText.text = "$percent%"
-                        binding.statusText.text = step
+                        binding.statusText.text = localizeStepText(step)
                     }
                 }
             }
@@ -221,7 +329,7 @@ class LoadingFragment : Fragment() {
             coreController?.onStatusUpdate = { msg ->
                 activity?.runOnUiThread {
                     if (isAdded && _binding != null) {
-                        binding.statusText.text = msg
+                        binding.statusText.text = localizeStepText(msg)
 
                         if (msg.startsWith("VLM ready")) {
                             // ═══ SUCCESS: navigate to camera ═══
@@ -245,17 +353,30 @@ class LoadingFragment : Fragment() {
                 }
             }
 
-            updateStatus("Waking up...", 10)
+            updateStatus(getString(R.string.loading_waking_up), 10)
             coreController?.initialize()
 
         } catch (e: Throwable) {
             CrashLogFile.logError(TAG, "initVlm crashed: ${e.message}", e)
             activity?.runOnUiThread {
                 if (isAdded && _binding != null) {
-                    showError("Init failed: ${e.message}")
+                    showError(getString(R.string.loading_init_failed, e.message ?: ""))
                 }
             }
         }
+    }
+
+    /**
+     * Map the controller's English status strings onto localized display
+     * strings. The controller's English text remains the log/spoken
+     * source of truth; this only localizes what the SCREEN shows
+     * (sighted users / TalkBack) so EN/MS/ZH stay in the res system.
+     */
+    private fun localizeStepText(raw: String): String = when {
+        raw.startsWith("Copying model") -> getString(R.string.loading_copying_model)
+        raw.startsWith("Error") -> getString(R.string.loading_prefix_error) +
+            raw.removePrefix("Error:")
+        else -> raw
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -265,33 +386,49 @@ class LoadingFragment : Fragment() {
     private fun onInitSuccess() {
         CrashLogFile.log(TAG, "VLM init SUCCESS — navigating")
         stopPulseAnimation()
+        cancelSafetyTimeout()
         safeRun {
             binding.progressBar.progress = 100
             binding.progressText.text = "100%"
-            binding.statusText.text = "Ready"
+            binding.statusText.text = getString(R.string.loading_ready)
         }
+        playCue(readySoundId)
         binding.root.postDelayed({ navigateToCamera() }, 500L)
     }
 
     private fun showError(message: String) {
         CrashLogFile.log(TAG, "ERROR: $message")
         stopPulseAnimation()
+        cancelSafetyTimeout()
+        showErrorState = true
         safeRun {
-            binding.statusText.text = message
+            binding.statusText.text = localizeStepText(message)
             binding.statusText.setTextColor(0xFFFF4444.toInt())
             binding.retryButton.visibility = View.VISIBLE
-            binding.retryButton.text = "Retry"
+            binding.retryButton.text = getString(R.string.loading_retry)
             if (message.contains("not found")) {
                 binding.hintText.visibility = View.VISIBLE
                 binding.hintText.text = "adb push gemma-4-E2B-it.litertlm /sdcard/Download/"
             }
         }
+        // Blind-first: errors are SPOKEN, and tap-anywhere now retries.
+        safeRun {
+            playCue(errorSoundId)
+            appTts()?.speakQueued(
+                appTts()?.localized(
+                    getString(R.string.loading_spoken_error),
+                    getString(R.string.loading_spoken_error_ms),
+                    getString(R.string.loading_spoken_error_zh)
+                ) ?: ""
+            )
+        }
     }
 
     private fun resetErrorState() {
+        showErrorState = false
         safeRun {
             binding.statusText.setTextColor(0xFF666666.toInt())
-            binding.statusText.text = "Retrying..."
+            binding.statusText.text = getString(R.string.loading_retrying)
             binding.retryButton.visibility = View.GONE
             binding.hintText.visibility = View.GONE
             binding.progressBar.progress = 0
@@ -299,6 +436,11 @@ class LoadingFragment : Fragment() {
             initStarted = false
             startPulseAnimation()
         }
+    }
+
+    private fun cancelSafetyTimeout() {
+        safetyTimeoutRunnable?.let { binding.root.removeCallbacks(it) }
+        safetyTimeoutRunnable = null
     }
 
     // ══════════════════════════════════════════════════════════════════

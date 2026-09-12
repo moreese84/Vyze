@@ -197,4 +197,22 @@
     <string name="menu_camera">相机</string>
     <string name="menu_gallery">图库</string>
     <string name="tv_gallery_placeholder">点击+添加图片进行场景分析。</string>
+
+    <!-- ── 加载界面（显示文本；语音行随附）── -->
+    <string name="loading_permissions_ok">权限正常</string>
+    <string name="loading_requesting_permissions">正在请求权限…</string>
+    <string name="loading_requesting_storage">正在请求存储访问…</string>
+    <string name="loading_storage_ok">存储访问正常</string>
+    <string name="loading_storage_granted">已授予存储访问权限</string>
+    <string name="loading_storage_denied">未授予存储权限——正在从应用资源加载</string>
+    <string name="loading_waking_up">正在唤醒…</string>
+    <string name="loading_ready">就绪</string>
+    <string name="loading_retry">重试</string>
+    <string name="loading_retrying">正在重试…</string>
+    <string name="loading_prefix_error">错误</string>
+    <string name="loading_copying_model">正在复制模型…</string>
+    <string name="loading_init_failed">初始化失败：%1$s</string>
+    <string name="loading_spoken_start_zh">正在启动Vyze。</string>
+    <string name="loading_spoken_error_zh">Vyze无法启动。点按任意位置重试。</string>
+    <string name="loading_still_working_zh">仍在工作——现在打开相机。</string>
 </resources>

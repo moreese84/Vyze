@@ -197,4 +197,22 @@
     <string name="menu_camera">Kamera</string>
     <string name="menu_gallery">Galeri</string>
     <string name="tv_gallery_placeholder">Klik + untuk menambah imej untuk analisis pemandangan.</string>
+
+    <!-- ── Skrin loading (paparan; baris suara di sebelah) ── -->
+    <string name="loading_permissions_ok">Kebenaran OK</string>
+    <string name="loading_requesting_permissions">Meminta kebenaran…</string>
+    <string name="loading_requesting_storage">Meminta akses storan…</string>
+    <string name="loading_storage_ok">Akses storan OK</string>
+    <string name="loading_storage_granted">Akses storan diberikan</string>
+    <string name="loading_storage_denied">Storan tidak diberikan — memuatkan dari aset aplikasi</string>
+    <string name="loading_waking_up">Sedang bangun…</string>
+    <string name="loading_ready">Sedia</string>
+    <string name="loading_retry">Cuba lagi</string>
+    <string name="loading_retrying">Mencuba lagi…</string>
+    <string name="loading_prefix_error">Ralat</string>
+    <string name="loading_copying_model">Menyalin model…</string>
+    <string name="loading_init_failed">Init gagal: %1$s</string>
+    <string name="loading_spoken_start_ms">Memulakan Vyze.</string>
+    <string name="loading_spoken_error_ms">Vyze tidak dapat dimulakan. Sentuh di mana-mana untuk mencuba lagi.</string>
+    <string name="loading_still_working_ms">Masih beroperasi — membuka kamera juga.</string>
 </resources>

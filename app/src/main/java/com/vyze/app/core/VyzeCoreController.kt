@@ -226,8 +226,13 @@ class VyzeCoreController(
                     mainHandler.post {
                         try {
                             ttsManager.speakQueued(
-                                "First time setup. Downloading AI engine. " +
-                                "This takes a few minutes on first use."
+                                ttsManager.localized(
+                                    "First time setup. Downloading AI engine. " +
+                                    "This takes a few minutes on first use.",
+                                    "Persediaan pertama kali. Memuat turun enjin AI. " +
+                                    "Ini mengambil masa beberapa minit pada penggunaan pertama.",
+                                    "首次设置。正在下载AI引擎。首次使用需要几分钟时间。"
+                                )
                             )
                         } catch (_: Throwable) {}
                     }
@@ -236,7 +241,13 @@ class VyzeCoreController(
                 progressPercent >= 25 && announcedMilestones.add(25) -> {
                     mainHandler.post {
                         try {
-                            ttsManager.speakQueued("Quarterway there.")
+                            ttsManager.speakQueued(
+                                ttsManager.localized(
+                                    "Quarterway there.",
+                                    "Sudah seperempat jalan.",
+                                    "已完成四分之一。"
+                                )
+                            )
                         } catch (_: Throwable) {}
                     }
                 }
@@ -244,7 +255,13 @@ class VyzeCoreController(
                 progressPercent >= 50 && announcedMilestones.add(50) -> {
                     mainHandler.post {
                         try {
-                            ttsManager.speakQueued("Halfway done.")
+                            ttsManager.speakQueued(
+                                ttsManager.localized(
+                                    "Halfway done.",
+                                    "Sudah separuh jalan.",
+                                    "已完成一半。"
+                                )
+                            )
                         } catch (_: Throwable) {}
                     }
                 }
@@ -252,7 +269,13 @@ class VyzeCoreController(
                 progressPercent >= 75 && announcedMilestones.add(75) -> {
                     mainHandler.post {
                         try {
-                            ttsManager.speakQueued("Almost there.")
+                            ttsManager.speakQueued(
+                                ttsManager.localized(
+                                    "Almost there.",
+                                    "Hampir siap.",
+                                    "快完成了。"
+                                )
+                            )
                         } catch (_: Throwable) {}
                     }
                 }
@@ -260,7 +283,13 @@ class VyzeCoreController(
                 progressPercent >= 99 && announcedMilestones.add(100) -> {
                     mainHandler.post {
                         try {
-                            ttsManager.speakQueued("Download complete. Preparing AI assistant.")
+                            ttsManager.speakQueued(
+                                ttsManager.localized(
+                                    "Download complete. Preparing AI assistant.",
+                                    "Muat turun selesai. Menyediakan pembantu AI.",
+                                    "下载完成。正在准备AI助手。"
+                                )
+                            )
                         } catch (_: Throwable) {}
                     }
                 }
@@ -276,10 +305,26 @@ class VyzeCoreController(
                 // during the 10-20s model loading phase.
                 when {
                     percent >= 75 && announcedMilestones.add(75) -> {
-                        try { ttsManager.speakQueued("Almost ready.") } catch (_: Throwable) {}
+                        try {
+                            ttsManager.speakQueued(
+                                ttsManager.localized(
+                                    "Almost ready.",
+                                    "Hampir sedia.",
+                                    "即将就绪。"
+                                )
+                            )
+                        } catch (_: Throwable) {}
                     }
                     percent >= 30 && percent < 75 && announcedMilestones.add(30) -> {
-                        try { ttsManager.speakQueued("Loading model weights.") } catch (_: Throwable) {}
+                        try {
+                            ttsManager.speakQueued(
+                                ttsManager.localized(
+                                    "Loading Vyze, please wait.",
+                                    "Memuatkan Vyze, sila tunggu.",
+                                    "正在加载Vyze，请稍候。"
+                                )
+                            )
+                        } catch (_: Throwable) {}
                     }
                 }
             }
@@ -415,12 +460,21 @@ class VyzeCoreController(
         val modelExists = vlmEngine.isModelOnDisk()
         if (!modelExists) {
             ttsManager.speakQueued(
-                "First time setup. Downloading AI engine. " +
-                "This takes a few minutes on first use."
+                ttsManager.localized(
+                    "First time setup. Downloading AI engine. " +
+                    "This takes a few minutes on first use.",
+                    "Persediaan pertama kali. Memuat turun enjin AI. " +
+                    "Ini mengambil masa beberapa minit pada penggunaan pertama.",
+                    "首次设置。正在下载AI引擎。首次使用需要几分钟时间。"
+                )
             )
         } else {
             ttsManager.speakQueued(
-                "Preparing your AI assistant."
+                ttsManager.localized(
+                    "Preparing your AI assistant.",
+                    "Menyediakan pembantu AI anda.",
+                    "正在准备您的AI助手。"
+                )
             )
         }
 

@@ -33,40 +33,42 @@
             android:contentDescription="@string/app_name"
             android:importantForAccessibility="yes" />
 
-        <!-- Progress bar with percentage -->
-        <FrameLayout
+        <!-- Progress bar with percentage — modernized: thicker rounded
+             track, label BELOW the bar (the old -4dp overlap hack
+             clipped descenders) -->
+        <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="48dp"
+            android:orientation="vertical"
             android:clipChildren="false">
 
             <com.google.android.material.progressindicator.LinearProgressIndicator
                 android:id="@+id/progress_bar"
                 android:layout_width="match_parent"
-                android:layout_height="12dp"
-                android:layout_gravity="center_vertical"
+                android:layout_height="wrap_content"
                 android:max="100"
                 android:progress="0"
-                app:trackCornerRadius="6dp"
+                app:trackCornerRadius="8dp"
+                app:trackThickness="16dp"
                 app:indicatorColor="@color/vyze_yellow"
-                app:trackColor="#33333322"
-                app:trackThickness="12dp"
+                app:trackColor="#1A231F20"
                 tools:progress="45" />
 
             <TextView
                 android:id="@+id/progress_text"
-                android:layout_width="wrap_content"
+                android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_gravity="end|bottom"
-                android:layout_marginBottom="-4dp"
+                android:layout_marginTop="6dp"
+                android:gravity="end"
                 android:text="0%"
                 android:textColor="#231f20"
                 android:textSize="13sp"
                 android:fontFamily="sans-serif-medium"
                 tools:text="45%" />
-        </FrameLayout>
+        </LinearLayout>
 
-        <!-- Status text -->
+        <!-- Status text — TalkBack announces changes automatically -->
         <TextView
             android:id="@+id/status_text"
             android:layout_width="wrap_content"
@@ -77,18 +79,25 @@
             android:textSize="14sp"
             android:gravity="center"
             android:importantForAccessibility="yes"
+            android:accessibilityLiveRegion="assertive"
             tools:text="Copying SmolVLM2 model..." />
 
-        <!-- Error state: Retry button -->
+        <!-- Error state: Retry button — pill-shaped brand button with ripple -->
         <Button
             android:id="@+id/retry_button"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginTop="32dp"
+            android:minWidth="160dp"
+            android:minHeight="48dp"
+            android:paddingHorizontal="32dp"
             android:text="Retry"
             android:textAllCaps="false"
             android:textColor="#FFFFFF"
-            android:background="#ce2028"
+            android:textSize="15sp"
+            android:fontFamily="sans-serif-medium"
+            android:stateListAnimator="@null"
+            android:background="@drawable/bg_retry_button"
             android:visibility="gone"
             android:importantForAccessibility="yes" />
 
