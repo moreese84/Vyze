@@ -2036,7 +2036,7 @@ class CameraFragment : Fragment() {
                 // delayed the mic by ~5s, so users who spoke early lost their
                 // query and heard nothing back.
                 mainActivity.speakThenCallback(
-                    ttsManager.localized("Listening.", "Silalah.", "请讲。")
+                    ttsManager.localized("Analyzing.", "Menganalisis.", "分析中。")
                 ) {
                     // Open the mic AFTER the cue finishes so it is never captured.
                     mainHandler.postDelayed({ startVoiceListening() }, VOICE_SESSION_OPEN_DELAY_MS)

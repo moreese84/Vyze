@@ -142,6 +142,14 @@ class MainActivity : AppCompatActivity() {
     private var localeFallbackIndex = 0
 
     /**
+     * Language tag the CURRENT recognizer session is pinned to ("en-US",
+     * "ms-MY", "zh-CN"), or null when the session is unpinned (auto-detect).
+     * The NO_MATCH ladder skips this locale — re-running the language that
+     * just failed would only reproduce the same NO_MATCH.
+     */
+    private var lastPinnedLocaleTag: String? = null
+
+    /**
      * Callback invoked when speech recognition completes with final text +
      * detected language + recognizer confidence (0.0–1.0). Confidence lets
      * the fragment run a "Did you say X?" confirmation on grey-band
@@ -953,6 +961,11 @@ class MainActivity : AppCompatActivity() {
                     return@post
                 }
 
+                // New user-initiated session — the language ladder starts
+                // from the top. (Ladder RETRIES bypass this method and call
+                // startListeningAfterTtsStop() directly, so they keep their
+                // ladder position.)
+                localeFallbackIndex = 0
                 startListeningAfterTtsStop()
             } catch (e: Exception) {
                 Log.e(TAG, "startListeningSafely error: ${e.message}")
@@ -1079,29 +1092,37 @@ class MainActivity : AppCompatActivity() {
             // next language instead of surfacing "No speech detected". This
             // breaks the chicken-and-egg where adaptive detection (which needs
             // ONE successful ms/zh result) never engages on the first query.
-            val ladderLocale = if (resolveRecognitionLocale() == null &&
+            // ── SESSION LANGUAGE SELECTION ───────────────────
+            // 1. LADDER ACTIVE (a previous session NO_MATCHed while the user
+            //    demonstrably spoke): pin the ladder's next language — the
+            //    user's speech is real, the engine just heard the wrong
+            //    language. Works even when a ms/zh locale is pinned by
+            //    [resolveRecognitionLocale]: the previous session's language
+            //    already failed, retrying it would reproduce the NO_MATCH.
+            // 2. Pinned ms/zh (declared voice or adaptive detection): honor
+            //    it — but remember the pin so the ladder can skip it.
+            // 3. Otherwise: pin en-US with auto-detect extras so first-contact
+            //    English queries work on any phone and ms/zh can switch
+            //    mid-session (API 34+).
+            val pinned = resolveRecognitionLocale()
+            val ladderLocale = if (localeFallbackIndex > 0 &&
                 localeFallbackIndex < FALLBACK_RECOGNITION_LOCALES.size
             ) {
                 FALLBACK_RECOGNITION_LOCALES[localeFallbackIndex]
             } else null
-            // Fresh intent EVERY session — the recognition language follows the
-            // user. Relying on the device default (English phone) made Malay and
-            // Chinese queries fail with NO_MATCH or low-confidence garbage that
-            // the chatter filter then silently dropped.
-            val recognitionLocale = resolveRecognitionLocale() ?: ladderLocale
+            val recognitionLocale = ladderLocale ?: pinned
             val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                 putExtra(
                     RecognizerIntent.EXTRA_LANGUAGE_MODEL,
                     RecognizerIntent.LANGUAGE_MODEL_FREE_FORM
                 )
                 if (recognitionLocale != null) {
+                    val tag = recognitionLocale.toLanguageTag()
                     // Strong hint: listen for the user's actual language
-                    // (Malay ms-MY / Chinese zh-CN on an English phone).
-                    putExtra(
-                        RecognizerIntent.EXTRA_LANGUAGE,
-                        recognitionLocale.toLanguageTag()
-                    )
-                    Log.d(TAG, "Recognition language forced to ${recognitionLocale.toLanguageTag()}" +
+                    // (en-US / ms-MY / zh-CN).
+                    putExtra(RecognizerIntent.EXTRA_LANGUAGE, tag)
+                    lastPinnedLocaleTag = tag
+                    Log.d(TAG, "Recognition language forced to $tag" +
                         if (ladderLocale != null) " (fallback ladder step ${localeFallbackIndex + 1})" else "")
                 } else {
                     // Language FIX: ALWAYS pin a base language, never leave the
@@ -1114,6 +1135,7 @@ class MainActivity : AppCompatActivity() {
                     // the language-detection extras below let the engine follow
                     // Malay/Chinese speech within the same session.
                     putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-US")
+                    lastPinnedLocaleTag = "en-US"
                     putExtra(
                         RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE,
                         SUPPORTED_RECOGNITION_LANGUAGES
@@ -1216,22 +1238,33 @@ class MainActivity : AppCompatActivity() {
                 // declared/detected ms/zh voice falls through to normal
                 // handling (including the model-ASR rescue).
                 if (error == SpeechRecognizer.ERROR_NO_MATCH && speechAttempted &&
-                    resolveRecognitionLocale() == null &&
                     // Guard: once an ENGLISH transcription has been accepted
                     // this session, NO_MATCH is likely real silence/noise, not
                     // a language mismatch — an English user must never get
-                    // stuck cycling the ms/zh ladder.
+                    // stuck cycling the ladder.
                     lastDetectedLocale?.language != "en" &&
                     localeFallbackIndex < FALLBACK_RECOGNITION_LOCALES.size
                 ) {
-                    val nextLocale = FALLBACK_RECOGNITION_LOCALES[localeFallbackIndex]
-                    localeFallbackIndex++
-                    Log.i(TAG, "Ladder retry: NO_MATCH on English session — retrying as ${nextLocale.toLanguageTag()} (step $localeFallbackIndex)")
-                    CrashLogFile.log(TAG, "LADDER RETRY: recognition → ${nextLocale.toLanguageTag()}")
-                    isListening = false
-                    speechRecognizer?.cancel()
-                    startListeningAfterTtsStop()
-                    return
+                    // [localeFallbackIndex] points at the NEXT locale to
+                    // try. Skip past the locale the failed session was pinned
+                    // to — re-running the language that just NO_MATCHed would
+                    // only reproduce the same failure.
+                    if (FALLBACK_RECOGNITION_LOCALES[localeFallbackIndex]
+                        .toLanguageTag() == lastPinnedLocaleTag
+                    ) {
+                        localeFallbackIndex++
+                    }
+                    if (localeFallbackIndex >= FALLBACK_RECOGNITION_LOCALES.size) {
+                        Log.i(TAG, "Ladder exhausted — falling through to normal error handling")
+                    } else {
+                        val nextLocale = FALLBACK_RECOGNITION_LOCALES[localeFallbackIndex]
+                        Log.i(TAG, "Ladder retry: NO_MATCH — retrying as ${nextLocale.toLanguageTag()} (step ${localeFallbackIndex + 1})")
+                        CrashLogFile.log(TAG, "LADDER RETRY: recognition → ${nextLocale.toLanguageTag()}")
+                        isListening = false
+                        speechRecognizer?.cancel()
+                        startListeningAfterTtsStop()
+                        return
+                    }
                 }
                 val errorMsg = when (error) {
                     SpeechRecognizer.ERROR_NO_MATCH -> {
@@ -1395,12 +1428,18 @@ class MainActivity : AppCompatActivity() {
         private const val SUPPORTED_RECOGNITION_LANGUAGES = "en-US,ms-MY,zh-CN"
 
         /**
-         * Locale-fallback ladder for first-contact recognition failures.
-         * An English-pinned session that returns NO_MATCH is retried as
-         * ms-MY, then zh-CN, before the error surfaces. Reset when any
-         * transcription is accepted or the session is user-aborted.
+         * Locale-fallback ladder for recognition failures. A session that
+         * returns NO_MATCH while the user demonstrably SPOKE is retried in
+         * the ladder's next language (en-US → ms-MY → zh-CN) before the
+         * error surfaces. English first so English queries work on first
+         * contact; ms/zh follow for first-contact non-English speech on
+         * engines that ignore the auto-detection extras. The locale already
+         * used by the failing session is skipped. Reset when any
+         * transcription is accepted, on a user-aborted session, and on each
+         * new user-initiated session.
          */
         private val FALLBACK_RECOGNITION_LOCALES = listOf(
+            java.util.Locale.US,
             java.util.Locale("ms", "MY"),
             java.util.Locale("zh", "CN")
         )
