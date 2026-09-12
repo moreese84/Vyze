@@ -1125,17 +1125,19 @@ class MainActivity : AppCompatActivity() {
                     Log.d(TAG, "Recognition language forced to $tag" +
                         if (ladderLocale != null) " (fallback ladder step ${localeFallbackIndex + 1})" else "")
                 } else {
-                    // Language FIX: ALWAYS pin a base language, never leave the
-                    // recognizer on its own default. Most recognizer engines
-                    // (including Google's on an English-default phone) IGNORE
-                    // EXTRA_LANGUAGE_PREFERENCE — it is a hint, not a command.
-                    // An unpinned session then defaults to en-US, so a Malay or
-                    // Chinese query comes back as NO_MATCH (the "no response"
-                    // bug). Pinning en-US keeps English queries working while
-                    // the language-detection extras below let the engine follow
-                    // Malay/Chinese speech within the same session.
-                    putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-US")
-                    lastPinnedLocaleTag = "en-US"
+                    // ── UNPINNED SESSION (mirroring-critical) ────────────
+                    // Do NOT set EXTRA_LANGUAGE here. A hard en-US pin makes
+                    // the engine transcribe Malay/Chinese speech through its
+                    // ENGLISH acoustic model and report "en-US" in the
+                    // results — setUserLocale(en-US) then reverts the mirrored
+                    // TTS voice and the prompt language directives. The
+                    // unpinned session (device default + auto-detect extras)
+                    // is the configuration under which the recognizer reports
+                    // the TRUE detected language, which is what mirroring
+                    // depends on. First-contact coverage is provided by the
+                    // NO_MATCH ladder (en-US → ms-MY → zh-CN) instead of a
+                    // pin.
+                    lastPinnedLocaleTag = null // unpinned — nothing to skip
                     putExtra(
                         RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE,
                         SUPPORTED_RECOGNITION_LANGUAGES
