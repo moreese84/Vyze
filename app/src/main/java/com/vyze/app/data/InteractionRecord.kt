@@ -1,4 +1,5 @@
 package com.vyze.app.data
+import com.vyze.app.vision.EmbeddingEngine
 
 import androidx.room.ColumnInfo
 import androidx.room.Entity
@@ -16,7 +17,7 @@ import androidx.room.PrimaryKey
  *
  * ## Embedding Format
  * [imageEmbedding] is a ByteArray-serialized FloatArray of 256 floats (16×16 grayscale pixels,
- * normalized to 0.0–1.0). This is computed by [com.vyze.app.embedding.EmbeddingEngine]
+ * normalized to 0.0–1.0). This is computed by [com.vyze.app.vision.EmbeddingEngine]
  * and provides lightweight visual similarity without requiring a separate ML model.
  *
  * ## Retrieval

@@ -1,4 +1,5 @@
 package com.vyze.app.memory
+import com.vyze.app.speech.TTSManager
 
 import android.util.Log
 import com.vyze.app.data.MemoryDao
@@ -78,7 +79,7 @@ class PreferenceLearner(private val memoryDao: MemoryDao) {
 
     /**
      * Record that the user interrupted a still-speaking answer by triggering
-     * a new capture. Call BEFORE [com.vyze.app.TTSManager.stop] so the
+     * a new capture. Call BEFORE [com.vyze.app.speech.TTSManager.stop] so the
      * speaking-state read is accurate.
      */
     suspend fun recordInterruptWhileSpeaking() = withContext(Dispatchers.IO) {

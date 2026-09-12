@@ -22,7 +22,7 @@
     <!-- Loading screen — first destination on launch -->
     <fragment
         android:id="@+id/loading_fragment"
-        android:name="com.vyze.app.fragments.LoadingFragment"
+        android:name="com.vyze.app.ui.fragments.LoadingFragment"
         android:label="LoadingFragment">
 
         <action
@@ -35,7 +35,7 @@
 
     <fragment
         android:id="@+id/permissions_fragment"
-        android:name="com.vyze.app.fragments.PermissionsFragment"
+        android:name="com.vyze.app.ui.fragments.PermissionsFragment"
         android:label="PermissionsFragment">
 
         <action
@@ -48,7 +48,7 @@
 
     <fragment
         android:id="@+id/camera_fragment"
-        android:name="com.vyze.app.fragments.CameraFragment"
+        android:name="com.vyze.app.ui.fragments.CameraFragment"
         android:label="CameraFragment">
 
         <action
@@ -65,12 +65,12 @@
 
     <fragment
         android:id="@+id/gallery_fragment"
-        android:name="com.vyze.app.fragments.GalleryFragment"
+        android:name="com.vyze.app.ui.fragments.GalleryFragment"
         android:label="GalleryFragment" />
 
     <fragment
         android:id="@+id/tts_settings_fragment"
-        android:name="com.vyze.app.fragments.TtsSettingsFragment"
+        android:name="com.vyze.app.ui.fragments.TtsSettingsFragment"
         android:label="TtsSettingsFragment">
 
         <action

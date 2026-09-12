@@ -1,4 +1,7 @@
 package com.vyze.app
+import com.vyze.app.util.CrashLogFile
+import com.vyze.app.core.VyzeCoreController
+import com.vyze.app.speech.TTSManager
 
 import android.app.Application
 import android.util.Log

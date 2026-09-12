@@ -1,10 +1,10 @@
 package com.vyze.app.memory
+import com.vyze.app.vision.EmbeddingEngine
 
 import android.graphics.Bitmap
 import android.util.Log
 import com.vyze.app.data.InteractionDao
 import com.vyze.app.data.InteractionRecord
-import com.vyze.app.embedding.EmbeddingEngine
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 

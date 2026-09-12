@@ -79,3 +79,6 @@ generate_vyze_*.py
 
 # Play Store mockups (local only)
 playstore-screenshots/
+
+# Local doc/pitch-deck generator scripts
+tools/

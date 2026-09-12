@@ -54,19 +54,33 @@ Camera Frame ──→ ML Kit OCR ──→ DynamicPromptBuilder
 
 | Component | File | Responsibility |
 |---|---|---|
-| **VlmEngineManager** | `VlmEngineManager.kt` | Gemma 4 E2B engine lifecycle, NPU/GPU fallback, inference |
-| **VyzeCoreController** | `VyzeCoreController.kt` | Pipeline orchestrator, session isolation, sentence streaming |
-| **DynamicPromptBuilder** | `DynamicPromptBuilder.kt` | Intent-based prompt construction, language mirroring |
-| **OcrHelper** | `OcrHelper.kt` | ML Kit on-device OCR (Latin + Chinese) |
-| **TTSManager** | `TTSManager.kt` | Platform TextToSpeech (Google TTS engine preferred), utterance tracking, voice switching, prosody & pronunciation smoothing |
-| **BarcodeHelper** | `BarcodeHelper.kt` | ML Kit on-device 1D/2D barcode detection (EAN/UPC/QR/Data Matrix) |
+| **VlmEngineManager** | `core/VlmEngineManager.kt` | Gemma 4 E2B engine lifecycle, NPU/GPU fallback, inference |
+| **VyzeCoreController** | `core/VyzeCoreController.kt` | Pipeline orchestrator, session isolation, sentence streaming |
+| **DynamicPromptBuilder** | `core/DynamicPromptBuilder.kt` | Intent-based prompt construction, language mirroring |
+| **OcrHelper** | `vision/OcrHelper.kt` | ML Kit on-device OCR (Latin + Chinese) |
+| **TTSManager** | `speech/TTSManager.kt` | Platform TextToSpeech (Google TTS engine preferred), utterance tracking, voice switching, prosody & pronunciation smoothing |
+| **BarcodeHelper** | `vision/BarcodeHelper.kt` | ML Kit on-device 1D/2D barcode detection (EAN/UPC/QR/Data Matrix) |
 | **PreferenceLearner** | `memory/PreferenceLearner.kt` | Silent behavioral adaptation — learns answer brevity from speech-active interrupts |
-| **CameraSetupDelegate** | `CameraSetupDelegate.kt` | CameraX frame extraction, snapshot capture |
-| **CameraFragment** | `CameraFragment.kt` | UI, speech callbacks, auto-snapshot loop |
-| **MemoryRepository** | `MemoryRepository.kt` | Vector similarity search, adaptive intelligence |
-| **AudioCapture** | `AudioCapture.kt` | 16 kHz mono float32 recorder for the model-native ASR rescue |
+| **CameraSetupDelegate** | `ui/delegates/CameraSetupDelegate.kt` | CameraX frame extraction, snapshot capture |
+| **CameraFragment** | `ui/fragments/CameraFragment.kt` | UI, speech callbacks, auto-snapshot loop |
+| **MemoryRepository** | `memory/MemoryRepository.kt` | Vector similarity search, adaptive intelligence |
+| **AudioCapture** | `device/AudioCapture.kt` | 16 kHz mono float32 recorder for the model-native ASR rescue |
 | **MainActivity** | `MainActivity.kt` | Speech recognition, lifecycle, TTS orchestration |
-| **ReportManager** | `ReportManager.kt` | Voice-driven bug reporting via email |
+| **ReportManager** | `speech/ReportManager.kt` | Voice-driven bug reporting via email |
+
+### Project structure
+
+```text
+app/src/main/java/com/vyze/app/
+├── core/        Pipeline orchestration: controller, prompt builder, VLM engine
+├── vision/      Perception: OCR, barcode, color analysis, scene embeddings
+├── speech/      Voice output: TTS management, report capture
+├── device/      Hardware interaction: gestures, haptics, flashlight, mic capture
+├── ui/          Fragments, delegates, views, viewmodels
+├── memory/      Adaptive intelligence: preference learning, scene memory
+├── data/        Room database: DAOs, entities, repositories
+└── util/        Crash logging
+```
 
 ---
 
@@ -190,20 +204,7 @@ Vyze needs two sets of models:
    ```
    The app checks both `/storage/emulated/0/Download/` and the app-scoped external files directory.
 
-2. **TTS Models (Kokoro + Meta MMS)** — bundled in the APK (`app/src/main/assets/`). Run the setup script once:
-   ```bash
-   # Windows (PowerShell)
-   .\setup-sherpa.ps1
-
-   # or download manually:
-   .\setup-sherpa-curl.bat
-   ```
-   This downloads:
-   - **Kokoro** (325 MB) — neural-quality English & Chinese voices
-   - **Meta MMS** (114 MB) — Malay & multilingual voice
-   - **Sherpa-ONNX JNI libraries** (26 MB) — native speech engine
-
-> **Note:** the Sherpa-ONNX TTS pipeline was removed in v1.2 — Vyze now uses the platform TextToSpeech engine and this setup script is no longer required.
+2. **TTS** — no setup needed. Vyze uses the Android platform `TextToSpeech` engine (no bundled models since v1.2).
 
 ### Install
 

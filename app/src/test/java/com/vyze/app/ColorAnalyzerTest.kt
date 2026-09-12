@@ -1,4 +1,5 @@
 package com.vyze.app
+import com.vyze.app.vision.ColorAnalyzer
 
 import org.junit.Assert.*
 import org.junit.Test

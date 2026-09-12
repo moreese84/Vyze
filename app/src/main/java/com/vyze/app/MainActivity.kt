@@ -1,4 +1,11 @@
 package com.vyze.app
+import com.vyze.app.util.CrashLogFile
+import com.vyze.app.ui.MainViewModel
+import com.vyze.app.device.HapticManager
+import com.vyze.app.speech.TTSManager
+import com.vyze.app.ui.TtsViewModel
+import com.vyze.app.device.AudioCapture
+import com.vyze.app.ui.SplashViewModel
 
 import android.annotation.SuppressLint
 import android.content.Context

@@ -1,4 +1,6 @@
 package com.vyze.app
+import com.vyze.app.ui.MainViewModel
+import com.vyze.app.speech.TTSManager
 
 import android.content.Context
 import androidx.test.ext.junit.runners.AndroidJUnit4

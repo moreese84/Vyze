@@ -1,4 +1,5 @@
 package com.vyze.app
+import com.vyze.app.device.GestureDetectorHelper
 
 import android.os.SystemClock
 import android.view.MotionEvent

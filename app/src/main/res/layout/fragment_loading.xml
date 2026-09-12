@@ -9,7 +9,7 @@
     android:contentDescription="Vyze loading screen">
 
     <!-- Animated brand dots background (red + yellow on white) -->
-    <com.vyze.app.BrandDotsView
+    <com.vyze.app.ui.BrandDotsView
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
