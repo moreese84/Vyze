@@ -153,6 +153,38 @@ class MemoryRepository(private val interactionDao: InteractionDao) {
     }
 
     /**
+     * Text-based recall — most recent interactions mentioning [query] terms.
+     * Serves spoken recall queries ("where are my keys?") that arrive with NO
+     * camera frame, where visual similarity search cannot run. Escapes SQL
+     * LIKE wildcards in the user's words before delegating to the DAO.
+     *
+     * @param query  Raw user query text (kept verbatim; LIKE wildcards escaped)
+     * @param limit  Maximum records to return (default: 5)
+     * @return Most recent matching records, newest first — empty on any failure
+     */
+    suspend fun recallByText(
+        query: String,
+        limit: Int = 5
+    ): List<InteractionRecord> = withContext(Dispatchers.IO) {
+        try {
+            val terms = query
+                .trim()
+                .take(100)
+                .replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            if (terms.isBlank()) {
+                emptyList()
+            } else {
+                interactionDao.searchRecentByPromptAndOutput(terms, limit)
+            }
+        } catch (e: Throwable) {
+            Log.e(tag, "Text recall failed: ${e.javaClass.simpleName}: ${e.message}", e)
+            emptyList()
+        }
+    }
+
+    /**
      * Get recent interactions for context (non-similarity-based).
      * Useful for providing spatial continuity even without visual matching.
      */

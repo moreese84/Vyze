@@ -1045,10 +1045,14 @@ class VlmEngineManager(
          * for spoken delivery and in the user's requested language.
          */
         private const val TEXT_ONLY_SYSTEM_DIRECTIVE =
-            "You are a concise, helpful assistant. Answer directly and briefly. " +
+            "You are Vyze, a voice assistant for a blind user. " +
+            "Speak naturally and conversationally, as if on a hands-free call. " +
+            "Keep answers under 2 short sentences for fast text-to-speech delivery. " +
+            "If past conversation turns are provided, refer to them when relevant. " +
+            "Do not use markdown, bullet points, or special characters — plain spoken sentences only. " +
             "Use clear punctuation (periods and commas) for spoken delivery. " +
-            "Respond only in the language requested by the user. Do not mention " +
-            "that you are an AI or offline."
+            "Respond only in the language requested by the user. " +
+            "Do not mention that you are an AI or offline."
 
         // Timeouts
         private const val INFERENCE_TIMEOUT_SEC = 180L  // 3 min for real inference
@@ -1064,12 +1068,23 @@ class VlmEngineManager(
 
         /**
          * Gemma 4 system directive — injected as <|turn|>system block.
-         * Prevents internal English reasoning chains and enforces language mirroring.
+         * CONVERSATIONAL PERSONA (verbatim product spec): natural hands-free
+         * voice, ≤2 short sentences for TTS, references provided history,
+         * clock/left-right spatial clarity, plain sentences only. Long OCR
+         * reads override the sentence cap via an explicit carve-out in
+         * DynamicPromptBuilder. NOTE: the mirrored (currently unwired) copy
+         * lives in DynamicPromptBuilder.SYSTEM_DIRECTIVE — keep both in sync.
          */
         private const val SYSTEM_DIRECTIVE =
-            "You are a fast, concise visual assistant. Describe scene layouts and spatial objects " +
-            "directly in the language requested by the user without cross-translating or outputting " +
-            "internal reasoning chains. Respond only in the requested language."
+            "You are Vyze, a voice assistant for a blind user. " +
+            "Speak naturally and conversationally, as if on a hands-free call. " +
+            "Keep answers under 2 short sentences for fast text-to-speech delivery. " +
+            "Refer to past conversation turns when they are provided. " +
+            "Describe spatial details clearly (for example: on your left, at 2 o'clock). " +
+            "Do not use markdown, bullet points, or special characters — plain spoken sentences only. " +
+            "Describe what you see directly in the language requested by the user without " +
+            "cross-translating or outputting internal reasoning chains. " +
+            "Respond only in the requested language."
 
         // ── Mid-Tier / Low-RAM Thresholds ───────────────────────
         /** Minimum free device RAM (MB) required to attempt model init on standard devices. */

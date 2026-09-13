@@ -31,6 +31,14 @@ interface InteractionDao {
     @Query("SELECT * FROM interaction_records WHERE tags LIKE '%' || :tag || '%' ORDER BY timestamp DESC")
     suspend fun getByTag(tag: String): List<InteractionRecord>
 
+    /**
+     * Text-based recall: most recent records whose PROMPT OR OUTPUT mentions
+     * the given terms (LIKE — no FTS available without a schema migration).
+     * Backs spoken recall queries ("where are my keys?") with no camera frame.
+     */
+    @Query("SELECT * FROM interaction_records WHERE prompt LIKE '%' || :terms || '%' OR output LIKE '%' || :terms || '%' ORDER BY timestamp DESC LIMIT :limit")
+    suspend fun searchRecentByPromptAndOutput(terms: String, limit: Int = 5): List<InteractionRecord>
+
     /** Get total number of stored interactions. */
     @Query("SELECT COUNT(*) FROM interaction_records")
     suspend fun getCount(): Int

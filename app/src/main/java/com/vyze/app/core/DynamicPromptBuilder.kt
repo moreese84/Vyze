@@ -60,12 +60,18 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
             // 2. OCR pre-extracted text (if available — feeds clean text to model)
             if (!ocrText.isNullOrBlank()) {
                 sb.appendLine("OCR: $ocrText")
-                // 2b. Reading guidance — the model sometimes echoes OCR text
-                //     letter-by-letter ("H-U-R-I-X") or stops early on long
-                //     passages (box back panels). Anchor the desired behavior.
-                sb.appendLine("The OCR text above is the ground truth. Read it as whole words and " +
-                    "continuous sentences — never spell it letter by letter. When asked to read " +
-                    "text, read ALL of it in reading order; do not summarize, skip, or stop early.")
+            // 2b. Reading guidance — the model sometimes echoes OCR text
+            //     letter-by-letter ("H-U-R-I-X") or stops early on long
+            //     passages (box back panels). Anchor the desired behavior.
+            //     OCR CARVE-OUT (persona override): a full label/document read
+            //     is ground-truth playback — the conversational 2-sentence cap
+            //     in the system directive must never truncate it, so reading
+            //     tasks explicitly override the cap here.
+            sb.appendLine("The OCR text above is the ground truth. Read it as whole words and " +
+                "continuous sentences — never spell it letter by letter. When asked to read " +
+                "text, read ALL of it in reading order; do not summarize, skip, or stop early. " +
+                "When reading text aloud, the 2-sentence limit does NOT apply — read every " +
+                "word of the OCR text completely.")
             }
 
             // 2b-bis. LEARNED BREVITY — silently adapted answer length.
@@ -201,14 +207,20 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
         private const val TAG = "DynamicPromptBuilder"
 
         /**
-         * System directive — injected as <|turn|>system block.
-         * Prevents Gemma from wasting cycles on internal English reasoning chains.
+         * System directive — currently UNWIRED (VlmEngineManager.SYSTEM_DIRECTIVE
+         * is the live one prepended to every inference); kept mirrored so the two
+         * never diverge in intent. Conversational persona for blind users.
          */
         private const val SYSTEM_DIRECTIVE =
-            "You are a fast, concise visual assistant. Describe scene layouts and spatial objects " +
-            "directly in the language requested by the user without cross-translating or outputting " +
-            "internal reasoning chains. Use clear, natural punctuation (commas, periods, and short clauses) " +
-            "to guide spoken delivery. Respond only in the requested language."
+            "You are Vyze, a voice assistant for a blind user. " +
+            "Speak naturally and conversationally, as if on a hands-free call. " +
+            "Keep answers under 2 short sentences for fast text-to-speech delivery. " +
+            "Refer to past conversation turns when they are provided. " +
+            "Describe spatial details clearly (for example: on your left, at 2 o'clock). " +
+            "Do not use markdown, bullet points, or special characters — plain spoken sentences only. " +
+            "Describe what you see directly in the language requested by the user without " +
+            "cross-translating or outputting internal reasoning chains. " +
+            "Respond only in the requested language."
 
         /**
          * NAVIGATION MODE — used for generic taps and automatic spatial descriptions.

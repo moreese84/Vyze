@@ -14,6 +14,7 @@ import android.os.Looper
 import android.speech.tts.TextToSpeech
 import android.util.Log
 import com.vyze.app.data.InteractionDao
+import com.vyze.app.data.InteractionRecord
 import com.vyze.app.data.MemoryDao
 import com.vyze.app.memory.MemoryRepository
 import com.vyze.app.memory.PreferenceLearner
@@ -106,9 +107,19 @@ class VyzeCoreController(
     // Bounded ring buffer of recent voice exchanges. Injected into voice
     // query prompts so pronouns resolve across turns ("what about the one
     // BEHIND it?"). Dropped when the follow-up window closes or after
-    // DIALOGUE_TTL_MS of silence. Deliberately SMALL: 2 turns × ~100 chars
-    // ≈ 120-150 prompt tokens — negligible prefill even on low-RAM phones.
+    // DIALOGUE_TTL_MS of silence. SIZED for conversation: 4 turns × ~150
+    // chars ≈ ~600 prompt tokens worst case — still small prefill, and the
+    // per-turn cap keeps longer histories from slowing first-token latency.
     private val dialogueTurns = ArrayDeque<Pair<String, String>>(MAX_DIALOGUE_TURNS)
+
+    /**
+     * Single shared lock for ALL [dialogueTurns] accesses — reads, writes, and
+     * clears (recordDialogueTurn / dialogueContextForPrompt / TTL prune in
+     * triggerSnapshot / onConversationWindowClosed). Recording runs on
+     * Dispatchers.Default while clears arrive on the main thread; without one
+     * shared lock a clear racing a record corrupts the deque.
+     */
+    private val dialogueLock = Any()
 
     /** Timestamp of the last recorded exchange (for TTL expiry). */
     @Volatile
@@ -905,7 +916,9 @@ class VyzeCoreController(
         if (isVoiceFollowUpCandidate) {
             // Lightweight TTL prune on every voice trigger.
             if (System.currentTimeMillis() - lastDialogueAt > DIALOGUE_TTL_MS) {
-                dialogueTurns.clear()
+                synchronized(dialogueLock) {
+                    dialogueTurns.clear()
+                }
             }
         }
         currencyModeActive = currencyQuery
@@ -1144,6 +1157,13 @@ class VyzeCoreController(
                     mainHandler.removeCallbacks(watchdogRunnable)
                     val ocrResponse = ocrText
                     if (currentSessionId == activeSessionId) {
+                        // FIX 3: spoken fast-path reads enter the dialogue
+                        // history (same gating as VLM answers) — without this a
+                        // follow-up like "what does the second line say?" had
+                        // no context for the text just read.
+                        if (isVoiceFollowUpCandidate && !isPreciseRead) {
+                            recordDialogueTurn(query ?: "", ocrResponse)
+                        }
                         mainHandler.post {
                             onInferenceComplete?.invoke(ocrResponse)
                             onStatusUpdate?.invoke("Ready [OCR fast-path]")
@@ -1750,6 +1770,21 @@ class VyzeCoreController(
                 }
 
                 CrashLogFile.log(TAG, "Building text-only prompt...")
+                // FIX 4 — TEXT-BASED RECALL: with no camera frame the visual
+                // similarity path cannot run (memoryContext = null). If the
+                // stored interaction history mentions what the user is asking
+                // about, inject it as context so "where are my keys?" can
+                // surface the last scene that showed keys.
+                val recallRecords = try {
+                    memoryRepository.recallByText(query)
+                } catch (e: Throwable) {
+                    CrashLogFile.logError(TAG, "Text recall lookup failed: ${e.message}", e)
+                    emptyList()
+                }
+                val recallContext = buildTextRecallContext(recallRecords)
+                if (recallContext != null) {
+                    CrashLogFile.log(TAG, "Text recall injected: ${recallContext.take(80)}...")
+                }
                 val basePrompt = promptBuilder.buildPrompt(
                     snapshotDescription = query,
                     queryOverride = query,
@@ -1758,8 +1793,12 @@ class VyzeCoreController(
                     ocrText = null,
                     currencyMode = false,
                     bankCardMode = false,
-                    memoryContext = null,
-                    brevityLevel = preferenceLearner.getBrevityLevel()
+                    memoryContext = recallContext,
+                    brevityLevel = preferenceLearner.getBrevityLevel(),
+                    // PERSONA SPEC — "refer to past conversation turns": the
+                    // text-only path now carries the sliding history too, so
+                    // follow-ups like "why?" after a knowledge answer resolve.
+                    dialogueContext = dialogueContextForPrompt()
                 )
                 CrashLogFile.log(TAG, "Text prompt built: ${basePrompt.length} chars")
 
@@ -2095,6 +2134,26 @@ class VyzeCoreController(
         }
     }
 
+    /**
+     * Format text-recall hits for prompt injection (FIX 4). Only records that
+     * actually mention the query's key terms are eligible, newest first; the
+     * single best (most recent) output is used, clipped to
+     * [TEXT_RECALL_MAX_CHARS] — mirrors [buildMemoryContext] sizing.
+     *
+     * @return injection-ready context string, or null when nothing matches.
+     */
+    private fun buildTextRecallContext(records: List<InteractionRecord>): String? {
+        if (records.isEmpty()) return null
+        val best = records.first()
+        val prior = best.output.trim()
+        if (prior.length < 8) return null
+        return if (prior.length > TEXT_RECALL_MAX_CHARS) {
+            prior.take(TEXT_RECALL_MAX_CHARS).trimEnd() + "…"
+        } else {
+            prior
+        }
+    }
+
     // ── Dialogue Memory API ───────────────────────────────────────
 
     /** Called when the hands-free follow-up window OPENS. */
@@ -2105,9 +2164,11 @@ class VyzeCoreController(
     /** Called when the follow-up window CLOSES — dialogue expires. */
     fun onConversationWindowClosed() {
         conversationWindowOpen = false
-        if (dialogueTurns.isNotEmpty()) {
-            dialogueTurns.clear()
-            Log.d(TAG, "Dialogue memory expired (window closed)")
+        synchronized(dialogueLock) {
+            if (dialogueTurns.isNotEmpty()) {
+                dialogueTurns.clear()
+                Log.d(TAG, "Dialogue memory expired (window closed)")
+            }
         }
     }
 
@@ -2119,7 +2180,7 @@ class VyzeCoreController(
         val q = userQuery.trim().take(MAX_DIALOGUE_TURN_CHARS)
         val a = response.trim().take(MAX_DIALOGUE_TURN_CHARS)
         if (q.isBlank() || a.isBlank()) return
-        synchronized(dialogueTurns) {
+        synchronized(dialogueLock) {
             while (dialogueTurns.size >= MAX_DIALOGUE_TURNS) dialogueTurns.removeFirst()
             dialogueTurns.addLast(q to a)
         }
@@ -2132,15 +2193,15 @@ class VyzeCoreController(
      */
     private fun dialogueContextForPrompt(): String? {
         if (!conversationWindowOpen) return null
-        if (dialogueTurns.isEmpty()) return null
-        // TTL expiry: silence longer than DIALOGUE_TTL_MS invalidates context —
-        // the conversation topic is almost certainly stale by then.
-        if (System.currentTimeMillis() - lastDialogueAt > DIALOGUE_TTL_MS) {
-            dialogueTurns.clear()
-            return null
-        }
-        return synchronized(dialogueTurns) {
-            dialogueTurns.joinToString("\n") { (q, a) -> "User: $q\nVyze: $a" }
+        synchronized(dialogueLock) {
+            if (dialogueTurns.isEmpty()) return null
+            // TTL expiry: silence longer than DIALOGUE_TTL_MS invalidates context —
+            // the conversation topic is almost certainly stale by then.
+            if (System.currentTimeMillis() - lastDialogueAt > DIALOGUE_TTL_MS) {
+                dialogueTurns.clear()
+                return null
+            }
+            return dialogueTurns.joinToString("\n") { (q, a) -> "User: $q\nVyze: $a" }
         }
     }
 
@@ -2201,11 +2262,11 @@ class VyzeCoreController(
         /** Scene queries: concise descriptions (raised — avoids mid-sentence cutoffs). */
         private const val SCENE_QUERY_MAX_TOKENS = 128
 
-        /** Max dialogue turns kept for conversational follow-ups. */
-        private const val MAX_DIALOGUE_TURNS = 2
+        /** Max dialogue turns kept for conversational follow-ups (sliding window). */
+        private const val MAX_DIALOGUE_TURNS = 4
 
-        /** Per-turn char cap — keeps the injected block ~120-150 tokens. */
-        private const val MAX_DIALOGUE_TURN_CHARS = 100
+        /** Per-turn char cap (~150) — bounds the injected block to ~600 tokens. */
+        private const val MAX_DIALOGUE_TURN_CHARS = 150
 
         /** Dialogue expires after this much silence even mid-window. */
         private const val DIALOGUE_TTL_MS = 60_000L
@@ -2239,6 +2300,12 @@ class VyzeCoreController(
         // ── Memory Context Injection ────────────────────────────
         /** Similarity bar for treating a past scan as "the same scene". */
         private const val MEMORY_INJECT_MIN_SIMILARITY = 0.6f
+
+        /**
+         * Cap the injected text-recall snippet ([buildTextRecallContext]) to
+         * keep text-only prompts lean — mirrors [MEMORY_CONTEXT_MAX_CHARS].
+         */
+        private const val TEXT_RECALL_MAX_CHARS = 240
         /** Only inject memories from scans within this window (24h). */
         private const val MEMORY_INJECT_MAX_AGE_MS = 24L * 60L * 60L * 1000L
         /** Cap injected snippet length to keep prompts lean. */

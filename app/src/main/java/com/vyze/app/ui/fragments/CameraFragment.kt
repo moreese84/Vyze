@@ -1918,6 +1918,19 @@ class CameraFragment : Fragment() {
     private val conversationWatchdog = object : Runnable {
         override fun run() {
             if (!inConversationWindow || !isAdded) return
+            // FIX 2 — WATCHDOG EXPIRY RACE: while an answer is being produced
+            // (ANALYZING) or spoken (SPEAKING), a long inference could outlive
+            // the 12s deadline; closing here wiped the dialogue history
+            // MID-ANSWER, so the just-finished exchange was lost to the next
+            // follow-up. Defer closure instead: the deadline is pushed forward
+            // and the window closes once the answer is done (or on the next
+            // expiry check after it).
+            if (appState == AppState.ANALYZING || appState == AppState.SPEAKING) {
+                conversationDeadlineMs = android.os.SystemClock.elapsedRealtime() +
+                    CONVERSATION_WINDOW_MS
+                mainHandler.postDelayed(this, CONVERSATION_WINDOW_TICK_MS)
+                return
+            }
             if (android.os.SystemClock.elapsedRealtime() >= conversationDeadlineMs) {
                 Log.d(TAG, "Conversation window expired — closing mic")
                 endFollowUpWindow()
