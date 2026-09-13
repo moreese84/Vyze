@@ -207,7 +207,7 @@ IDLE ─────────────────────────
 <pre class="art"><code>&lt;|turn|&gt;system [System Prompt]&lt;|end_of_turn|&gt;
 &lt;|turn|&gt;user [User / Image Context]&lt;|end_of_turn|&gt;
 &lt;|turn|&gt;model</code></pre>
-<p>Image patch tokens are bound natively by the LiteRT-LM engine when a <code>Bitmap</code> is passed — no literal image placeholder is required. A fixed system directive enforces the product's two behavioral contracts:</p>
+<p>Image patch tokens are bound natively by the LiteRT-LM engine via <code>Content.ImageBytes(jpegBytes)</code> — the camera <code>Bitmap</code> is first downscaled and JPEG-encoded, then the resulting bytes are passed in the <code>Contents</code> payload (the Kotlin SDK does not accept bitmaps directly; there is no <code>fromBitmap</code> API). No literal image placeholder is required. A fixed system directive enforces the product's two behavioral contracts:</p>
 <ol><li><strong>Language mirroring</strong> — respond only in the language requested, without cross-translating.</li><li><strong>No internal reasoning chains</strong> — answers are direct and concise (the raw chain-of-thought of the base model is suppressed, both for latency and to avoid confusing narration).</li></ol>
 <p><code>DynamicPromptBuilder</code> assembles query-specific context: language identification, injected memory recall (see §9.2), OCR ground truth when present, and <strong>few-shot examples</strong> for specialized tasks such as reading medicine packaging:</p>
 <blockquote><em>"Input: what medicine is this? Image shows Diclac Retard box. Output: Diclac Retard, diclofenac sodium 100mg. Take one tablet daily after meals."</em>
