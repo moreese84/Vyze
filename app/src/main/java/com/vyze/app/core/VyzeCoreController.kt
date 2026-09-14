@@ -2143,9 +2143,15 @@ class VyzeCoreController(
      * PUBLIC for the fragment's capture router: true when [query] is an
      * explicit text-reading request — the only query class that needs the
      * full-resolution ImageCapture still for OCR.
-     * Pure query-text classification (no state touched).
+     *
+     * Deliberately excludes tap payloads: the fixed tap query embeds the
+     * phrase "read it aloud verbatim", which satisfies TEXT_KEYWORDS —
+     * routing taps here would put EVERY tap on the slow still-capture
+     * path. Same exclusion as the fast-path: a single tap keeps the
+     * analyzer frame; text on the tapped object is handled by the 720p
+     * OCR pre-pass + Gemma.
      */
-    fun isTextReadQuery(query: String?): Boolean = isTextExtractionQuery(query)
+    fun isTextReadQuery(query: String?): Boolean = isOcrFastPathQuery(query)
 
     /**
      * Returns true if the query contains keywords indicating the user wants

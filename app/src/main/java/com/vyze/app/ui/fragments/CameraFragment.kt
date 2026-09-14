@@ -465,8 +465,9 @@ class CameraFragment : Fragment() {
             bargeInAndCapture(
                 "User tapped at position (${x.toInt()}, ${y.toInt()}). " +
                 "Describe what is in front of me and around me for navigation, in 1-2 " +
-                "dense sentences — what each key object is plus color, size, material, " +
-                "and state, not lengthy prose. " +
+                "complete, natural spoken sentences with a subject and a verb — the way " +
+                "you would tell a person standing next to me. For each key object include " +
+                "color, size, material, and state. " +
                 "If the tapped object is a packaged product (packet, box, bottle, can), " +
                 "first say its BRAND name and product type exactly as printed " +
                 "(for example: Maggi instant noodle packet), then its details, then continue. " +
