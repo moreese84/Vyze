@@ -154,6 +154,15 @@ class TTSManager private constructor(context: Context) {
      */
     fun hasPendingSpeech(): Boolean = pendingUtteranceIds.isNotEmpty()
 
+    /**
+     * Number of utterances currently queued or playing — the Q3 backpressure
+     * signal. The controller holds sentence flushes while this exceeds
+     * [MAX_PENDING_UTTERANCES] so generation outpacing speech cannot stack
+     * unbounded synthesis work in the TTS service (worst exactly during a
+     * thermal event). The final flush bypasses the cap, so no text is lost.
+     */
+    fun pendingUtteranceCount(): Int = pendingUtteranceIds.size
+
     // ── Audio Attributes (Media stream — follows the phone volume) ──
     // USAGE_MEDIA routes TTS to STREAM_MUSIC, so Vyze speaks at exactly
     // the phone's media volume and the hardware volume buttons work
@@ -1426,6 +1435,9 @@ class TTSManager private constructor(context: Context) {
         }
 
         const val DEBOUNCE_MS = 1500L
+
+        /** Sentence flushes pause above this many pending utterances (Q3). */
+        const val MAX_PENDING_UTTERANCES = 3
 
         /** Speech-rate multiplier for safety-critical readouts (money, medication). */
         private const val CRITICAL_INFO_RATE_FACTOR = 0.85f

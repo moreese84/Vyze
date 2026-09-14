@@ -29,6 +29,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import com.vyze.app.memory.MemoryRepository
 import com.vyze.app.memory.SimilarInteraction
@@ -514,7 +515,24 @@ class VlmEngineManager(
      * @param sessionId Session gating ID for callbacks
      * @return The complete trimmed response, or null on error / interrupt
      */
+    /**
+     * Runs [runConversationInLane] on the dedicated single-thread inference
+     * lane (Q3 hardening): engine work never competes with preprocessing,
+     * OCR dispatch or DB reads for shared Default/IO threads, and under
+     * MODERATE+ thermal policy bitmap preprocessing is routed to this same
+     * lane (see [onInferenceLane]) so nothing parallel competes with the
+     * GPU for CPU time. Serialization itself is still enforced by
+     * [generationMutex]; the lane makes it structural as well.
+     */
     private suspend fun runConversation(
+        contents: Contents,
+        maxTokens: Int,
+        sessionId: String
+    ): String? = inferenceLane.lane {
+        runConversationInLane(contents, maxTokens, sessionId)
+    }
+
+    private suspend fun runConversationInLane(
         contents: Contents,
         maxTokens: Int,
         sessionId: String
@@ -959,6 +977,24 @@ class VlmEngineManager(
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /**
+     * Dedicated single-thread inference lane (Q3). A limitedParallelism(1)
+     * view over the IO pool — only ever one engine/preprocess task runs on
+     * it; blocking native waits behave as on IO. [onInferenceLane] is the
+     * public hook the controller uses for thermal-tier preprocessing.
+     */
+    private val inferenceLane = object {
+        private val dispatcher = Dispatchers.IO.limitedParallelism(1)
+        suspend fun <T> lane(block: suspend () -> T): T = withContext(dispatcher) { block() }
+    }
+
+    /**
+     * Run [block] on the single-thread inference lane. Used by
+     * VyzeCoreController to route MODERATE+ thermal bitmap preprocessing
+     * onto the same thread that will run the generation.
+     */
+    suspend fun <T> onInferenceLane(block: suspend () -> T): T = inferenceLane.lane(block)
 
     // ── Model Resolution ──────────────────────────────────────────
 

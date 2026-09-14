@@ -568,6 +568,17 @@ class VyzeCoreController(
             val text = sentenceBuffer.toString()
             if (text.isEmpty()) return
 
+            // ── TTS BACKPRESSURE (Q3) ────────────────────────────
+            // Speech playback falling behind generation: hold the buffer
+            // instead of stacking unbounded utterances on the engine queue.
+            // The flush resumes on the next token once the pending queue
+            // drains below the cap (coalescing absorbs the held text); the
+            // final flush in flushRemainingSentenceBuffer bypasses this
+            // cap, so nothing held here is ever lost.
+            if (ttsManager.pendingUtteranceCount() > TTSManager.MAX_PENDING_UTTERANCES) {
+                return
+            }
+
             // ── Sentence-boundary flushing only ─────────────────────
             // Flush ONLY at real sentence ends (., !, ?, newline). Commas and
             // colons stay INSIDE the sentence. Previously the buffer also
@@ -973,6 +984,31 @@ class VyzeCoreController(
 
         onStatusUpdate("Analyzing snapshot...")
 
+        // ── THERMAL POLICY SNAPSHOT (Phase 2 Step B) ──────────────
+        // Read ONCE per capture and honored for the whole inference — a
+        // single capture is never governed by two different policies,
+        // even if the OS status changes mid-run.
+        // CRITICAL tier: VLM inference halted. OCR fast-path reads are the
+        // only visual escape hatch (they skip Gemma entirely — enforced
+        // again before the VLM call below for low-confidence reads).
+        val thermalPolicy = (context.applicationContext as? VyzeApplication)
+            ?.thermalPowerController?.policy ?: ThermalPolicy.NORMAL
+        if (!thermalPolicy.vlmInferenceAllowed && !isOcrFastPathQuery(query)) {
+            isInferring.set(false)
+            mainHandler.post {
+                onStatusUpdate?.invoke("Too hot")
+                onError?.invoke("Device is too hot for visual analysis")
+                ttsManager.speakImmediate(
+                    ttsManager.localized(
+                        "Device is too hot for visual analysis. Text reading still works.",
+                        "Peranti terlalu panas untuk analisis visual. Pembacaan teks masih berfungsi.",
+                        "设备过热，无法进行视觉分析。文字识别仍可使用。"
+                    )
+                )
+            }
+            return
+        }
+
         // ── Watchdog Timer (progress-aware) ────────────────────
         // Safety net against a hung GPU inference. The runnable re-arms
         // itself whenever tokens are still flowing (lastInferenceActivityMs
@@ -1053,6 +1089,42 @@ class VyzeCoreController(
                         bitmap
                     }
                 } else bitmap
+
+                // ── THERMAL SCENE DOWNSCALE (Phase 2 Step B) ─────
+                // MODERATE+ policy caps the scene image dimension. Scene,
+                // pointing and continuous frames drop to the policy size;
+                // text and tap queries keep their OCR-quality dimensions —
+                // thermal heat is temporary, label readability is not.
+                if (thermalPolicy.sceneImageDimension > 0 && !isTextQuery && !isTapQuery &&
+                    inferenceBitmap.width > thermalPolicy.sceneImageDimension
+                ) {
+                    val dim = thermalPolicy.sceneImageDimension
+                    val previous = inferenceBitmap
+                    inferenceBitmap = try {
+                        // Q3 lane routing: MODERATE+ preprocessing runs on the
+                        // same single thread that will run the generation —
+                        // nothing parallel competes for CPU while throttled.
+                        vlmEngine.onInferenceLane {
+                            // Center-crop to 1:1 (spatial alignment), then scale.
+                            val size = minOf(previous.width, previous.height)
+                            val cx = (previous.width - size) / 2
+                            val cy = (previous.height - size) / 2
+                            val cropped = android.graphics.Bitmap.createBitmap(previous, cx, cy, size, size)
+                            val scaled = android.graphics.Bitmap.createScaledBitmap(cropped, dim, dim, true)
+                            if (scaled !== cropped) cropped.recycle()
+                            scaled
+                        }
+                    } catch (e: Throwable) {
+                        CrashLogFile.logError(TAG, "Thermal downscale failed: ${e.message}", e)
+                        previous
+                    }
+                    // Recycle the replaced intermediate — but NEVER the
+                    // original capture (it is still used downstream).
+                    if (inferenceBitmap !== previous && previous !== bitmap && !previous.isRecycled) {
+                        previous.recycle()
+                    }
+                    CrashLogFile.log(TAG, "Thermal downscale: ${thermalPolicy.sceneImageDimension}px (${thermalPolicy.label})")
+                }
 
                 // ── OCR PRE-PASS (text + tap queries) ────────────
                 // ML Kit OCR is 10-30x faster than full VLM inference.
@@ -1233,6 +1305,31 @@ class VyzeCoreController(
                     return@launch
                 }
 
+                // ── THERMAL CRITICAL GATE (Phase 2 Step B) ────────
+                // CRITICAL/EMERGENCY: VLM inference is halted between the
+                // OCR pre-pass and the model call. High-confidence OCR text
+                // (a tap on a clear label) is still delivered verbatim;
+                // everything else gets a spoken refusal. No Gemma call.
+                if (!thermalPolicy.vlmInferenceAllowed) {
+                    isInferring.set(false)
+                    mainHandler.removeCallbacks(watchdogRunnable)
+                    val usableFallback =
+                        if (ocrConfidence >= OCR_FAST_PATH_CONFIDENCE) ocrText else null
+                    if (currentSessionId == activeSessionId) {
+                        mainHandler.post {
+                            if (!usableFallback.isNullOrBlank()) {
+                                onInferenceComplete?.invoke(usableFallback)
+                            } else {
+                                onInferenceComplete?.invoke(
+                                    "Device is too hot. Try again after it cools."
+                                )
+                            }
+                            onStatusUpdate?.invoke("Ready [thermal]")
+                        }
+                    }
+                    return@launch
+                }
+
                 CrashLogFile.log(TAG, "Calling vlmEngine.analyzeImage()...")
                 // Scene queries are concise (25 words max). Text queries get an
                 // ADAPTIVE budget sized to the OCR text actually found — the
@@ -1248,6 +1345,15 @@ class VyzeCoreController(
                         PreferenceLearner.BrevityLevel.NORMAL -> SCENE_QUERY_MAX_TOKENS
                         PreferenceLearner.BrevityLevel.BRIEF -> (SCENE_QUERY_MAX_TOKENS * 4) / 5
                         PreferenceLearner.BrevityLevel.TERSE -> (SCENE_QUERY_MAX_TOKENS * 3) / 5
+                    }.let { base ->
+                        // Thermal cap (Phase 2 Step B): MODERATE+ tightens the
+                        // scene-token budget (96 → 64) so generation — the
+                        // hottest phase of inference — ends sooner.
+                        if (thermalPolicy.sceneTokenCap in 1 until base) {
+                            thermalPolicy.sceneTokenCap
+                        } else {
+                            base
+                        }
                     }
                 }
                 val response = vlmEngine.analyzeImage(
@@ -2004,7 +2110,17 @@ class VyzeCoreController(
     // ── Dynamic Resolution Scaling ──────────────────────────────
 
     /**
-     * Detect text-extraction queries that benefit from higher resolution.
+     * True when this query can be served entirely by the OCR fast-path —
+     * an explicit spoken read ("read this label") where the whole ask IS
+     * the text. Used by the thermal CRITICAL gate: such reads skip Gemma
+     * anyway, so they remain available when VLM inference is halted.
+     */
+    fun isOcrFastPathQuery(query: String?): Boolean =
+        !query.isNullOrBlank() &&
+            isTextExtractionQuery(query) &&
+            query?.contains(TAP_POSITION_MARKER) != true
+
+    /**
      * Returns true if the query contains keywords indicating the user wants
      * to read text, labels, signs, or documents.
      *

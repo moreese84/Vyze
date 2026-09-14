@@ -1,5 +1,6 @@
 package com.vyze.app.ui.fragments
 import com.vyze.app.VyzeApplication
+import com.vyze.app.core.ThermalPowerController
 import com.vyze.app.R
 import com.vyze.app.util.CrashLogFile
 import com.vyze.app.ui.MainViewModel
@@ -704,6 +705,30 @@ class CameraFragment : Fragment() {
 
                     CrashLogFile.log(TAG, "onBitmap callback: ${bitmap.width}x${bitmap.height}")
 
+                    // ── THERMAL GATE (Phase 2 Step B) — CRITICAL tier ──
+                    // VLM inference is halted; refuse the manual query with
+                    // a spoken notice. OCR fast-path reads are exempt — the
+                    // gate is enforced inside triggerSnapshot, so an OCR
+                    // read can still complete here without Gemma.
+                    if (!thermalController().policy.vlmInferenceAllowed &&
+                        !coreController.isOcrFastPathQuery(query)
+                    ) {
+                        bitmap.recycle()
+                        isCapturing.set(false)
+                        activity?.runOnUiThread {
+                            if (isAdded && _fragmentCameraBinding != null) {
+                                appState = AppState.IDLE
+                                updateStatus("Too hot")
+                            }
+                        }
+                        announceThermalNotice(
+                            "Device is too hot for visual analysis. Text reading still works.",
+                            "Peranti terlalu panas untuk analisis visual. Pembacaan teks masih berfungsi.",
+                            "设备过热，无法进行视觉分析。文字识别仍可使用。"
+                        )
+                        return@takeSnapshot
+                    }
+
                     // Double-check engine isn't already running a different inference
                     if (coreController.isCurrentlyInferring()) {
                         CrashLogFile.log(TAG, "Engine busy — recycling bitmap")
@@ -1165,6 +1190,17 @@ class CameraFragment : Fragment() {
         if (coreController.isCurrentlyInferring()) return
         if (isCapturing.get()) return
 
+        // ── THERMAL GATE (Phase 2 Step B) ─────────────────────────
+        // MODERATE: continuous captures still run, but the controller
+        // caps dimension/tokens at inference time. SEVERE+: continuous
+        // mode must not run at all — drop this tick (the thermal
+        // escalation hook has already paused the loop and spoken).
+        val thermalPolicy = thermalController().policy
+        if (!thermalPolicy.continuousModeAllowed) {
+            Log.d(TAG, "Continuous capture skipped — thermal policy ${thermalPolicy.label}")
+            return
+        }
+
         if (!isCapturing.compareAndSet(false, true)) return
 
         appState = AppState.ANALYZING
@@ -1173,6 +1209,7 @@ class CameraFragment : Fragment() {
         updateStatus("Scanning...")
 
         cameraSetup.takeSnapshot(
+            onCaptureStart = { captureStartAtMs = System.currentTimeMillis() },
             onBitmap = { bitmap ->
                 try {
                     if (bitmap.isRecycled) {
@@ -1221,6 +1258,19 @@ class CameraFragment : Fragment() {
      */
     fun toggleContinuousMode() {
         isContinuousMode = !isContinuousMode
+        // ── THERMAL GUARD (Phase 2 Step B) ────────────────────────────
+        // SEVERE+ forbids continuous mode. Auto-pause with a spoken notice
+        // instead of letting the thermal escalation hook and the user's
+        // toggle fight each other.
+        if (isContinuousMode && !thermalController().policy.continuousModeAllowed) {
+            isContinuousMode = false
+            announceThermalNotice(
+                "Continuous mode paused. Device is warm. Use tap or voice queries.",
+                "Mod berterusan dijeda. Peranti panas. Gunakan ketukan atau suara.",
+                "连续模式已暂停。设备发热。请使用点按或语音查询。"
+            )
+            return
+        }
         if (isContinuousMode) {
             continuousModeStartTime = System.currentTimeMillis()
             Log.d(TAG, "Continuous mode ON — auto-snapshot every ${AUTO_SNAPSHOT_INTERVAL_MS}ms (throttle after ${CONTINUOUS_MODE_THROTTLE_AFTER_MS / 1000}s)")
@@ -1241,6 +1291,30 @@ class CameraFragment : Fragment() {
 
     private fun stopContinuousLoop() {
         mainHandler.removeCallbacks(autoSnapshotRunnable)
+    }
+
+    // ── Thermal Governor Access (Phase 2 Step B) ──────────────────
+
+    /** App-scoped thermal governor; NORMAL fallback if unavailable. */
+    private fun thermalController(): ThermalPowerController =
+        (requireActivity().application as? VyzeApplication)?.thermalPowerController
+            ?: ThermalPowerController(requireContext().applicationContext)
+
+    /**
+     * Local capture-start timestamp for the CURRENT demand — set through
+     * takeSnapshot's onCaptureStart hook. Reserved for capture-latency
+     * telemetry when tuning the thermal tiers on device; no readers yet.
+     */
+    @Volatile
+    private var captureStartAtMs: Long = 0L
+
+    /**
+     * Speak a thermal notice through the ACTIVE TTS voice language. Used by
+     * the governor's escalation hook (fires once per tier escalation) and
+     * by user-initiated actions refused by the current policy.
+     */
+    private fun announceThermalNotice(english: String, malay: String, chinese: String) {
+        ttsManager.speakImmediate(ttsManager.localized(english, malay, chinese))
     }
 
     private fun startVoiceListening() {

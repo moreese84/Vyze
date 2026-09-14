@@ -1,5 +1,6 @@
 package com.vyze.app
 import com.vyze.app.util.CrashLogFile
+import com.vyze.app.core.ThermalPowerController
 import com.vyze.app.core.VyzeCoreController
 import com.vyze.app.speech.TTSManager
 
@@ -72,6 +73,16 @@ class VyzeApplication : Application() {
     /** Singleton TTSManager (process-wide singleton via TTSManager.getInstance). */
     val ttsManager: TTSManager by lazy { TTSManager.getInstance(applicationContext) }
 
+    /**
+     * Thermal & power governor — app-scoped, process-lifetime. Registers the
+     * platform thermal listener once at app create; the fragment and core
+     * controller read its [ThermalPowerController.policy] snapshot at
+     * capture/inference time. Zero polling: the OS pushes status changes.
+     */
+    val thermalPowerController: ThermalPowerController by lazy {
+        ThermalPowerController(applicationContext)
+    }
+
     // ── Lifecycle ─────────────────────────────────────────────────────
 
     override fun onCreate() {
@@ -79,7 +90,15 @@ class VyzeApplication : Application() {
         CrashLogFile.init(this)
         installGlobalErrorHandler()
         pruneOldErrorLogs()
+        // Event-driven thermal governance: register the OS listener for the
+        // whole process lifetime (unregistered in onTerminate).
+        thermalPowerController.register()
         Log.d(TAG, "VyzeApplication created")
+    }
+
+    override fun onTerminate() {
+        thermalPowerController.unregister()
+        super.onTerminate()
     }
 
     /**
