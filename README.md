@@ -16,7 +16,7 @@
 Vyze speaks what the camera sees — instantly, privately, offline.
 
 - **Scene Description** — "A wooden chair is directly ahead, about 3 steps away"
-- **Text Reading** — Reads labels, signs, prescriptions, packaging and menus aloud — in whole sentences, in the text's original language, to the end
+- **Text Reading** — Reads labels, signs, prescriptions, packaging and menus aloud — in whole sentences, in the text's original language, to the end. Voice "read this" queries capture a full-resolution still (~2400px) so entire letters and dense documents read back completely
 - **Product & Brand Naming** — Identifies packaged goods by brand and product type as printed ("Maggi instant noodle packet"), then reads the rest
 - **Currency Reading** — Reads the value on banknotes and coins aloud, with a strict never-guess rule
 - **Bank Card Identification** — Identifies bank name and card type (debit/credit/ATM) from logos and printed text, with a strict never-guess rule
@@ -61,7 +61,7 @@ Camera Frame ──→ ML Kit OCR ──→ DynamicPromptBuilder
 | **TTSManager** | `speech/TTSManager.kt` | Platform TextToSpeech (Google TTS engine preferred), utterance tracking, voice switching, prosody & pronunciation smoothing |
 | **BarcodeHelper** | `vision/BarcodeHelper.kt` | ML Kit on-device 1D/2D barcode detection (EAN/UPC/QR/Data Matrix) |
 | **PreferenceLearner** | `memory/PreferenceLearner.kt` | Silent behavioral adaptation — learns answer brevity from speech-active interrupts |
-| **CameraSetupDelegate** | `ui/delegates/CameraSetupDelegate.kt` | CameraX frame extraction, snapshot capture |
+| **CameraSetupDelegate** | `ui/delegates/CameraSetupDelegate.kt` | CameraX frame extraction, snapshot capture, full-resolution ImageCapture stills for OCR text reads |
 | **CameraFragment** | `ui/fragments/CameraFragment.kt` | UI, speech callbacks, auto-snapshot loop |
 | **MemoryRepository** | `memory/MemoryRepository.kt` | Vector similarity search, adaptive intelligence |
 | **AudioCapture** | `device/AudioCapture.kt` | 16 kHz mono float32 recorder for the model-native ASR rescue |
@@ -92,6 +92,7 @@ All inference runs on-device — including the TTS engine. No cloud APIs, no dat
 ### Fast Response Times
 - **OCR fast-path**: ~150ms (ML Kit only — skips Gemma when confidence ≥ 85%)
 - **OCR + Gemma**: ~300-500ms (ML Kit text + Gemma interpretation)
+- **Full-page document reads (voice)**: +~200-400ms high-res still capture before OCR — buys ~4x glyph height for dense pages
 - **Scene queries**: ~1.5-2s (Gemma with trimmed prompts)
 - **First audio**: within ~3 characters of generated text (sentence-buffered streaming)
 
@@ -110,8 +111,12 @@ OCR text, barcodes/QR, currency reads, bank cards and color analyses are persist
 ### Multi-Language
 Automatically detects your spoken language via SpeechRecognizer and mirrors it to both Gemma's output and the TTS voice. Supports English, Malay, Chinese, and any language with an installed TTS voice pack. No hardcoded language lists — uses Android's dynamic Locale resolution.
 
+Mirroring is **symmetric**: the prompt names the output language explicitly for every language — English included — and a bottom-of-prompt reminder fires unconditionally. Few-shot examples are complete natural sentences (subject + verb + spatial phrase, not comma-chained attribute lists), rendered in the active language, so answers sound like a person talking rather than bullet points — in all three languages, including on back-and-forth code switches.
+
 ### Hybrid OCR Pipeline
 ML Kit handles fast text extraction (80-150ms), Gemma handles interpretation and context. OCR fast-path skips Gemma entirely when ML Kit confidence ≥ 85%, reducing latency to ~150ms for clear text.
+
+Capture resolution follows the query type: explicit voice text reads ("read this", "baca") capture a **full-resolution still** (~2400px via a dedicated `ImageCapture` use case) so entire letters and dense documents read back completely — the 960×720 analyzer stream cannot resolve a full page at reading distance. Taps, pointing and scene queries stay on the analyzer stream with zero added latency; text on the tapped object is read from the 720p pre-pass. A dense-document sanity gate suppresses the fast-path when a high-res read returns a suspiciously short single line (ML Kit can score high confidence on a page it only partially recognized) — the read then goes to Gemma's adaptive token budget instead of speaking a garbled fragment.
 
 ### Dynamic Aspect Ratio
 Gemma 4 handles dynamic aspect ratios natively via its vision token budget. Bitmaps are proportionally downscaled without rigid center-cropping, preserving spatial accuracy.
@@ -229,7 +234,8 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 
 | Optimization | Impact |
 |---|---|
-| OCR fast-path (≥85% confidence) | ~150ms text reads — skips Gemma entirely |
+| OCR fast-path (≥85% confidence) | ~150ms text reads — skips Gemma entirely; partial dense-page reads fall through to Gemma |
+| High-res still capture (voice text reads) | Full-page OCR — ~4x glyph height vs the 960×720 analyzer stream |
 | Sentence-buffered TTS streaming | First audio in <500ms |
 | Punctuation-guided clause flushing | Natural pauses at commas/periods |
 | Greedy decoding (topK=1, temp=0.1) | Fastest possible token generation |
