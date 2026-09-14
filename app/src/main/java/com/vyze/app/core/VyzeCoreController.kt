@@ -180,7 +180,11 @@ class VyzeCoreController(
     private var fastStartFragment = false
 
     /** Chars accumulated before a post-first coalesced flush may fire. */
-    private val COALESCED_FLUSH_CHARS = 110
+    // Pause FIX: 110 held most ≤2-sentence persona answers (~90-130 chars)
+    // hostage between this and the 200-char ceiling — a 0.5-2s silent gap per
+    // mid-answer. 60 ≈ one completed short sentence, so the next utterance
+    // fires at the first natural boundary; long answers still coalesce.
+    private val COALESCED_FLUSH_CHARS = 60
 
     private val minFlushChars = 10
 

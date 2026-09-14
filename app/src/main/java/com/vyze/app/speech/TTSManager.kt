@@ -1103,6 +1103,14 @@ class TTSManager private constructor(context: Context) {
         // the Latin-oriented spacing rules below would corrupt it.
         if (isChineseText(enhanced)) return enhanced
 
+        // Ellipsis pause FIX: Google TTS inserts a long native ellipsis pause
+        // mid-sentence ("I can see... a mug"). Collapse model-emitted "..."
+        // and the single-char U+2026 (…) to a plain period so the ellipsis
+        // reads as a normal sentence boundary instead of dead air. (Chinese
+        // and Malay paths already strip ellipses in their smoothing rules —
+        // this covers English, which had no handling.)
+        enhanced = enhanced.replace("...", ".").replace("\u2026", ".")
+
         // Ensure sentence terminators are followed by a space
         enhanced = enhanced.replace(Regex("([.!?])([A-Za-z0-9])"), "$1 $2")
 
