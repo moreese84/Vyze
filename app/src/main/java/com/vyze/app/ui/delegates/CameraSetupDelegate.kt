@@ -8,6 +8,8 @@ import android.graphics.ImageFormat
 import android.graphics.Matrix
 import android.graphics.Rect
 import android.graphics.YuvImage
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.util.Size
 import android.view.Display
@@ -21,19 +23,38 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
+import kotlinx.coroutines.CompletableDeferred
 import java.io.ByteArrayOutputStream
+import java.util.ArrayDeque
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Handles all CameraX lifecycle and setup operations.
  *
- * Uses ImageAnalysis for zero-disk, in-memory frame extraction.
- * The latest frame is held in a RAM buffer and extracted on-demand
- * when takeSnapshot() is called — eliminating the ~300-450ms disk
- * round-trip of the previous ImageCapture.takePicture() approach.
+ * ## Demand-Driven Frame Architecture (battery redesign, Phase 2 Step A)
+ * The analyzer NO LONGER decodes frames continuously. While the camera is
+ * open but idle, each delivered ImageProxy is used ONLY for the throttled
+ * auto-torch luminance sample (reading the Y plane in-place — no Bitmap
+ * allocation, no YUV→JPEG→ARGB round-trip) and then closed immediately.
+ * The previous build decoded ~15 Bitmaps per second (~2.5 MB each) into a
+ * rolling buffer that a user-triggered snapshot pulled from at most a few
+ * times a minute — constant CPU, ISP and allocation-churn cost for stale
+ * work. The 1 ms visual-similarity scene gate still runs in continuous
+ * mode, but it now runs against a frame decoded at the moment of capture
+ * instead of a continuously-refreshed buffer.
+ *
+ * Full YUV→ARGB decode happens ONLY when [takeSnapshot] demands a frame:
+ * the demand registers a waiter and the ANALYZER thread decodes the NEXT
+ * delivered frame exclusively for it, handing the bitmap straight to the
+ * caller — one decode per capture, zero shared-buffer copies, and the
+ * snapshot always reflects what the camera saw at-or-after the gesture.
+ *
+ * The old Thread.sleep(20) busy-wait is gone entirely: [takeSnapshot] is
+ * fully ASYNC (registers a waiter, never blocks the caller — the old
+ * implementation could sleep up to ~600 ms on the main thread on its
+ * cold-start path), the analyzer wakes the waiter when the frame arrives,
+ * and a main-handler timeout fails the capture if no frame comes.
  */
 class CameraSetupDelegate {
 
@@ -48,42 +69,53 @@ class CameraSetupDelegate {
 
     private lateinit var flashlightManager: FlashlightManager
 
-    // ── In-Memory Frame Buffer ─────────────────────────────────────
-    // Holds the latest YUV_888 frame from ImageAnalysis as a Bitmap.
-    // Updated every frame (~33ms at 30fps). takeSnapshot() pulls from here.
-
-    /** Latest decoded frame from the camera — updated by ImageAnalysis.Analyzer. */
-    private val latestFrame = AtomicReference<Bitmap?>(null)
-
-    /** Counts frames the analyzer examined, to throttle expensive decodes. */
-    private var decodeTick = 0
-
-    /** Lock to prevent concurrent frame extraction + recycling. */
-    private val frameLock = AtomicBoolean(false)
-
-    /** Analysis executor — single thread to avoid frame drops. */
+    /** Analysis executor — single thread; decodes happen here on demand. */
     private var analysisExecutor: ExecutorService = Executors.newSingleThreadExecutor()
 
-    /** Reference to PreviewView for fallback frame extraction. */
-    private var previewViewRef: PreviewView? = null
+    /** Main handler — waiter timeout scheduling only. */
+    private val mainHandler = Handler(Looper.getMainLooper())
 
-    /** Whether a frame has been consumed by takeSnapshot since the last analyzer delivery. */
-    private val frameConsumed = AtomicBoolean(false)
+    /** Whether the analyzer is currently bound (is it producing frames?). */
+    @Volatile
+    private var analyzerBound = false
 
     /**
-     * Monotonically increasing frame counter. Incremented every time the analyzer
-     * delivers a new frame. takeSnapshot() uses this to guarantee it reads a frame
-     * that arrived AFTER the voice query was triggered — preventing stale frame reuse.
+     * Monotonically increasing counter of frames DELIVERED by the analyzer.
+     * Drives the luminance-sample throttle.
      */
     @Volatile
     private var frameCounter = 0L
 
+    // ── Capture Waiters ────────────────────────────────────────────
+    // takeSnapshot() registers a waiter; the ANALYZER thread serves it from
+    // the next delivered frame (freshness guaranteed by ordering — the
+    // waiter is registered before the frame that serves it arrives). FIFO
+    // order when several captures queue up (e.g. a voice query barging in
+    // front of a continuous tick): one decode per frame, oldest waiter first.
+
+    private class CaptureWaiter {
+        /** The decoded frame — set by the analyzer right before completion. */
+        @Volatile
+        var result: Bitmap? = null
+
+        /** Decode attempts used (transient OOM/recycle-race failures retry). */
+        var attempts = 0
+
+        /** Signalled (result set) or failed by exactly one party. */
+        val done = CompletableDeferred<Unit>()
+
+        /** Scheduled timeout — cancelled when the waiter is served. */
+        var timeoutRunnable: Runnable? = null
+    }
+
+    private val captureWaiters = ArrayDeque<CaptureWaiter>()
+
     // ── Auto-Torch Luminance Detection ────────────────────────────
-    // Calculates average brightness from the Y plane of each YUV frame.
-    // Uses dual-threshold hysteresis to prevent rapid torch toggling:
-    //   - Torch ON  when brightness < DARK_THRESHOLD (35/255)
-    //   - Torch OFF when brightness > BRIGHT_THRESHOLD (65/255)
-    // Only samples every Nth frame to minimize CPU overhead.
+    // REQUIRES the analyzer to keep delivering frames — so the analyzer
+    // stays bound even in demand mode. Cost per delivered frame is now
+    // tiny: an in-place Y-plane read (no Bitmap, no YUV->JPEG->ARGB
+    // round-trip), only every Nth frame. This is the ONLY per-frame work
+    // while idle.
 
     /** Frame counter at last luminance check — skips frames to reduce CPU load. */
     @Volatile
@@ -94,32 +126,34 @@ class CameraSetupDelegate {
     private var isDarkEnvironment = false
 
     companion object {
-        /** Polling interval when waiting for a frame (ms). */
-        private const val FRAME_POLL_INTERVAL_MS = 20L
+        /**
+         * Waiter timeout: if no analyzer frame arrives within this window the
+         * capture fails instead of hanging (camera stall / unbind race).
+         * Generous vs the ~33 ms frame period — covers analyzer backpressure
+         * on mid-tier devices plus up to [DECODE_ATTEMPTS] decode retries.
+         */
+        private const val WAITER_TIMEOUT_MS = 1000L
 
         /**
-         * Decode only every Nth analyzed frame to ARGB. At high analysis
-         * resolution each decoded frame is several MB; decoding every frame
-         * churns memory and can starve the capture path on mid-tier devices.
+         * Luminance-sample throttle (the only per-frame work now). Previously
+         * this throttled Bitmap decodes; it now throttles Y-plane samples.
          */
         private const val DECODE_THROTTLE = 2
 
         /**
-         * Capture attempts before reporting failure — the first attempt can
-         * lose a race with the analyzer recycling the frame, or a copy can
-         * fail under memory pressure; retrying with a fresh frame recovers.
+         * Decode attempts per waiter when a decode fails under memory
+         * pressure (recycle race / OOM) — each retry is served by the NEXT
+         * delivered frame.
          */
-        private const val CAPTURE_ATTEMPTS = 3
-        /** Extra wait per attempt for a genuinely new frame (ms). */
-        private const val CAPTURE_FRAME_WAIT_MS = 150L
+        private const val DECODE_ATTEMPTS = 3
 
         // ── Auto-Torch Luminance Thresholds ─────────────────────
         /** Average Y-plane brightness below this → torch ON (0-255). */
         private const val DARK_THRESHOLD = 35
         /** Average Y-plane brightness above this → torch OFF (0-255). */
         private const val BRIGHT_THRESHOLD = 65
-        /** Check luminance every N frames (~300ms at 30fps) to minimize CPU load. */
-        private const val LUMINANCE_CHECK_INTERVAL = 10L
+        /** Check luminance every N frames (~600ms at 30fps) to minimize CPU load. */
+        private const val LUMINANCE_CHECK_INTERVAL = 20L
     }
 
     /**
@@ -170,15 +204,13 @@ class CameraSetupDelegate {
             .setTargetRotation(previewView.display.rotation)
             .build()
 
-        // ImageAnalysis — delivers frames in RAM at camera framerate.
-        // No disk I/O, no JPEG encode/decode round-trip.
-        //
-        // An explicit high target resolution is CRITICAL for OCR: without it
-        // CameraX falls back to a low default (~640x480), and small print on
-        // tiny products (a 2ml bottle's Chinese label, fine-print panels) drops
-        // below what ML Kit can detect. 960x720 keeps ~2.2x the default's pixel
-        // density while halving the memory pressure of 1280x960 — combined with
-        // the decode throttle below, capture stays reliable on mid-tier devices.
+        // ImageAnalysis — delivers frames at camera framerate, but the
+        // analyzer body below is now nearly free: Y-plane luminance sample
+        // at most, proxy closed immediately. An explicit high target
+        // resolution is CRITICAL for OCR (see whitepaper): small print on
+        // tiny products drops below what ML Kit can detect at CameraX's
+        // ~640x480 default. 960x720 keeps ~2.2x the pixel density while
+        // halving the memory pressure of 1280x960.
         // NOTE: must NOT be combined with setTargetAspectRatio on the same
         // use case — CameraX throws IllegalArgumentException.
         val imageAnalysis = ImageAnalysis.Builder()
@@ -187,52 +219,62 @@ class CameraSetupDelegate {
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
             .build()
 
-        // Store previewView reference for fallback bitmap extraction
-        previewViewRef = previewView
-
         imageAnalysis.setAnalyzer(analysisExecutor) { imageProxy ->
             try {
-                // ── DECODE THROTTLE ─────────────────────────────
-                // At high analysis resolution each decoded ARGB frame is ~2.5MB;
-                // decoding every delivered frame churns memory hard on mid-tier
-                // devices and can starve the capture path. Decode every Nth
-                // frame — KEEP_ONLY_LATEST still keeps the rolling frame fresh
-                // for takeSnapshot while allocation pressure is halved.
-                val bitmap = if (decodeTick++ % DECODE_THROTTLE == 0) {
-                    imageProxyToBitmap(imageProxy)
-                } else {
+                // ── LUMINANCE SAMPLE (the ONLY idle per-frame work) ──
+                // In-place Y-plane read: no Bitmap, no NV21 copy, no JPEG
+                // encode/decode.
+                if (frameCounter % DECODE_THROTTLE == 0L &&
+                    frameCounter - lastLuminanceCheckFrame >= LUMINANCE_CHECK_INTERVAL
+                ) {
+                    lastLuminanceCheckFrame = frameCounter
+                    val brightness = sampleLuminance(imageProxy)
+                    if (brightness != null) {
+                        updateAutoTorch(brightness)
+                    }
+                }
+
+                frameCounter++
+
+                // ── DEMAND SERVE ─────────────────────────────────
+                // A capture demanded a frame — decode THIS one for the
+                // oldest waiter. FIFO: one decode per proxy. A timed-out
+                // waiter is removed from the deque before completion, so
+                // it is never served late.
+                val waiter: CaptureWaiter? = synchronized(captureWaiters) {
+                    while (captureWaiters.isNotEmpty()) {
+                        val head = captureWaiters.removeFirst()
+                        if (head.done.isCompleted) continue   // timed out already
+                        return@synchronized head
+                    }
                     null
                 }
-                if (bitmap != null) {
-                    // Swap in the new frame — old one is recycled below.
-                    // CRITICAL: Acquire frameLock before recycling so takeSnapshot()
-                    // doesn't end up with a reference to a recycled Bitmap.
-                    val oldFrame = latestFrame.getAndSet(bitmap)
-                    if (oldFrame != null && !oldFrame.isRecycled) {
-                        synchronized(frameLock) {
-                            if (!oldFrame.isRecycled) {
-                                oldFrame.recycle()
-                            }
-                        }
-                    }
-                    // Mark frame as available for snapshot consumption.
-                    // takeSnapshot() will clear frameConsumed after copying.
-                    frameConsumed.set(false)
-                    frameCounter++  // Signal takeSnapshot() that a genuinely new frame arrived
-
-                    // ── Auto-Torch: luminance check every 10th frame (~300ms at 30fps) ──
-                    if (frameCounter - lastLuminanceCheckFrame >= LUMINANCE_CHECK_INTERVAL) {
-                        lastLuminanceCheckFrame = frameCounter
-                        checkLuminanceAndAutoTorch(imageProxy)
+                if (waiter != null) {
+                    val bitmap = doDecodeFrame(imageProxy)
+                    if (bitmap != null) {
+                        serveWaiter(waiter, bitmap)
+                    } else if (waiter.attempts + 1 < DECODE_ATTEMPTS) {
+                        // Transient decode failure (recycle race / OOM) —
+                        // requeue to be served by the NEXT frame.
+                        waiter.attempts++
+                        synchronized(captureWaiters) { captureWaiters.addFirst(waiter) }
+                    } else {
+                        failWaiter(waiter)
                     }
                 }
             } catch (e: Throwable) {
                 Log.w(TAG, "Frame analysis error: ${e.message}")
             } finally {
+                // ── PROXY CLOSE — unconditional, all paths ─────────
+                // The single guarantee that prevents surface-buffer leaks:
+                // every ImageProxy delivered here is closed exactly once,
+                // whether it was luminance-sampled, decoded for a waiter,
+                // or discarded because nobody demanded it.
                 try { imageProxy.close() } catch (_: Throwable) {}
             }
         }
 
+        analyzerBound = true
         provider.unbindAll()
         try {
             camera = provider.bindToLifecycle(lifecycleOwner, cameraSelector, preview, imageAnalysis)
@@ -240,117 +282,170 @@ class CameraSetupDelegate {
             preview?.setSurfaceProvider(previewView.surfaceProvider)
         } catch (exc: Exception) {
             Log.e(TAG, "Use case binding failed", exc)
+            analyzerBound = false
         }
     }
 
+    // ── Snapshot (Demand-Driven, Fully Async) ──────────────────────
+
     /**
-     * Take a snapshot from the in-memory frame buffer.
-     * Returns a copy of the latest frame as a Bitmap — zero disk I/O.
+     * Take a snapshot on demand — ASYNC, never blocks the caller (gesture
+     * handlers and the continuous-mode timer both invoke this on the main
+     * thread). The analyzer decodes the NEXT delivered frame exclusively
+     * for this capture and hands it to [onBitmap]; no shared rolling
+     * buffer, no defensive copy — the bitmap is the caller's to recycle.
      *
-     * Typical latency: ~5-20ms (Bitmap.copy + rotation), compared to
-     * ~300-450ms for the previous ImageCapture.takePicture() disk round-trip.
+     * Wait latency: one frame period (~33 ms) vs the old rolling-buffer hit
+     * (~0-20 ms) — negligible against the multi-second VLM run that
+     * follows, in exchange for eliminating ~15 Bitmap decodes/second idle.
      *
-     * @param onBitmap Callback with the captured bitmap (on main thread).
-     * @param onError  Callback with the error (on main thread).
+     * Callbacks: [onBitmap]/[onError] run on the analysis executor thread
+     * (callers already route UI work through runOnUiThread). Exactly one
+     * of them fires per call, at most [WAITER_TIMEOUT_MS] later.
+     *
+     * @param onCaptureStart  Optional synchronous callback fired before the
+     *   frame wait starts (capture-start timestamping).
+     * @param onBitmap Callback with a private ARGB bitmap.
+     * @param onError  Callback with an error message.
      */
     fun takeSnapshot(
+        onCaptureStart: (() -> Unit)? = null,
         onBitmap: (Bitmap) -> Unit,
         onError: (String) -> Unit
     ) {
-        val counterAtQuery = frameCounter
-        var lastError = "Camera frame unavailable"
+        onCaptureStart?.invoke()
 
-        for (attempt in 0 until CAPTURE_ATTEMPTS) {
-            var candidate = latestFrame.get()?.takeIf { !it.isRecycled }
+        if (!analyzerBound || cameraProvider == null) {
+            // Camera unbound (release/destroy in flight): frames will not
+            // come — fail fast instead of waiting on a signal that never
+            // arrives. (The old code busy-polled here for up to ~600 ms.)
+            onError("Camera unavailable")
+            return
+        }
 
-            if (candidate == null) {
-                // No decoded frame yet (cold start) — wait for the analyzer.
-                val waitUntil = System.currentTimeMillis() + CAPTURE_FRAME_WAIT_MS
-                while (System.currentTimeMillis() < waitUntil) {
-                    candidate = latestFrame.get()?.takeIf { !it.isRecycled }
-                    if (candidate != null) break
-                    Thread.sleep(FRAME_POLL_INTERVAL_MS)
-                }
-            } else if (attempt > 0 && frameCounter <= counterAtQuery) {
-                // A previous attempt hit a recycled/failed frame — this time
-                // wait briefly for a genuinely NEWER frame to retry against.
-                val waitUntil = System.currentTimeMillis() + CAPTURE_FRAME_WAIT_MS
-                while (System.currentTimeMillis() < waitUntil) {
-                    val fresh = latestFrame.get()?.takeIf { !it.isRecycled }
-                    if (frameCounter > counterAtQuery) {
-                        candidate = fresh
-                        break
+        val waiter = CaptureWaiter()
+
+        // Delivery: fires on whichever thread completes the waiter (the
+        // analyzer on success, the main handler on timeout), then POSTS the
+        // callback to the MAIN thread — preserving the old takeSnapshot's
+        // delivery contract (onBitmap/onError ran on main). The analyzer
+        // thread stays free to process the next frame immediately.
+        waiter.done.invokeOnCompletion {
+            waiter.timeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+            val bitmap = waiter.result
+            mainHandler.post {
+                try {
+                    if (bitmap != null && !bitmap.isRecycled) {
+                        onBitmap(bitmap)
+                    } else {
+                        bitmap?.recycle()
+                        onError("Camera frame unavailable")
                     }
-                    Thread.sleep(FRAME_POLL_INTERVAL_MS)
-                }
-                if (frameCounter <= counterAtQuery) {
-                    candidate = latestFrame.get()?.takeIf { !it.isRecycled }
+                } catch (e: Throwable) {
+                    Log.w(TAG, "takeSnapshot callback error: ${e.message}")
+                    bitmap?.recycle()
                 }
             }
-            // Attempt 0 with a valid frame: the rolling frame is updated
-            // continuously (≤ ~130ms old with the decode throttle), so it is
-            // used IMMEDIATELY — the happy path adds no wait at all.
-
-            if (candidate != null) {
-                val copy = copyFrameSafely(candidate)
-                if (copy != null) {
-                    onBitmap(copy)
-                    return
-                }
-                // The frame was recycled or the copy failed (e.g. allocation
-                // under memory pressure) — retry with a fresh frame instead of
-                // reporting "capture failed" on the first transient miss.
-                lastError = "Failed to copy camera frame"
-                Log.w(TAG, "takeSnapshot: attempt $attempt copy failed — retrying")
-            } else {
-                lastError = "Camera frame unavailable"
-            }
-            Thread.sleep(FRAME_POLL_INTERVAL_MS)
         }
 
-        Log.e(TAG, "takeSnapshot failed after $CAPTURE_ATTEMPTS attempts: $lastError")
-        onError(lastError)
+        // Timeout: if no frame arrives in time, fail the capture. The
+        // waiter is removed from the deque first so the analyzer can no
+        // longer serve it (no double-completion race).
+        val timeoutRunnable = Runnable {
+            var timedOut = false
+            synchronized(captureWaiters) {
+                if (captureWaiters.remove(waiter)) {
+                    timedOut = true
+                }
+            }
+            if (timedOut) failWaiter(waiter)
+        }
+        waiter.timeoutRunnable = timeoutRunnable
+
+        synchronized(captureWaiters) { captureWaiters.addLast(waiter) }
+        mainHandler.postDelayed(timeoutRunnable, WAITER_TIMEOUT_MS)
     }
 
+    /** Complete a waiter with a frame (analyzer thread). */
+    private fun serveWaiter(waiter: CaptureWaiter, bitmap: Bitmap) {
+        synchronized(captureWaiters) { captureWaiters.remove(waiter) }
+        waiter.result = bitmap
+        waiter.done.complete(Unit)
+    }
+
+    /** Fail a waiter (timeout or exhausted decode attempts). */
+    private fun failWaiter(waiter: CaptureWaiter) {
+        waiter.done.complete(Unit)
+    }
+
+    // ── Frame Decode ───────────────────────────────────────────────
+
     /**
-     * Deep-copy the latest frame under [frameLock] so the analyzer cannot
-     * recycle it mid-copy. Returns null if the frame died or the copy
-     * allocation failed — the caller retries with a fresh frame.
+     * Convert an ImageProxy (YUV_888) to an ARGB_8888 Bitmap.
+     * Handles rotation based on imageProxy.imageInfo.rotationDegrees.
+     *
+     * Runs on the analysis executor only. Never recycles the proxy —
+     * the analyzer's finally block owns that.
      */
-    private fun copyFrameSafely(frame: Bitmap): Bitmap? {
-        while (!frameLock.compareAndSet(false, true)) {
-            Thread.sleep(1)
-        }
-        try {
-            if (frame.isRecycled) return null
-            val copy = frame.copy(Bitmap.Config.ARGB_8888, true)
-            return if (copy != null && !copy.isRecycled) copy else null
+    private fun doDecodeFrame(imageProxy: ImageProxy): Bitmap? {
+        return try {
+            val yBuffer = imageProxy.planes[0].buffer
+            val uBuffer = imageProxy.planes[1].buffer
+            val vBuffer = imageProxy.planes[2].buffer
+
+            val ySize = yBuffer.remaining()
+            val uSize = uBuffer.remaining()
+            val vSize = vBuffer.remaining()
+
+            val nv21 = ByteArray(ySize + uSize + vSize)
+            // Y plane
+            yBuffer.get(nv21, 0, ySize)
+            // VU plane (interleaved for NV21)
+            vBuffer.get(nv21, ySize, vSize)
+            uBuffer.get(nv21, ySize + vSize, uSize)
+
+            val yuvImage = YuvImage(nv21, ImageFormat.NV21, imageProxy.width, imageProxy.height, null)
+            val out = ByteArrayOutputStream()
+            yuvImage.compressToJpeg(Rect(0, 0, imageProxy.width, imageProxy.height), 85, out)
+            val jpegBytes = out.toByteArray()
+
+            var bitmap = android.graphics.BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
+                ?: return null
+
+            // Apply rotation — reuse the Matrix; allocating one per decode
+            // is pure garbage pressure.
+            val rotation = imageProxy.imageInfo.rotationDegrees
+            if (rotation != 0) {
+                val matrix = ROTATION_MATRIX
+                matrix.reset()
+                matrix.postRotate(rotation.toFloat())
+                val rotated = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+                if (rotated !== bitmap) {
+                    bitmap.recycle()
+                }
+                bitmap = rotated
+            }
+
+            bitmap
         } catch (e: Throwable) {
-            Log.w(TAG, "copyFrameSafely error: ${e.message}")
-            return null
-        } finally {
-            frameLock.set(false)
+            Log.w(TAG, "YUV conversion error: ${e.message}")
+            null
         }
     }
 
-    // ── YUV → Bitmap Conversion ────────────────────────────────────
+    /** Reusable rotation matrix (single-threaded analyzer access only). */
+    private val ROTATION_MATRIX = Matrix()
+
+    // ── Auto-Torch Luminance ───────────────────────────────────────
 
     /**
-     * Calculate average luminance from the Y plane of a YUV frame and
-     * trigger auto-torch if the environment is dark or bright.
-     *
-     * Uses dual-threshold hysteresis:
-     *   - Torch ON  when avg brightness < 35/255
-     *   - Torch OFF when avg brightness > 65/255
-     *   - Between 35-65: no change (prevents rapid toggling)
-     *
-     * This runs on the analysis executor — NOT on the main thread.
-     * Sampling is throttled to every 10th frame (~300ms) to minimize CPU overhead.
+     * Sample average luminance from the Y plane IN-PLACE (no Bitmap, no
+     * buffer copy beyond one row at a time). Returns null on failure.
      */
-    private fun checkLuminanceAndAutoTorch(imageProxy: ImageProxy) {
-        try {
+    private fun sampleLuminance(imageProxy: ImageProxy): Int? {
+        return try {
             val planes = imageProxy.planes
-            if (planes.isEmpty()) return
+            if (planes.isEmpty()) return null
 
             val yBuffer = planes[0].buffer
             val yRowStride = planes[0].rowStride
@@ -376,73 +471,40 @@ class CameraSetupDelegate {
                 }
             }
 
-            if (count == 0) return
-            val avgBrightness = (sum / count).toInt()
-
-            // Hysteresis: ON < 35, OFF > 65, dead zone 35-65 prevents oscillation
-            val shouldBeOn = avgBrightness < DARK_THRESHOLD
-            val shouldBeOff = avgBrightness > BRIGHT_THRESHOLD
-
-            val newDarkState = if (shouldBeOn) true else if (shouldBeOff) false else isDarkEnvironment
-
-            if (newDarkState != isDarkEnvironment) {
-                isDarkEnvironment = newDarkState
-                flashlightManager.autoTorch(isDarkEnvironment)
-                Log.d(TAG, "Auto-torch: brightness=$avgBrightness/255, torch=${if (isDarkEnvironment) "ON" else "OFF"}")
-            }
+            if (count == 0) null else (sum / count).toInt()
         } catch (e: Throwable) {
-            Log.w(TAG, "Luminance check error: ${e.message}")
+            Log.w(TAG, "Luminance sample error: ${e.message}")
+            null
         }
     }
 
     /**
-     * Convert an ImageProxy (YUV_888) to an ARGB_8888 Bitmap.
-     * Handles rotation based on imageProxy.imageInfo.rotationDegrees.
-     *
-     * This runs on the analysis executor — NOT on the main thread.
+     * Hysteresis: ON < 35, OFF > 65, dead zone 35-65 prevents oscillation.
      */
-    private fun imageProxyToBitmap(imageProxy: ImageProxy): Bitmap? {
-        try {
-            val yBuffer = imageProxy.planes[0].buffer
-            val uBuffer = imageProxy.planes[1].buffer
-            val vBuffer = imageProxy.planes[2].buffer
+    private fun updateAutoTorch(avgBrightness: Int) {
+        val shouldBeOn = avgBrightness < DARK_THRESHOLD
+        val shouldBeOff = avgBrightness > BRIGHT_THRESHOLD
 
-            val ySize = yBuffer.remaining()
-            val uSize = uBuffer.remaining()
-            val vSize = vBuffer.remaining()
+        val newDarkState = if (shouldBeOn) true else if (shouldBeOff) false else isDarkEnvironment
 
-            val nv21 = ByteArray(ySize + uSize + vSize)
-            // Y plane
-            yBuffer.get(nv21, 0, ySize)
-            // VU plane (interleaved for NV21)
-            vBuffer.get(nv21, ySize, vSize)
-            uBuffer.get(nv21, ySize + vSize, uSize)
-
-            val yuvImage = YuvImage(nv21, ImageFormat.NV21, imageProxy.width, imageProxy.height, null)
-            val out = ByteArrayOutputStream()
-            yuvImage.compressToJpeg(Rect(0, 0, imageProxy.width, imageProxy.height), 85, out)
-            val jpegBytes = out.toByteArray()
-
-            var bitmap = android.graphics.BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
-                ?: return null
-
-            // Apply rotation
-            val rotation = imageProxy.imageInfo.rotationDegrees
-            if (rotation != 0) {
-                val matrix = Matrix()
-                matrix.postRotate(rotation.toFloat())
-                val rotated = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
-                if (rotated !== bitmap) {
-                    bitmap.recycle()
-                }
-                bitmap = rotated
-            }
-
-            return bitmap
-        } catch (e: Throwable) {
-            Log.w(TAG, "YUV conversion error: ${e.message}")
-            return null
+        if (newDarkState != isDarkEnvironment) {
+            isDarkEnvironment = newDarkState
+            flashlightManager.autoTorch(isDarkEnvironment)
+            Log.d(TAG, "Auto-torch: brightness=$avgBrightness/255, torch=${if (isDarkEnvironment) "ON" else "OFF"}")
         }
+    }
+
+    /**
+     * Last known dark/bright environment state, maintained by the auto-torch
+     * luminance checks. Used by the long-press light check.
+     */
+    fun isEnvironmentDark(): Boolean = isDarkEnvironment
+
+    /**
+     * Updates the target rotation for the image analysis.
+     */
+    fun updateRotation(display: Display) {
+        // Rotation is applied at bind time; rebind needed for runtime changes
     }
 
     /** Reference to the application context. */
@@ -454,34 +516,30 @@ class CameraSetupDelegate {
     }
 
     /**
-     * Updates the target rotation for the image analysis.
-     */
-    fun updateRotation(display: Display) {
-        // Rotation is applied at bind time; rebind needed for runtime changes
-    }
-
-    /**
-     * Last known dark/bright environment state, maintained by the auto-torch
-     * luminance checks (refreshed roughly every 10th frame). Used by the
-     * long-press light check.
-     */
-    fun isEnvironmentDark(): Boolean = isDarkEnvironment
-
-    /**
      * Releases the camera and unbinds all use cases.
+     *
+     * Pending capture waiters are failed FAST — a capture in flight during
+     * unbind reports an error instead of hanging on a signal that will
+     * never arrive.
      */
     fun releaseCamera() {
         cameraProvider?.unbindAll()
         camera = null
-        flashlightManager.camera = null
-        previewViewRef = null
-        frameConsumed.set(false)
-        frameCounter = 0L
-        // Recycle any held frame
-        val oldFrame = latestFrame.getAndSet(null)
-        if (oldFrame != null && !oldFrame.isRecycled) {
-            oldFrame.recycle()
+        if (::flashlightManager.isInitialized) {
+            flashlightManager.camera = null
         }
+        analyzerBound = false
+        frameCounter = 0L
+        lastLuminanceCheckFrame = 0L
+        // Fail all pending waiters — unbind means no more frames will come.
+        // (Their invokeOnCompletion handlers deliver onError / cancel the
+        // timeout runnables.)
+        val pending: List<CaptureWaiter> = synchronized(captureWaiters) {
+            val list = captureWaiters.toList()
+            captureWaiters.clear()
+            list
+        }
+        pending.forEach { failWaiter(it) }
     }
 
     /**
@@ -490,7 +548,6 @@ class CameraSetupDelegate {
     fun destroy() {
         releaseCamera()
         cameraProvider = null
-        context = null
         analysisExecutor.shutdownNow()
     }
 }

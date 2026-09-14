@@ -35,9 +35,6 @@ import com.vyze.app.data.ScanRepository
 import com.vyze.app.ui.delegates.CameraSetupDelegate
 import com.vyze.app.ui.delegates.GestureRouter
 import com.vyze.app.databinding.FragmentCameraBinding
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
-import java.util.concurrent.TimeUnit
 
 /**
  * Main camera fragment for Vyze accessibility app — VLM Snapshot Mode.
@@ -82,7 +79,6 @@ class CameraFragment : Fragment() {
     private lateinit var flashlightManager: FlashlightManager
     private lateinit var reportManager: ReportManager
 
-    private lateinit var backgroundExecutor: ExecutorService
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private enum class AppState { LOADING, IDLE, LISTENING, ANALYZING, SPEAKING, REPORTING }
@@ -226,8 +222,6 @@ class CameraFragment : Fragment() {
     @SuppressLint("MissingPermission")
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
-
-        backgroundExecutor = Executors.newSingleThreadExecutor()
 
         ttsManager = ttsViewModel.ttsManager
         hapticManager = HapticManager(requireContext().applicationContext)
@@ -490,10 +484,12 @@ class CameraFragment : Fragment() {
 
         gestureRouter.attach(fragmentCameraBinding.cameraContainer)
 
-        backgroundExecutor.execute {
-            fragmentCameraBinding.viewFinder.post {
-                setUpCamera()
-            }
+        // Demand-driven capture (Phase 2 Step A): the fragment no longer
+        // owns a background executor — CameraSetupDelegate's analysis
+        // executor is the single camera-work thread (luminance sampling
+        // idle, full YUV decode only when a snapshot is demanded).
+        fragmentCameraBinding.viewFinder.post {
+            setUpCamera()
         }
 
         // NOTE: no viewFinder.setOnClickListener fallback — it fired on every
@@ -560,9 +556,6 @@ class CameraFragment : Fragment() {
         if (app?.coreController != coreController && this::coreController.isInitialized) {
             coreController.destroy()
         }
-
-        backgroundExecutor.shutdown()
-        backgroundExecutor.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS)
 
         if (this::ttsManager.isInitialized) ttsManager.onDestroy()
         if (this::hapticManager.isInitialized) hapticManager.cancel()
