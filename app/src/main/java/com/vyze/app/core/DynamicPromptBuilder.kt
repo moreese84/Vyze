@@ -40,11 +40,17 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
 
             // 0. LANGUAGE MIRROR — TOP OF PROMPT (before any English rules)
             //    This is the strongest lever for non-English output.
+            //    MIRRORING SYMMETRY (Phase 1): English gets an explicit anchor
+            //    too. Without it, Malay dialogue history / few-shot residue in
+            //    the prompt pulls a small model back toward Malay on MS→EN
+            //    switches — the asymmetric direction that failed on device.
             val langName = languageNameForLocale(userLocale)
             if (userLocale != Locale.US && userLocale.language != "en") {
                 sb.appendLine("[OUTPUT LANGUAGE: $langName] Write EVERY word of your response in $langName. Do NOT use English. Do NOT translate. This is mandatory.")
-                sb.appendLine()
+            } else {
+                sb.appendLine("[OUTPUT LANGUAGE: English] Write every word of your response in English. Do not continue in any other language.")
             }
+            sb.appendLine()
 
             // 1. Inject appropriate rules based on query intent
             when {
@@ -132,10 +138,9 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
                 sb.appendLine(BANK_CARD_RULES)
             }
 
-            // 4. Language mirror — reinforce at bottom
-            if (userLocale != Locale.US && userLocale.language != "en") {
-                sb.appendLine("REMEMBER: Respond only in $langName.")
-            }
+            // 4. Language mirror — reinforce at bottom (ALL languages now:
+            //    symmetric anchor, English included — see the top mirror note)
+            sb.appendLine("REMEMBER: Respond only in $langName.")
 
             val prompt = sb.toString()
             Log.d(TAG, "Built prompt: ${prompt.length} chars, " +
@@ -226,7 +231,10 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
          * NAVIGATION MODE — used for generic taps and automatic spatial descriptions.
          */
         private const val NAV_RULES_PROSE =
-            "Describe the scene in 1-2 DENSE sentences — more useful detail per word, never wordy prose. " +
+            "Describe the scene in 1-2 complete, natural spoken sentences — the way you " +
+            "would tell a person standing next to you. " +
+            "Write full sentences with a subject and a verb; NEVER answer with a list of " +
+            "attributes separated by commas. " +
             "For each key object say what it is plus the details you can ACTUALLY SEE: " +
             "color, size, material, and state (open/closed, full/empty, lying/standing). " +
             "Add left/center/right + distance when it places the object for the user. " +
@@ -234,13 +242,15 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
             "and product type exactly as printed, then its details. " +
             "Read printed words verbatim in ORIGINAL language as whole words — never spell them letter by letter. " +
             "Vehicle plates, codes, serial and phone numbers are read CHARACTER BY CHARACTER — letters one by one, digits one by one ('QLB 3469' is spoken 'Q L B, three four six nine'), never as a quantity. " +
-            "No filler phrases ('there is', 'I see', 'in the image', 'it appears'). " +
-            "Use clear punctuation: periods to end sentences, commas to separate details. " +
+            "Skip phrases like 'in the image' or 'it appears', but natural speech like " +
+            "'there is', 'you are facing', or 'a person is standing' is exactly right. " +
             "If unsure about an object, say 'not clearly visible'. Do NOT guess or hallucinate. " +
             "Mirrors/glass: describe the surface itself.\n"
 
         private const val DIRECT_RULES_PROSE =
             "Answer directly in the first sentence. " +
+            "Write in complete, natural spoken sentences with a subject and a verb — NEVER a " +
+            "list of attributes separated by commas. " +
             "Name the object and give compact, useful details — size, color, material, " +
             "state (open/closed, full/empty) — only what you can ACTUALLY see, never long prose. " +
             "If it is a packaged product (packet, box, bottle, can), first say its BRAND name and product type " +
@@ -249,7 +259,6 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
             "Vehicle plates, codes, serial and phone numbers are read CHARACTER BY CHARACTER — letters one by one, digits one by one ('QLB 3469' is spoken 'Q L B, three four six nine'), never as a quantity. " +
             "When asked to read text, read the ENTIRE text in reading order; never stop halfway or summarize. " +
             "Keep the whole answer to 1-3 short spoken sentences. " +
-            "Use clear punctuation: periods to end sentences, commas for pauses between details. " +
             "If text is blurry or unreadable, say 'Text is unclear' — NEVER guess. " +
             "If no text visible, say 'No text visible'. " +
             "Only what you see in THIS image.\n"
@@ -266,52 +275,52 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
 
         private const val NAV_EXAMPLES_EN =
             "Examples:\n" +
-            "Input: door in front. Output: Brown wooden door, closed, center, about 2 steps ahead.\n" +
-            "Input: person nearby. Output: Person on your left, about 1 step away.\n" +
-            "Input: sofa scene. Output: Grey fabric sofa, soft cushions, about 3 steps ahead. Low wooden table in front of it.\n" +
-            "Input: bottle on table. Output: Clear glass water bottle, half full, on the table about 1 step ahead.\n" +
-            "Input: dark room. Output: Dark room. No obstacles detected within 3 steps.\n" +
-            "Input: red packet on table. Output: Small red Maggi instant noodle packet, closed, on the table about 1 step ahead — label reads Maggi Kari.\n" +
-            "Input: car plate ahead. Output: Vehicle plate Q L B, three four six nine."
+            "Input: door in front. Output: There is a closed brown wooden door straight ahead of you, about two steps away.\n" +
+            "Input: person nearby. Output: A person is standing on your left, about one step away.\n" +
+            "Input: sofa scene. Output: You are facing a grey fabric sofa with soft cushions about three steps ahead, and there is a low wooden table in front of it.\n" +
+            "Input: bottle on table. Output: There is a clear glass water bottle on the table, half full, about one step ahead of you.\n" +
+            "Input: dark room. Output: The room is dark, and no obstacles are visible within three steps.\n" +
+            "Input: red packet on table. Output: There is a small red packet of Maggi instant noodles on the table about one step ahead, and the label reads Maggi Kari.\n" +
+            "Input: car plate ahead. Output: The vehicle plate ahead reads Q L B, three four six nine."
 
         private const val NAV_EXAMPLES_MS =
             "Examples:\n" +
-            "Input: pintu di hadapan. Output: Pintu kayu perang, tertutup, di tengah, kira-kira 2 langkah di hadapan.\n" +
-            "Input: orang berdekatan. Output: Orang di sebelah kiri anda, kira-kira 1 langkah.\n" +
-            "Input: sofa. Output: Sofa kain kelabu, cushion lembut, kira-kira 3 langkah di hadapan. Meja kayu rendah di hadapannya.\n" +
-            "Input: botol di atas meja. Output: Botol air kaca lutsinar, separuh penuh, di atas meja kira-kira 1 langkah.\n" +
-            "Input: bilik gelap. Output: Bilik gelap. Tiada halangan dikesan dalam 3 langkah.\n" +
-            "Input: paket merah di atas meja. Output: Paket mi Maggi merah kecil, tertutup, di atas meja kira-kira 1 langkah — label tertulis Maggi Kari.\n" +
-            "Input: plat kereta di hadapan. Output: Plat kenderaan Q L B, tiga empat enam sembilan."
+            "Input: pintu di hadapan. Output: Ada sebuah pintu kayu perang yang tertutup terus di hadapan anda, kira-kira dua langkah jauhnya.\n" +
+            "Input: orang berdekatan. Output: Ada seseorang berdiri di sebelah kiri anda, kira-kira satu langkah jauhnya.\n" +
+            "Input: sofa. Output: Anda sedang menghadap sebuah sofa kain kelabu dengan cushion lembut kira-kira tiga langkah di hadapan, dan ada meja kayu rendah di hadapannya.\n" +
+            "Input: botol di atas meja. Output: Ada sebuah botol air kaca lutsinar di atas meja, separuh penuh, kira-kira satu langkah di hadapan anda.\n" +
+            "Input: bilik gelap. Output: Bilik ini gelap, dan tiada halangan yang kelihatan dalam tiga langkah.\n" +
+            "Input: paket merah di atas meja. Output: Ada satu paket kecil mi Maggi berwarna merah di atas meja kira-kira satu langkah, dan label tertulis Maggi Kari.\n" +
+            "Input: plat kereta di hadapan. Output: Plat kenderaan di hadapan tertulis Q L B, tiga empat enam sembilan."
 
         private const val NAV_EXAMPLES_ZH =
             "Examples:\n" +
-            "Input: 前面有门。Output: 棕色木门，关着，在正前方，大约两步远。\n" +
-            "Input: 附近有人。Output: 有人在你的左边，大约一步远。\n" +
-            "Input: 沙发。Output: 灰色布沙发，软垫，大约三步远。前面有一张矮木桌。\n" +
-            "Input: 桌上有瓶子。Output: 透明玻璃水瓶，半满，在桌上，大约一步远。\n" +
-            "Input: 黑暗的房间。Output: 黑暗的房间。三步内没有检测到障碍物。\n" +
-            "Input: 桌上有红色包装。Output: 桌上有一包红色的小包装Maggi快熟面，封着口——标签写着Maggi Kari。\n" +
-            "Input: 前面有车牌。Output: 车牌Q L B，数字是三、四、六、九。"
+            "Input: 前面有门。Output: 您的正前方大约两步远，有一扇关着的棕色木门。\n" +
+            "Input: 附近有人。Output: 有一个人站在您的左边，大约一步远。\n" +
+            "Input: 沙发。Output: 您正前方大约三步远有一张带软垫的灰色布沙发，前面还有一张矮木桌。\n" +
+            "Input: 桌上有瓶子。Output: 桌上有一个透明的玻璃水瓶，半满，在您前方大约一步的位置。\n" +
+            "Input: 黑暗的房间。Output: 房间很暗，三步之内看不到任何障碍物。\n" +
+            "Input: 桌上有红色包装。Output: 桌上大约一步远有一包红色的小包装Maggi快熟面，标签写着Maggi Kari。\n" +
+            "Input: 前面有车牌。Output: 前方的车牌是Q L B，三、四、六、九。"
 
         private const val DIRECT_EXAMPLES_EN =
             "Examples:\n" +
-            "Input: what is this? Image shows a red packet. Output: Small red Maggi instant noodle packet, closed. Label reads Maggi Kari — noodles and seasoning sachets inside.\n" +
-            "Input: what medicine is this? Image shows Diclac Retard box. Output: Diclac Retard, diclofenac sodium 100 milligram. Take one tablet daily after meals.\n" +
-            "Input: read this label. Image shows price tag RM12.90. Output: Price is 12 Ringgit and 90 sen.\n" +
-            "Input: what does this sign say? Image blurry. Output: Text is unclear."
+            "Input: what is this? Image shows a red packet. Output: This is a small red packet of Maggi instant noodles, and the label reads Maggi Kari — noodles and seasoning sachets are inside.\n" +
+            "Input: what medicine is this? Image shows Diclac Retard box. Output: This is Diclac Retard, diclofenac sodium 100 milligram — take one tablet daily after meals.\n" +
+            "Input: read this label. Image shows price tag RM12.90. Output: The price is 12 Ringgit and 90 sen.\n" +
+            "Input: what does this sign say? Image blurry. Output: The text is unclear."
 
         private const val DIRECT_EXAMPLES_MS =
             "Examples:\n" +
-            "Input: apa ini? Imej menunjukkan paket mi merah. Output: Paket mi Maggi merah kecil, tertutup. Label tertulis Maggi Kari — mi dan sachet perencah di dalamnya.\n" +
-            "Input: ubat apa ini? Imej menunjukkan kotak Diclac Retard. Output: Diclac Retard, diklofenak natrium 100 miligram. Ambil satu tablet sehari selepas makan.\n" +
-            "Input: baca label ini. Imej menunjukkan tag harga RM12.90. Output: Harganya 12 Ringgit dan 90 sen.\n" +
-            "Input: apa yang tertulis di papan tanda ini? Imej kabur. Output: Teks tidak jelas."
+            "Input: apa ini? Imej menunjukkan paket mi merah. Output: Ini adalah satu paket kecil mi Maggi berwarna merah, dan label tertulis Maggi Kari — mi dan sachet perencah berada di dalamnya.\n" +
+            "Input: ubat apa ini? Imej menunjukkan kotak Diclac Retard. Output: Ini adalah Diclac Retard, diklofenak natrium 100 miligram — ambil satu tablet sehari selepas makan.\n" +
+            "Input: baca label ini. Imej menunjukkan tag harga RM12.90. Output: Harganya ialah 12 Ringgit dan 90 sen.\n" +
+            "Input: apa yang tertulis di papan tanda ini? Imej kabur. Output: Teksnya tidak jelas."
 
         private const val DIRECT_EXAMPLES_ZH =
             "Examples:\n" +
-            "Input: 这是什么？图像显示一个红色包装。Output: 一包红色的小包装Maggi快熟面，封着口。标签写着Maggi Kari——里面是面条和调味包。\n" +
-            "Input: 这是什么药？图像显示Diclac Retard药盒。Output: Diclac Retard，双氯芬酸钠100毫克。每天饭后服用一片。\n" +
+            "Input: 这是什么？图像显示一个红色包装。Output: 这是一包红色的小包装Maggi快熟面，标签写着Maggi Kari——里面是面条和调味包。\n" +
+            "Input: 这是什么药？图像显示Diclac Retard药盒。Output: 这是Diclac Retard，双氯芬酸钠100毫克——每天饭后服用一片。\n" +
             "Input: 读一下这个标签。图像显示价格标签RM12.90。Output: 价格是12令吉90仙。\n" +
             "Input: 这个牌子上写什么？图像模糊。Output: 文字不清楚。"
 
@@ -369,7 +378,9 @@ Output 1-2 spoken sentences with spatial positioning. No filler, no formatting."
             "a bank name. Do not read or mention the card number."
 
         private const val CONTINUOUS_MODE_RULES =
-            "Instant assistant. Key objects + position. 15 words max. Use commas between items, period at end."
+            "Instant assistant. ONE short natural spoken sentence, about 15 words maximum: " +
+            "the key objects, their positions and their states. Write a complete sentence " +
+            "with a verb, and end it with a period — never a comma-separated list."
 
         /**
          * Text-only Q&A rules — used when NO camera frame is available

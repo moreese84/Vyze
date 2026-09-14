@@ -17,6 +17,8 @@ import androidx.camera.core.AspectRatio
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageCapture
+import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
@@ -109,6 +111,16 @@ class CameraSetupDelegate {
     }
 
     private val captureWaiters = ArrayDeque<CaptureWaiter>()
+
+    // ── High-Resolution Still Capture (OCR) ────────────────────────
+    // A bound ImageCapture use case gives text queries a full-resolution
+    // JPEG still (~2400x1350 vs the 960x720 analyzer stream). The analyzer
+    // stream physically cannot hold a page of A4 text — at reading distance
+    // its glyphs fall below ML Kit's reliable detection floor, which is why
+    // long letters/documents read back garbled or empty. Scene, tap and
+    // continuous queries never touch this use case, so their latency and
+    // battery profile are unchanged.
+    private var imageCapture: ImageCapture? = null
 
     // ── Auto-Torch Luminance Detection ────────────────────────────
     // REQUIRES the analyzer to keep delivering frames — so the analyzer
@@ -219,6 +231,20 @@ class CameraSetupDelegate {
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
             .build()
 
+        // High-res still use case for OCR text reads. BOUND WITH the analyzer
+        // in one bindToLifecycle call: CameraX guarantees a simultaneous
+        // Preview + ImageAnalysis + ImageCapture combination (the default
+        // supported use-case level), while re-binding later to add it would
+        // race the analyzer and risk dropping frames mid-capture. 4:3 keeps
+        // the full sensor field of view (16:9 crops it), so nothing at the
+        // top or bottom of a document page is lost.
+        val imageCaptureUseCase = ImageCapture.Builder()
+            .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+            .setTargetResolution(Size(2400, 1350))
+            .setTargetRotation(previewView.display.rotation)
+            .build()
+        this.imageCapture = imageCaptureUseCase
+
         imageAnalysis.setAnalyzer(analysisExecutor) { imageProxy ->
             try {
                 // ── LUMINANCE SAMPLE (the ONLY idle per-frame work) ──
@@ -277,7 +303,9 @@ class CameraSetupDelegate {
         analyzerBound = true
         provider.unbindAll()
         try {
-            camera = provider.bindToLifecycle(lifecycleOwner, cameraSelector, preview, imageAnalysis)
+            camera = provider.bindToLifecycle(
+                lifecycleOwner, cameraSelector, preview, imageAnalysis, imageCaptureUseCase
+            )
             flashlightManager.camera = camera
             preview?.setSurfaceProvider(previewView.surfaceProvider)
         } catch (exc: Exception) {
@@ -376,6 +404,73 @@ class CameraSetupDelegate {
     /** Fail a waiter (timeout or exhausted decode attempts). */
     private fun failWaiter(waiter: CaptureWaiter) {
         waiter.done.complete(Unit)
+    }
+
+    // ── High-Resolution Still Capture (OCR text reads) ────────────
+
+    /**
+     * Capture a FULL-RESOLUTION still and hand it to [onBitmap] — used ONLY
+     * by explicit text-reading queries where small glyph detail decides
+     * whether ML Kit can read a document at all. Fully async, main-thread
+     * callback delivery (same contract as [takeSnapshot]).
+     *
+     * The analyzer stream (960x720) is fine for scene/OCR-at-arm's-length
+     * work but cannot resolve a full page of print; the still (~2400px)
+     * roughly quadruples glyph height at reading distance.
+     *
+     * Fallback: if no ImageCapture use case is bound (binding failed,
+     * unbind race) or the hardware take fails, the error callback fires
+     * and the CALLER (CameraFragment) falls back to the analyzer snapshot
+     * — one degraded OCR read is better than a failed query.
+     *
+     * @param onCaptureStart Optional synchronous callback fired before the
+     *   capture starts (capture-start timestamping, mirrors [takeSnapshot]).
+     */
+    fun takeHighResSnapshot(
+        onCaptureStart: (() -> Unit)? = null,
+        onBitmap: (Bitmap) -> Unit,
+        onError: (String) -> Unit
+    ) {
+        onCaptureStart?.invoke()
+
+        val capture = imageCapture
+        if (capture == null || camera == null) {
+            onError("High-res capture unavailable")
+            return
+        }
+
+        capture.takePicture(
+            ContextCompat.getMainExecutor(context ?: return),
+            object : ImageCapture.OnImageCapturedCallback() {
+                override fun onCaptureSuccess(image: ImageProxy) {
+                    // Rotation is applied here so ML Kit sees upright text.
+                    val bitmap = image.toBitmap()
+                    val rotation = image.imageInfo.rotationDegrees
+                    image.close()
+                    try {
+                        val rotated = if (rotation != 0 && bitmap != null) {
+                            val matrix = Matrix().apply { postRotate(rotation.toFloat()) }
+                            Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+                                .also { if (it !== bitmap) bitmap.recycle() }
+                        } else bitmap
+                        if (rotated != null) {
+                            onBitmap(rotated)
+                        } else {
+                            onError("Still frame decode failed")
+                        }
+                    } catch (e: Throwable) {
+                        Log.w(TAG, "High-res rotation failed: ${e.message}")
+                        bitmap?.recycle()
+                        onError("Still frame decode failed")
+                    }
+                }
+
+                override fun onError(exception: ImageCaptureException) {
+                    Log.w(TAG, "High-res capture failed: ${exception.message}")
+                    onError("High-res capture failed")
+                }
+            }
+        )
     }
 
     // ── Frame Decode ───────────────────────────────────────────────
@@ -525,6 +620,7 @@ class CameraSetupDelegate {
     fun releaseCamera() {
         cameraProvider?.unbindAll()
         camera = null
+        imageCapture = null
         if (::flashlightManager.isInitialized) {
             flashlightManager.camera = null
         }

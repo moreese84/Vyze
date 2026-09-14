@@ -16,6 +16,7 @@ import com.vyze.app.vision.ColorAnalyzer
 import android.annotation.SuppressLint
 import android.content.Context
 import android.content.res.Configuration
+import android.graphics.Bitmap
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -647,6 +648,40 @@ class CameraFragment : Fragment() {
     // VLM Snapshot Trigger
     // ══════════════════════════════════════════════════════════════════
 
+    /**
+     * Capture a frame for [query], choosing the source by query type.
+     *
+     * OCR PIPELINE FIX (Phase 2): explicit text-reading queries go through
+     * the full-resolution ImageCapture still (~2400px vs the 960x720
+     * analyzer stream) — a page of print physically cannot resolve in the
+     * analyzer stream, so long letters/documents previously read back
+     * garbled or empty. Every other query type (scene, tap, pointing,
+     * currency, continuous) keeps the analyzer snapshot: latency and
+     * battery behavior unchanged.
+     *
+     * Fallback: if the high-res take fails (unbind race, hardware error),
+     * degrade to the analyzer snapshot instead of failing the query — one
+     * lower-quality OCR read beats no answer.
+     */
+    private fun captureFrameForQuery(
+        query: String,
+        onBitmap: (Bitmap) -> Unit,
+        onError: (String) -> Unit
+    ) {
+        if (coreController.isTextReadQuery(query)) {
+            CrashLogFile.log(TAG, "Text read query — using high-res still capture")
+            cameraSetup.takeHighResSnapshot(
+                onBitmap = onBitmap,
+                onError = { error ->
+                    CrashLogFile.log(TAG, "High-res capture failed ($error) — falling back to analyzer snapshot")
+                    cameraSetup.takeSnapshot(onBitmap = onBitmap, onError = onError)
+                }
+            )
+        } else {
+            cameraSetup.takeSnapshot(onBitmap = onBitmap, onError = onError)
+        }
+    }
+
     private fun triggerVlmSnapshot(query: String) {
         CrashLogFile.log(TAG, "triggerVlmSnapshot: state=$appState, engineReady=${coreController.isEngineReady()}, inferring=${coreController.isCurrentlyInferring()}, capturing=${isCapturing.get()}")
 
@@ -685,7 +720,7 @@ class CameraFragment : Fragment() {
         updateStatus("Capturing...")
         CrashLogFile.log(TAG, "Calling cameraSetup.takeSnapshot()")
 
-        cameraSetup.takeSnapshot(
+        captureFrameForQuery(query,
             onBitmap = { bitmap ->
                 // ── SINGLE EXIT: guarantee isCapturing is cleared ──
                 try {
@@ -700,7 +735,7 @@ class CameraFragment : Fragment() {
                                 updateStatus("Ready")
                             }
                         }
-                        return@takeSnapshot
+                        return@captureFrameForQuery
                     }
 
                     CrashLogFile.log(TAG, "onBitmap callback: ${bitmap.width}x${bitmap.height}")
@@ -726,14 +761,14 @@ class CameraFragment : Fragment() {
                             "Peranti terlalu panas untuk analisis visual. Pembacaan teks masih berfungsi.",
                             "设备过热，无法进行视觉分析。文字识别仍可使用。"
                         )
-                        return@takeSnapshot
+                        return@captureFrameForQuery
                     }
 
                     // Double-check engine isn't already running a different inference
                     if (coreController.isCurrentlyInferring()) {
                         CrashLogFile.log(TAG, "Engine busy — recycling bitmap")
                         bitmap.recycle()
-                        return@takeSnapshot
+                        return@captureFrameForQuery
                     }
 
                     // ── INSTANT HAPTIC: acknowledge frame capture immediately ──

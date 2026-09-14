@@ -1225,11 +1225,30 @@ class VyzeCoreController(
                 // would otherwise commit Latin-only OCR at high confidence and
                 // never give the model a chance to read small/mixed script the
                 // OCR missed (e.g. tiny Chinese glyphs on a small bottle).
+                // ── DENSE-DOCUMENT SANITY GATE ──────────────
+                // ML Kit can return high average confidence on a page it
+                // only PARTIALLY recognized (a few solid regions of a
+                // dense letter), and the fast-path would confidently read
+                // that fragment aloud as the whole answer. Guard: an
+                // explicit READ of a large capture that comes back with
+                // almost no text, no line structure, and no sentence end
+                // is treated as a failed read — fall through to Gemma,
+                // whose adaptive token budget handles the full page.
+                val ocrTextForGate = ocrText
+                val ocrLooksIncomplete = ocrTextForGate != null &&
+                    ocrTextForGate.isNotEmpty() &&
+                    bitmap.width >= 1500 &&
+                    ocrTextForGate.length < 120 &&
+                    !ocrTextForGate.contains('\n') &&
+                    ocrTextForGate.last() !in ".!?。！？"
+                if (ocrLooksIncomplete) {
+                    CrashLogFile.log(TAG, "OCR fast-path suppressed: dense-doc sanity gate (len=${ocrTextForGate?.length}, single line, high-res capture)")
+                }
                 if (!isTapQuery && isTextExtractionQuery(query) &&
-                    !ocrText.isNullOrBlank() && ocrConfidence >= OCR_FAST_PATH_CONFIDENCE
+                    !ocrText.isNullOrBlank() && ocrConfidence >= OCR_FAST_PATH_CONFIDENCE &&
+                    !ocrLooksIncomplete
                 ) {
                     CrashLogFile.log(TAG, "OCR FAST-PATH: confidence=$ocrConfidence >= $OCR_FAST_PATH_CONFIDENCE — skipping Gemma")
-                    isInferring.set(false)
                     mainHandler.removeCallbacks(watchdogRunnable)
                     val ocrResponse = ocrText
                     if (currentSessionId == activeSessionId) {
@@ -2119,6 +2138,14 @@ class VyzeCoreController(
         !query.isNullOrBlank() &&
             isTextExtractionQuery(query) &&
             query?.contains(TAP_POSITION_MARKER) != true
+
+    /**
+     * PUBLIC for the fragment's capture router: true when [query] is an
+     * explicit text-reading request — the only query class that needs the
+     * full-resolution ImageCapture still for OCR.
+     * Pure query-text classification (no state touched).
+     */
+    fun isTextReadQuery(query: String?): Boolean = isTextExtractionQuery(query)
 
     /**
      * Returns true if the query contains keywords indicating the user wants
