@@ -965,10 +965,15 @@ class VyzeCoreController(
         // Gemma only when the scene CHANGED since the last spoken
         // description (~1ms embedding check vs multi-second inference —
         // this is the battery/latency saver).
+        // Cache micro-win: the gate candidate is kept and reused as the
+        // post-answer baseline below — one embedding pass per continuous
+        // capture instead of two passes over the same frame.
+        var gateEmbeddingCandidate: FloatArray? = null
         if (continuousMode) {
             val baseline = lastContinuousEmbedding
             if (baseline != null) {
                 val candidate = EmbeddingEngine.generateEmbedding(bitmap)
+                    .also { gateEmbeddingCandidate = it }
                 val similarity = EmbeddingEngine.cosineSimilarity(candidate, baseline)
                 if (similarity >= CONTINUOUS_SKIP_SIMILARITY) {
                     Log.d(TAG, "Scene gating: unchanged scene (sim=$similarity) — skipping inference")
@@ -1441,9 +1446,14 @@ class VyzeCoreController(
 
                         // Continuous mode: refresh the scene baseline so the
                         // NEXT auto-capture can skip if the scene is unchanged.
+                        // Reuses the gate-time candidate — same frame, same
+                        // pixels, identical embedding, no second pass. The
+                        // fallback covers the very first capture of a session
+                        // (no baseline existed, so the gate never embedded).
                         if (continuousMode) {
                             try {
-                                lastContinuousEmbedding = EmbeddingEngine.generateEmbedding(bitmap)
+                                lastContinuousEmbedding = gateEmbeddingCandidate
+                                    ?: EmbeddingEngine.generateEmbedding(bitmap)
                                 lastContinuousDescriptionAt = System.currentTimeMillis()
                             } catch (e: Throwable) {
                                 CrashLogFile.logError(TAG, "Scene baseline update failed: ${e.message}", e)

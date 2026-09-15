@@ -324,18 +324,29 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
             "Input: 读一下这个标签。图像显示价格标签RM12.90。Output: 价格是12令吉90仙。\n" +
             "Input: 这个牌子上写什么？图像模糊。Output: 文字不清楚。"
 
+        // ── Memoized static rule blocks (cache micro-win) ──────────
+        // buildPrompt runs on every capture; re-concatenating identical
+        // immutable strings each turn is pure allocation churn. The six
+        // static blocks are built once (lazy = thread-safe) and reused.
+        private val navRulesEn by lazy { NAV_RULES_PROSE + NAV_EXAMPLES_EN }
+        private val navRulesMs by lazy { NAV_RULES_PROSE + NAV_EXAMPLES_MS }
+        private val navRulesZh by lazy { NAV_RULES_PROSE + NAV_EXAMPLES_ZH }
+        private val directRulesEn by lazy { DIRECT_RULES_PROSE + DIRECT_EXAMPLES_EN }
+        private val directRulesMs by lazy { DIRECT_RULES_PROSE + DIRECT_EXAMPLES_MS }
+        private val directRulesZh by lazy { DIRECT_RULES_PROSE + DIRECT_EXAMPLES_ZH }
+
         /** Navigation rules with few-shot examples in the user's language. */
         private fun navigationRulesFor(language: String): String = when (language) {
-            "ms" -> NAV_RULES_PROSE + NAV_EXAMPLES_MS
-            "zh" -> NAV_RULES_PROSE + NAV_EXAMPLES_ZH
-            else -> NAV_RULES_PROSE + NAV_EXAMPLES_EN
+            "ms" -> navRulesMs
+            "zh" -> navRulesZh
+            else -> navRulesEn
         }
 
         /** Direct-query rules with few-shot examples in the user's language. */
         private fun directQueryRulesFor(language: String): String = when (language) {
-            "ms" -> DIRECT_RULES_PROSE + DIRECT_EXAMPLES_MS
-            "zh" -> DIRECT_RULES_PROSE + DIRECT_EXAMPLES_ZH
-            else -> DIRECT_RULES_PROSE + DIRECT_EXAMPLES_EN
+            "ms" -> directRulesMs
+            "zh" -> directRulesZh
+            else -> directRulesEn
         }
 
         private const val DEFAULT_NAVIGATION_QUERY =

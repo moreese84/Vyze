@@ -531,6 +531,13 @@ class CameraSetupDelegate {
     /** Reusable rotation matrix (single-threaded analyzer access only). */
     private val ROTATION_MATRIX = Matrix()
 
+    /**
+     * Reusable luminance row buffer (single-threaded analyzer access only).
+     * Grown lazily to the largest row stride seen — removes one ByteArray
+     * allocation per luminance sample (~every 600 ms while idle).
+     */
+    private var luminanceRowBuffer: ByteArray = ByteArray(0)
+
     // ── Auto-Torch Luminance ───────────────────────────────────────
 
     /**
@@ -553,7 +560,11 @@ class CameraSetupDelegate {
             var sum = 0L
             var count = 0
 
-            val rowBuffer = ByteArray(yRowStride)
+            val rowBuffer = if (luminanceRowBuffer.size >= yRowStride) {
+                luminanceRowBuffer
+            } else {
+                ByteArray(yRowStride).also { luminanceRowBuffer = it }
+            }
             for (row in 0 until height step sampleStep) {
                 yBuffer.position(row * yRowStride)
                 yBuffer.get(rowBuffer, 0, minOf(yRowStride, rowBuffer.size))
