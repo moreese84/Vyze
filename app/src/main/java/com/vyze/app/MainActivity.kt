@@ -111,6 +111,27 @@ class MainActivity : AppCompatActivity() {
     private var asrFallbackTried = false
 
     /**
+     * Suspect-transcript ladder retries consumed THIS session. Kept separate
+     * from [localeFallbackIndex] (which the NO_MATCH ladder advances) so the
+     * two retry paths can never combine into an unbounded loop. Reset on
+     * every fresh session and whenever a transcription is accepted.
+     */
+    @Volatile
+    private var suspectLadderRetries = 0
+
+    /**
+     * The transcript that triggered the suspect ladder — held while the
+     * ladder retry session runs. If the retry fails (NO_MATCH, silence,
+     * error), the ORIGINAL transcript is delivered instead of an error: it
+     * passed the chatter filter, so the user demonstrably spoke and a
+     * possibly-wrong-language answer beats losing the query. The retry
+     * captures NEW audio (the recognizer cannot replay the old session), so
+     * this fallback is what keeps latency bounded and the query safe.
+     */
+    @Volatile
+    private var pendingSuspectTranscript: String? = null
+
+    /**
      * True once the recognizer heard the user BEGIN speaking in the current
      * session (onBeginningOfSpeech). The model-ASR rescue is ONLY allowed for
      * speech that was attempted but failed (the noisy-room case). Pure silence
@@ -1073,8 +1094,11 @@ class MainActivity : AppCompatActivity() {
      */
     private fun startListeningInternal() {
         try {
-            // Fresh voice session — allow one model-ASR rescue attempt
+            // Fresh voice session — allow one model-ASR rescue attempt and
+            // one suspect-transcript ladder retry
             asrFallbackTried = false
+            suspectLadderRetries = 0
+            pendingSuspectTranscript = null
 
             // Barge-in: stop TTS before opening the microphone
             if (ttsReady && ttsManager.isSpeaking()) {
@@ -1235,6 +1259,24 @@ class MainActivity : AppCompatActivity() {
                 if (!voiceSessionWanted) {
                     Log.d(TAG, "onError($error) after session aborted — dropping stale callback")
                     localeFallbackIndex = 0
+                    return
+                }
+                // ── SUSPECT-RETRY FAILURE: deliver the original ──────
+                // The retry session captured NEW audio; if it produced
+                // nothing (silence — the user did not repeat — or another
+                // failure), the ORIGINAL transcript is still a real query
+                // that passed the chatter filter. Deliver it with its
+                // original detected locale instead of an error or the
+                // model-ASR rescue (which would nag "say that again" for a
+                // query we already hold). The ladder index resets so the
+                // NO_MATCH ladder does not chain more silent retries on top.
+                val originalTranscript = pendingSuspectTranscript
+                if (originalTranscript != null) {
+                    pendingSuspectTranscript = null
+                    localeFallbackIndex = 0
+                    Log.i(TAG, "Suspect retry failed (error=$error) — accepting original transcript")
+                    CrashLogFile.log(TAG, "SUSPECT RETRY FAILED: accepting original transcript")
+                    onSpeechResult?.invoke(originalTranscript, lastDetectedLocale, 0f)
                     return
                 }
                 // ── LOCALE FALLBACK LADDER RETRY ────────────────────
@@ -1414,10 +1456,63 @@ class MainActivity : AppCompatActivity() {
                     textDetectedLocale // Use text detection for Malay/Chinese
                 }
 
+                // ── SUSPECT-TRANSCRIPT LADDER ────────────────────
+                // A SUCCESSFUL session can still run the wrong language: on
+                // engines without API 34+ auto-detect, an unpinned session
+                // uses the device-default acoustic model, which transcribes
+                // Malay/Chinese speech into garbled English-ish tokens —
+                // success-with-wrong-language that the NO_MATCH ladder never
+                // sees (verified on device: setUserLocale pinned en_US for
+                // every language). Detection signal: no ms/zh evidence in
+                // the text AND recognizer confidence below threshold (the
+                // chatter filter already dropped < 0.35, so the live band is
+                // the mediocre-confidence range where wrong-language garble
+                // typically lands; intact ms/zh text is exempt — genuine
+                // ms/zh transcripts score low by nature and are handled by
+                // the text detector, not this path). Retry the session
+                // pinned to the ladder's next language — ONCE, bounded.
+                if (suspectLadderRetries < SUSPECT_LADDER_MAX_RETRIES &&
+                    localeFallbackIndex < FALLBACK_RECOGNITION_LOCALES.size
+                ) {
+                    val conf = confidence?.firstOrNull()
+                    val textSaysMsZh = finalLocale.language == "ms" || finalLocale.language == "zh"
+                    val lowConfidence = conf != null && conf < SUSPECT_TRANSCRIPT_CONFIDENCE
+                    if (!textSaysMsZh && lowConfidence) {
+                        // Order the retry at the last successfully SPOKEN
+                        // language when known (same heuristic as the NO_MATCH
+                        // ladder), then skip the language the recognizer
+                        // claimed in its bundle (the failed acoustic model).
+                        if (lastPinnedLocaleTag == null && localeFallbackIndex == 0) {
+                            val idx = FALLBACK_RECOGNITION_LOCALES.indexOfFirst {
+                                it.language == lastDetectedLocale?.language
+                            }
+                            if (idx > 0) localeFallbackIndex = idx
+                        }
+                        if (!detectedLang.isNullOrBlank() &&
+                            FALLBACK_RECOGNITION_LOCALES[localeFallbackIndex]
+                                .toLanguageTag() == detectedLang
+                        ) {
+                            localeFallbackIndex++
+                        }
+                        if (localeFallbackIndex < FALLBACK_RECOGNITION_LOCALES.size) {
+                            val nextLocale = FALLBACK_RECOGNITION_LOCALES[localeFallbackIndex]
+                            suspectLadderRetries++
+                            pendingSuspectTranscript = bestMatch
+                            Log.i(TAG, "Suspect transcript (conf=$conf, no ms/zh signal) — ladder retry as ${nextLocale.toLanguageTag()} (attempt $suspectLadderRetries)")
+                            CrashLogFile.log(TAG, "SUSPECT LADDER RETRY: recognition → ${nextLocale.toLanguageTag()}")
+                            isListening = false
+                            speechRecognizer?.cancel()
+                            startListeningAfterTtsStop()
+                            return
+                        }
+                    }
+                }
+
                 Log.i(TAG, "onResults: \"$bestMatch\" lang=$finalLocale (bundle=$detectedLang)")
                 CrashLogFile.log(TAG, "Speech result: \"$bestMatch\" lang=$finalLocale")
                 lastDetectedLocale = finalLocale
                 localeFallbackIndex = 0 // a session succeeded — ladder back to start
+                suspectLadderRetries = 0 // a transcription was accepted — suspect budget restored
                 onSpeechResult?.invoke(bestMatch, finalLocale, confidence?.firstOrNull() ?: 1f)
             }
 
@@ -1447,6 +1542,24 @@ class MainActivity : AppCompatActivity() {
          * English-default phone be heard on the very first session.
          */
         private const val SUPPORTED_RECOGNITION_LANGUAGES = "en-US,ms-MY,zh-CN"
+
+        /**
+         * Max suspect-transcript ladder retries per voice session — capped
+         * at 1 so worst-case latency is one silent re-listen (plus the
+         * engine's no-speech timeout) before the original transcript is
+         * delivered as-is.
+         */
+        private const val SUSPECT_LADDER_MAX_RETRIES = 1
+
+        /**
+         * Recognizer confidence below which a transcript with no ms/zh
+         * text-detector signal is treated as suspected wrong-language garble.
+         * Sits above the chatter filter floor (0.35): only the
+         * mediocre-confidence band reaches this check, which is where
+         * English-model transcriptions of Malay/Chinese speech typically
+         * land. Tune on device logcat if the band proves too wide/narrow.
+         */
+        private const val SUSPECT_TRANSCRIPT_CONFIDENCE = 0.5f
 
         /**
          * Locale-fallback ladder for recognition failures. A session that
