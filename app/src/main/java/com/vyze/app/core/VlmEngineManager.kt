@@ -51,7 +51,7 @@ import java.util.concurrent.TimeUnit
  *
  * ## Prompt Format
  * Uses Gemma 4's turn format:
- * `<|turn|>system [System Prompt]<|end_of_turn|><|turn|>user [User/Image Context]<|end_of_turn|><|turn|>model`
+ * `<start_of_turn>user [System Prompt + User/Image Context]<end_of_turn><start_of_turn>model` — the system directive is folded into the user turn (Gemma defines no system role)
  * Image patch tokens are bound natively by the LiteRT-LM engine when
  * passing the Bitmap — no literal [IMAGE_TOKEN] placeholder needed.
  *
@@ -357,7 +357,7 @@ class VlmEngineManager(
      * Analyze a camera frame with a text prompt.
      *
      * Uses Gemma 4's turn format:
-     * `<|turn|>system [System Prompt]<|end_of_turn|><|turn|>user [User/Image Context]<|end_of_turn|><|turn|>model`
+     * `<start_of_turn>user [System Prompt + User/Image Context]<end_of_turn><start_of_turn>model` — the system directive is folded into the user turn (Gemma defines no system role)
      * Image patch tokens are bound natively by the engine via Content.ImageBytes.
      *
      * @param bitmap          Camera frame — will be downscaled proportionally before inference
@@ -397,7 +397,7 @@ class VlmEngineManager(
             CrashLogFile.log(TAG, "JPEG: ${imageBytes.size} bytes")
 
             // 3. Build the user payload + Gemma 4 turn format.
-            //    System directive is injected as <|turn|>system block.
+            //    System directive is folded into the user turn (Gemma has no system role).
             //    User rules come from DynamicPromptBuilder inside the user payload.
             val userPayload = buildUserPayload(prompt, memoryContext)
             val formattedPrompt = buildGemmaTurnPrompt(userPayload, SYSTEM_DIRECTIVE)
@@ -1103,7 +1103,7 @@ class VlmEngineManager(
         private const val GENERATION_DRAIN_TIMEOUT_MS = 20_000L
 
         /**
-         * Gemma 4 system directive — injected as <|turn|>system block.
+         * Gemma 4 system directive — folded into the user turn (Gemma has no system role).
          * CONVERSATIONAL PERSONA (verbatim product spec): natural hands-free
          * voice, ≤2 short sentences for TTS, references provided history,
          * clock/left-right spatial clarity, plain sentences only. Long OCR

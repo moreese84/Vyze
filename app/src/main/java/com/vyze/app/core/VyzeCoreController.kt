@@ -125,6 +125,17 @@ class VyzeCoreController(
     @Volatile
     private var lastDialogueAt = 0L
 
+    /**
+     * Language of the most recent dialogue turn. A change in the user's
+     * detected locale between turns clears [dialogueTurns]: cross-language
+     * history contaminates a 2B model's output language (the reported
+     * MS→EN drift), and follow-up pronoun resolution is unlikely to
+     * survive a language switch anyway — it is a natural conversation
+     * boundary.
+     */
+    @Volatile
+    private var lastDialogueLanguage: String? = null
+
     /** True while the hands-free conversation window is open. */
     @Volatile
     private var conversationWindowOpen = false
@@ -2078,6 +2089,23 @@ class VyzeCoreController(
         activeUserLocale = locale
         Log.i(TAG, "setUserLocale: $locale (language=${locale.language})")
 
+        // LANGUAGE-SWITCH HISTORY TRIM: a detected language change is a
+        // conversation boundary. Cross-language dialogue history pulls a
+        // 2B model's output language back toward the previous turn (the
+        // reported MS→EN drift), so the buffer is cleared rather than
+        // carried over. setUserLocale is invoked before the query is
+        // dispatched, so the fresh query always builds against clean state.
+        val newLanguage = locale.language
+        if (lastDialogueLanguage != null && lastDialogueLanguage != newLanguage) {
+            synchronized(dialogueLock) {
+                if (dialogueTurns.isNotEmpty()) {
+                    Log.d(TAG, "Language switch $lastDialogueLanguage → $newLanguage — clearing dialogue history")
+                    dialogueTurns.clear()
+                }
+            }
+        }
+        lastDialogueLanguage = newLanguage
+
         // Switch TTS voice to match detected language.
         // mirrorDetectedLocale normalizes ISO 639-3 STT codes (zlm→ms-MY,
         // cmn→zh) and enforces the unknown→English fallback — the raw
@@ -2348,6 +2376,7 @@ class VyzeCoreController(
             dialogueTurns.addLast(q to a)
         }
         lastDialogueAt = System.currentTimeMillis()
+        lastDialogueLanguage = activeUserLocale.language
     }
 
     /**
@@ -2356,6 +2385,10 @@ class VyzeCoreController(
      */
     private fun dialogueContextForPrompt(): String? {
         if (!conversationWindowOpen) return null
+        // Belt-and-braces: never inject history whose language differs from
+        // the CURRENT turn — setUserLocale clears on the switch, but a race
+        // (locale set while a turn was being recorded) could leave residue.
+        if (lastDialogueLanguage != null && lastDialogueLanguage != activeUserLocale.language) return null
         synchronized(dialogueLock) {
             if (dialogueTurns.isEmpty()) return null
             // TTL expiry: silence longer than DIALOGUE_TTL_MS invalidates context —
