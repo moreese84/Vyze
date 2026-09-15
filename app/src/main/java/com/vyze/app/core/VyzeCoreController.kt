@@ -194,7 +194,9 @@ class VyzeCoreController(
     // streaming flush never found a boundary and a Chinese answer was only
     // spoken after the whole generation finished (or stalled entirely on long
     // answers), which users perceived as "no response" for Chinese queries.
-    private val SENTENCE_TERMINATORS = charArrayOf('.', '!', '?', '\n', '。', '！', '？', '；')
+    // Streaming FIX: ASCII ';' added as a strong clause delimiter — flushes
+    // may cut on it just like a sentence end. Commas stay INSIDE the sentence.
+    private val SENTENCE_TERMINATORS = charArrayOf('.', '!', '?', ';', '\n', '。', '！', '？', '；')
 
     /** True while the CURRENT flush is a mid-sentence fast-start fragment. */
     @Volatile
@@ -568,14 +570,17 @@ class VyzeCoreController(
             .trim()
 
         // Enforce trailing punctuation — Android TTS clips phonemes on
-        // unpunctuated final words. Append '.' if missing. A trailing ',' is
-        // kept as-is: it is already punctuation (anti-clipping satisfied), and
-        // it marks a fast-start mid-sentence fragment whose continuation must
-        // flow — stamping a period there would force full-stop intonation and
-        // a dead-air seam into the middle of a sentence.
+        // unpunctuated final words. Append '.' if missing. A trailing ',' or
+        // ';' is kept as-is: it is already punctuation (anti-clipping
+        // satisfied), and a ',' additionally marks a fast-start mid-sentence
+        // fragment whose continuation must flow — stamping a period there
+        // would force full-stop intonation and a dead-air seam into the
+        // middle of a sentence.
         if (cleaned.isNotEmpty()) {
             val lastChar = cleaned.last()
-            if (lastChar != '.' && lastChar != '!' && lastChar != '?' && lastChar != ',') {
+            if (lastChar != '.' && lastChar != '!' && lastChar != '?' &&
+                lastChar != ',' && lastChar != ';'
+            ) {
                 cleaned = "$cleaned."
             }
         }
@@ -636,26 +641,40 @@ class VyzeCoreController(
                 cut = text.length - 1
             }
 
-            // ── FIRST-UTTERANCE FAST START ────────────────────────
-            // ONLY for the very first flush: if the model is still mid-sentence
-            // but has already emitted a long-enough lead-in (dense descriptions
-            // often run 60+ chars before the first period), speak the
-            // word-aligned prefix immediately instead of making the user wait
-            // for the entire first sentence. This moves first speech forward by
-            // ~1s at the cost of ONE brief mid-sentence pause at the very
-            // start. Every later flush stays strictly sentence-boundary, so the
-            // "A red can…" choppiness cannot come back.
+            // ── FIRST-UTTERANCE BUFFER THRESHOLD ──────────────────
+            // ONLY for the very first flush: hold the buffer until EITHER a
+            // sentence terminator arrives (handled above) OR the accumulated
+            // text reaches the first-utterance threshold — FAST_START_CHARS
+            // (~30) chars AND FIRST_FLUSH_MIN_WORDS (5) complete words — then
+            // speak the word-aligned prefix. This guarantees 1-3 word
+            // micro-fragments ("this is", "a", "a set") can NEVER reach
+            // tts.speak(): the word count is checked on the candidate being
+            // flushed, so an incomplete trailing word cannot sneak through
+            // either. Every later flush stays strictly on sentence /
+            // strong-clause boundaries, so the "A red can…" choppiness cannot
+            // come back.
             if (cut < 0 && !firstChunkSent && text.length >= FAST_START_CHARS) {
-                val spaceIdx = text.lastIndexOf(' ', FAST_START_CHARS - 1)
-                if (spaceIdx >= FAST_START_MIN_CHARS) {
-                    cut = spaceIdx
-                    // Continuity FIX: do NOT let sanitizeForTts stamp a period
-                    // onto this mid-sentence fragment. A period gives the
-                    // continuation full-stop intonation + a dead-air seam
-                    // ("Brown wooden door. …closed, center…"). A comma keeps
-                    // the voice in listing intonation, so the rest of the
-                    // sentence flows as one natural continuation.
-                    fastStartFragment = true
+                val spaceIdx = text.lastIndexOf(' ')
+                // CJK FIX: Chinese/Japanese text is not space-delimited — each
+                // character is a word-equivalent, so count CJK chars toward
+                // the 5-unit minimum (otherwise the first flush would starve
+                // until the read-ahead ceiling and Chinese first audio would
+                // regress to a multi-second silence).
+                if (spaceIdx >= 0 || text.any { it.code in 0x2E80..0x9FFF || it.code in 0x3000..0x303F || it.code in 0xFF00..0xFFEF }) {
+                    val candidate = if (spaceIdx >= 0) text.substring(0, spaceIdx).trim() else text.trim()
+                    val cjkChars = candidate.count { it.code in 0x2E80..0x9FFF || it.code in 0x3000..0x303F || it.code in 0xFF00..0xFFEF }
+                    val wordCount = cjkChars +
+                        candidate.split(Regex("\\s+")).count { it.isNotBlank() && it.all { c -> !(c.code in 0x2E80..0x9FFF || c.code in 0x3000..0x303F || c.code in 0xFF00..0xFFEF) } }
+                    if (wordCount >= FIRST_FLUSH_MIN_WORDS && candidate.length >= minFlushChars) {
+                        cut = if (spaceIdx >= 0) spaceIdx else text.length
+                        // Continuity FIX: do NOT let sanitizeForTts stamp a period
+                        // onto this mid-sentence fragment. A period gives the
+                        // continuation full-stop intonation + a dead-air seam
+                        // ("Brown wooden door. …closed, center…"). A comma keeps
+                        // the voice in listing intonation, so the rest of the
+                        // sentence flows as one natural continuation.
+                        fastStartFragment = true
+                    }
                 }
             }
             if (cut < 0) {
@@ -683,14 +702,22 @@ class VyzeCoreController(
                 return // previous utterance still synthesizing — keep merging
             }
 
-            val cutEnd = cut + 1
+            // Whitespace FIX: word-aligned (fast-start) cuts at the space
+            // index EXCLUDE the trailing space, so no stray space lands
+            // before the continuation comma ("object ," → "object,").
+            // Sentence-boundary cuts include the terminator itself (cut + 1).
+            val cutEnd = if (fastStartFragment) cut else cut + 1
             chunk = sanitizeForTts(
                 text.substring(0, cutEnd) + if (fastStartFragment) "," else ""
             )
             fastStartFragment = false
 
             sentenceBuffer.delete(0, cut + 1)
-            while (sentenceBuffer.isNotEmpty() && sentenceBuffer[0] == ' ') {
+            // Whitespace FIX: strip ALL leading whitespace artifacts (spaces,
+            // newlines, tabs) from the remainder before it seeds the next
+            // utterance — a stale separator reaching speak() surfaced as
+            // micro-pauses between queued audio chunks.
+            while (sentenceBuffer.isNotEmpty() && sentenceBuffer[0].isWhitespace()) {
                 sentenceBuffer.deleteCharAt(0)
             }
         }
@@ -2440,16 +2467,16 @@ class VyzeCoreController(
         private const val MAX_FLUSH_READ_AHEAD_CHARS = 200
 
         /**
-         * Fast-start: speak the first word-aligned fragment once the lead-in
-         * reaches this many characters (before the first sentence ends), so
-         * first speech begins sooner. Must be long enough that the fragment
-         * reads naturally as an opening clause. Lowered from 44 to 30 so
-         * first audio arrives ~300-500ms sooner — the brief mid-sentence
-         * pause is a worthwhile tradeoff for blind users who hear silence.
+         * First-utterance buffer threshold (chars): the very first flush may
+         * leave the buffer mid-sentence only once at least this many chars
+         * AND FIRST_FLUSH_MIN_WORDS words have accumulated. Everything below
+         * the threshold is held until a sentence terminator arrives (or the
+         * read-ahead ceiling trips) — 1-3 word micro-fragments ("this is",
+         * "a", "a set") can never reach tts.speak().
          */
         private const val FAST_START_CHARS = 30
-        /** Minimum length of the fast-start fragment (avoids "Yes."-style clips). */
-        private const val FAST_START_MIN_CHARS = 18
+        /** First-utterance buffer threshold (words) — see FAST_START_CHARS. */
+        private const val FIRST_FLUSH_MIN_WORDS = 5
 
         // ── Dynamic Resolution Constants ──────────────────────────
 
