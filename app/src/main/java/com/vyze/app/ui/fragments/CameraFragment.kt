@@ -1188,11 +1188,11 @@ class CameraFragment : Fragment() {
         // hasPendingSpeech() returns true iff pendingUtteranceIds is non-empty.
         // Each speak() call adds an ID; onDone/onError removes it.
         //
-        // The final utterance in the queue includes a silent tail padding
-        // (via TTSManager.playSilentUtterance) that keeps hasPendingSpeech()
-        // true until the hardware AudioTrack buffer is fully drained.
+        // NOTE: there is no silent tail utterance under the platform engine
+        // (the old playSilentUtterance is removed). The grace period below is
+        // what covers the hardware AudioTrack drain after the last onDone.
         //
-        // After hasPendingSpeech() == false, an additional 400ms grace
+        // After hasPendingSpeech() == false, an additional 600ms grace
         // period ensures the speaker has finished emitting the last
         // audible phoneme before we release audio focus and restart mic.
         val checkRunnable = object : Runnable {
@@ -1200,8 +1200,8 @@ class CameraFragment : Fragment() {
                 if (ttsManager.hasPendingSpeech()) {
                     mainHandler.postDelayed(this, 150L)
                 } else {
-                    // All utterances (including silent tail) have completed.
-                    // Add a final 400ms grace for AudioTrack hardware drain.
+                    // All utterances have completed.
+                    // Add a final 600ms grace for AudioTrack hardware drain.
                     // Audio focus stays held for the entire session — only released on app destroy.
                     mainHandler.postDelayed({
                         onDone()

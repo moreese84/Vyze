@@ -20,6 +20,12 @@ import java.nio.ByteOrder
  * fails in a noisy room, capture a short clip here and hand the bytes to
  * [VlmEngineManager.transcribeAudio] so the model itself does the speech
  * recognition — fully offline, no Google services.
+ *
+ * Phase 3 (suspect-transcript audio replay): the LAST capture is also
+ * retained in [lastCapture] so a transcript that came back as wrong-language
+ * garble can be re-transcribed offline by Gemma's language-agnostic audio
+ * encoder WITHOUT asking the user to repeat. The retention is best-effort —
+ * a null/stale value simply disables the replay path.
  */
 object AudioCapture {
 
@@ -30,6 +36,20 @@ object AudioCapture {
 
     /** Max clip length — Gemma caps audio input at 30s; short queries need ~6-8s. */
     const val MAX_DURATION_MS = 8000L
+
+    /**
+     * Most recent successful capture, retained for the suspect-transcript
+     * replay path. Cleared in [clearLastCapture] when a fresh session starts.
+     * Volatile: written on the ASR coroutine (IO), read on the main thread.
+     */
+    @Volatile
+    var lastCapture: ByteArray? = null
+        private set
+
+    /** Drop the retained capture (new voice session — stale audio is useless). */
+    fun clearLastCapture() {
+        lastCapture = null
+    }
 
     /** Stop early when this much near-silence has elapsed (user finished speaking). */
     private const val SILENCE_TIMEOUT_MS = 1200L
@@ -144,6 +164,7 @@ object AudioCapture {
                 Log.w(TAG, "Capture too short (${bytes.size} bytes) — discarding")
                 return null
             }
+            lastCapture = bytes  // retained for the suspect-transcript replay
             return bytes
 
         } catch (e: Throwable) {

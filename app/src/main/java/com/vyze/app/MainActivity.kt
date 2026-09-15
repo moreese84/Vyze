@@ -17,7 +17,7 @@ import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
-import android.speech.tts.UtteranceProgressListener
+import android.text.TextUtils
 import android.util.Log
 import android.widget.ScrollView
 import android.widget.TextView
@@ -415,6 +415,16 @@ class MainActivity : AppCompatActivity() {
     /**
      * Speak text and invoke a callback when TTS finishes.
      * Used to speak VLM output. Does NOT restart listening — returns to IDLE.
+     *
+     * Phase 1 FIX (listener-overwrite race): this used to REPLACE the
+     * engine-global UtteranceProgressListener on every call. The platform
+     * engine has exactly one listener slot, so when two speech flows
+     * overlapped (answer streaming + a follow-up cue), the first flow's
+     * utterances delivered their onDone to the SECOND flow's listener —
+     * firing the wrong flow's callback: premature IDLE, the mic reopened
+     * mid-answer, and the recognizer captured the answer's tail as a
+     * phantom query. Callbacks now register per-utterance inside TTSManager
+     * and can never cross-deliver.
      */
     fun speakThenCallback(text: String, onDone: () -> Unit) {
         if (!ttsReady || text.isBlank()) {
@@ -422,40 +432,27 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // Barge-in: stop any current speech first
+        // Barge-in: stop any current speech first. The flushed utterances
+        // report onError to their OWN registered callbacks — each waiting
+        // flow resumes independently.
         ttsManager.stop()
 
-        ttsManager.speak(text, TextToSpeech.QUEUE_FLUSH)
-
-        // ADDITIVE listener: setOnUtteranceProgressListener wraps the caller's
-        // listener around the global pendingUtteranceIds listener — both fire.
-        // The global listener maintains hasPendingSpeech() accuracy.
-        try {
-            ttsManager.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                override fun onStart(utteranceId: String?) {
-                    Log.d(TAG, "TTS onStart: $utteranceId")
-                }
-
-                override fun onDone(utteranceId: String?) {
-                    Log.d(TAG, "TTS onDone: $utteranceId — going to IDLE")
-                    runOnUiThread { onDone() }
-                }
-
-                @Deprecated("Deprecated in Java")
-                override fun onError(utteranceId: String?) {
-                    Log.w(TAG, "TTS onError: $utteranceId")
-                    runOnUiThread { onDone() }
-                }
-
-                override fun onError(utteranceId: String?, errorCode: Int) {
-                    Log.w(TAG, "TTS onError: $utteranceId code=$errorCode")
-                    runOnUiThread { onDone() }
-                }
-            })
-        } catch (e: Throwable) {
-            Log.w(TAG, "Could not set UtteranceProgressListener: ${e.message}")
-            mainHandler.postDelayed({ onDone() }, 500L)
+        // One-shot guard: onDone and onError must fire exactly once, even if
+        // the engine sends both terminal events.
+        var fired = false
+        val deliver: () -> Unit = {
+            if (!fired) {
+                fired = true
+                runOnUiThread { onDone() }
+            }
         }
+        val accepted = ttsManager.speak(
+            text,
+            TextToSpeech.QUEUE_FLUSH,
+            onDone = deliver,
+            onError = deliver
+        )
+        Log.d(TAG, "speakThenCallback: submission ${if (accepted) "OK" else "REJECTED (onDone already delivered)"}")
     }
 
     /**
@@ -696,6 +693,73 @@ class MainActivity : AppCompatActivity() {
         return true
     }
 
+    /**
+     * SUSPECT-TRANSCRIPT AUDIO REPLAY (Phase 3, attempt 2).
+     *
+     * The recognizer produced a suspect transcript (wrong-language garble)
+     * and the one re-listen failed or is not available. The session's
+     * captured PCM (retained by [AudioCapture]) is sent to Gemma 4 E2B's
+     * NATIVE audio encoder — language-agnostic, fully offline — so the user
+     * does NOT have to repeat. On success the transcription is delivered
+     * exactly like a model-ASR rescue result. Returns true when the replay
+     * is running (caller must not end the session).
+     */
+    private fun attemptSuspectAudioReplay(): Boolean {
+        val core = (application as? VyzeApplication)?.coreController
+        val audio = AudioCapture.lastCapture
+        if (core == null || !core.isEngineReady() || core.isCurrentlyInferring()) {
+            Log.d(TAG, "Suspect audio replay unavailable (core=${core != null}, " +
+                "ready=${core?.isEngineReady()}, inferring=${core?.isCurrentlyInferring()})")
+            return false
+        }
+        if (audio == null) {
+            Log.d(TAG, "Suspect audio replay: no retained capture — skipping")
+            return false
+        }
+        Log.i(TAG, "Suspect audio replay: transcribing ${audio.size} bytes offline (Gemma audio encoder)")
+        CrashLogFile.log(TAG, "SUSPECT AUDIO REPLAY: ${audio.size} bytes")
+        asrScope.launch {
+            try {
+                // The engine runs one native generation at a time — a tap
+                // analysis may have started since; also honor session aborts.
+                if (!voiceSessionWanted) {
+                    Log.d(TAG, "Suspect audio replay: session aborted — dropping")
+                    return@launch
+                }
+                if (core.isCurrentlyInferring()) {
+                    Log.d(TAG, "Suspect audio replay: inference started — aborting replay")
+                    finishRescueWithError("No speech detected.")
+                    return@launch
+                }
+                val transcription = core.transcribeAudio(audio)?.trim()
+                if (transcription.isNullOrBlank()) {
+                    Log.w(TAG, "Suspect audio replay: nothing understood")
+                    finishRescueWithError("No speech detected.")
+                    return@launch
+                }
+                Log.i(TAG, "Suspect audio replay transcription: \"$transcription\"")
+                CrashLogFile.log(TAG, "SUSPECT AUDIO REPLAY result: \"$transcription\"")
+                runOnUiThread {
+                    if (!voiceSessionWanted) {
+                        Log.d(TAG, "Suspect audio replay result after session aborted — dropping")
+                        return@runOnUiThread
+                    }
+                    pendingSuspectTranscript = null
+                    localeFallbackIndex = 0
+                    val replayLocale = detectLocaleFromText(transcription)
+                    lastDetectedLocale = replayLocale
+                    // Confidence 0: never chain a confirmation ask on top of
+                    // the retries the transcript already went through.
+                    onSpeechResult?.invoke(transcription, replayLocale, 0f)
+                }
+            } catch (e: Throwable) {
+                Log.e(TAG, "Suspect audio replay crashed: ${e.message}")
+                finishRescueWithError("No speech detected.")
+            }
+        }
+        return true
+    }
+
     /** Fall through to the original speech error after a failed rescue. */
     private fun finishRescueWithError(originalError: String) {
         runOnUiThread {
@@ -830,7 +894,8 @@ class MainActivity : AppCompatActivity() {
             "sudah", "sedang", "akan", "baru", "lagi",        // tense/aspect
             "boleh", "mahu", "nak", "perlu", "mesti",         // modals
             "ini", "apa", "siapa", "mana", "kenapa",          // question words
-            "bila", "berapa", "mengapa"
+            "bila", "berapa", "mengapa",
+            "ada", "depan", "belakang"                        // Phase 3: short-query coverage
         )
         for (word in words) {
             val cleaned = word.replace(Regex("[^a-z]"), "")
@@ -1087,6 +1152,70 @@ class MainActivity : AppCompatActivity() {
         return stored.takeIf { it.language == "ms" || it.language == "zh" }
     }
 
+    // ── Transcript plausibility helpers (Phase 3) ─────────────────
+
+    /**
+     * Strong textual evidence of Malay that the main detector missed: any
+     * STRONG_MALAY_RESCUE_WORDS token surviving word-boundary cleanup.
+     * Returns true even for a single word ("apa" alone).
+     */
+    private fun hasStrongMalaySignal(text: String): Boolean {
+        val words = text.lowercase().split(Regex("\\s+"))
+            .map { w -> w.replace(Regex("[^a-z]"), "") }
+            .filter { it.isNotEmpty() }
+        if (words.isEmpty()) return false
+        return words.any { it in STRONG_MALAY_RESCUE_WORDS }
+    }
+
+    /**
+     * PLAUSIBILITY GATE (Phase 3 — garble detection).
+     *
+     * True when the transcript looks like wrong-language force-translation:
+     * the text detector found no ms/zh evidence, and the "English" transcript
+     * itself is implausible — a short run of word-like chunks with no English
+     * function-word skeleton ("any uppa", "inni apa"). Every real English
+     * question carries at least one function word (what/where/this/the/is...);
+     * phonetic garble usually does not. Applies ONLY to Latin transcripts —
+     * CJK output can only come from a genuinely Chinese acoustic model.
+     */
+    private fun isImplausibleEnglishTranscript(text: String): Boolean {
+        if (hasCjkCharacters(text)) return false
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) return false
+        val words = trimmed.lowercase().split(Regex("\\s+"))
+            .map { w -> w.replace(Regex("[^a-z]"), "") }
+            .filter { it.isNotEmpty() }
+        if (words.isEmpty()) return false
+        // Garble is rarely > 6 words: force-translation of a short Malay
+        // query produces 1-4 word-like chunks.
+        if (words.size > 6) return false
+        return words.none { it in ENGLISH_FUNCTION_WORDS }
+    }
+
+    /**
+     * True when the recognizer claimed ms/zh in its results bundle (many
+     * devices omit the bundle entirely — a missing bundle is NOT English
+     * evidence).
+     */
+    private fun bundleClaimsMsZh(detectedLang: String?): Boolean {
+        if (detectedLang.isNullOrBlank()) return false
+        val language = try {
+            java.util.Locale.forLanguageTag(detectedLang).language
+        } catch (e: Throwable) {
+            return false
+        }
+        return language == "ms" || language == "zh"
+    }
+
+    /**
+     * The ms/zh locale the user most recently SPOKE successfully (normal
+     * results, model-ASR rescue, or a suspect retry). Used to order the
+     * NO_MATCH ladder and to protect mirrored TTS voices when a garbled
+     * transcript would otherwise re-pin the session to en_US.
+     */
+    private fun lastSpokenMsZhLocale(): java.util.Locale? =
+        lastDetectedLocale?.takeIf { it.language == "ms" || it.language == "zh" }
+
     // ── Internal Listening ────────────────────────────────────────
 
     /**
@@ -1099,6 +1228,10 @@ class MainActivity : AppCompatActivity() {
             asrFallbackTried = false
             suspectLadderRetries = 0
             pendingSuspectTranscript = null
+            // Stale audio from a previous session is useless for the
+            // suspect-transcript replay — drop it here, BEFORE the
+            // recognizer writes a fresh capture.
+            AudioCapture.clearLastCapture()
 
             // Barge-in: stop TTS before opening the microphone
             if (ttsReady && ttsManager.isSpeaking()) {
@@ -1189,13 +1322,19 @@ class MainActivity : AppCompatActivity() {
                 putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
                 putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
 
+                // VAD FIX (Phase 3): the previous 300/400ms thresholds are
+                // tuned for fast English — final Malay consonants ("apa" →
+                // "ap") and short Chinese syllables were clipped, then the
+                // session ended before the query completed. 600/800ms keeps
+                // the session open long enough for short non-English queries
+                // while the follow-up window watchdog still bounds latency.
                 putExtra(
                     RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS,
-                    400L
+                    800L
                 )
                 putExtra(
                     RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS,
-                    300L
+                    600L
                 )
                 putExtra(
                     RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS,
@@ -1272,6 +1411,13 @@ class MainActivity : AppCompatActivity() {
                 // NO_MATCH ladder does not chain more silent retries on top.
                 val originalTranscript = pendingSuspectTranscript
                 if (originalTranscript != null) {
+                    // Attempt 2 available? Replay the captured PCM offline
+                    // before giving up — no user re-listen needed.
+                    if (suspectLadderRetries < SUSPECT_LADDER_MAX_RETRIES &&
+                        attemptSuspectAudioReplay()
+                    ) {
+                        return
+                    }
                     pendingSuspectTranscript = null
                     localeFallbackIndex = 0
                     Log.i(TAG, "Suspect retry failed (error=$error) — accepting original transcript")
@@ -1464,29 +1610,48 @@ class MainActivity : AppCompatActivity() {
                 // success-with-wrong-language that the NO_MATCH ladder never
                 // sees (verified on device: setUserLocale pinned en_US for
                 // every language). Detection signal: no ms/zh evidence in
-                // the text AND recognizer confidence below threshold (the
-                // chatter filter already dropped < 0.35, so the live band is
-                // the mediocre-confidence range where wrong-language garble
-                // typically lands; intact ms/zh text is exempt — genuine
-                // ms/zh transcripts score low by nature and are handled by
-                // the text detector, not this path). Retry the session
-                // pinned to the ladder's next language — ONCE, bounded.
-                if (suspectLadderRetries < SUSPECT_LADDER_MAX_RETRIES &&
-                    localeFallbackIndex < FALLBACK_RECOGNITION_LOCALES.size
+                // the text AND (recognizer confidence below threshold OR an
+                // implausible English transcript — see the Phase 3 rework
+                // below). Intact ms/zh text is exempt — genuine ms/zh
+                // transcripts score low by nature and are handled by the
+                // text detector, not this path.
+                val conf = confidence?.firstOrNull()
+                val textSaysMsZh = finalLocale.language == "ms" || finalLocale.language == "zh"
+                val lowConfidence = conf != null && conf < SUSPECT_TRANSCRIPT_CONFIDENCE
+
+                // (R0) strong Malay signal inside a failed detection - no
+                // retry needed, the transcript carries the language itself.
+                if (!textSaysMsZh && hasStrongMalaySignal(bestMatch)) {
+                    Log.i(TAG, "Malay rescue words in transcript \"$bestMatch\" - delivering as ms-MY (conf=$conf)")
+                    CrashLogFile.log(TAG, "MS RESCUE: strong Malay tokens in transcript")
+                    lastDetectedLocale = java.util.Locale("ms", "MY")
+                    onSpeechResult?.invoke(bestMatch, lastDetectedLocale, conf ?: 1f)
+                    return
+                }
+
+                // (R1)/(R2) trigger: no ms/zh evidence AND (low confidence OR
+                // an implausible English transcript).
+                val implausible = isImplausibleEnglishTranscript(bestMatch)
+                if (!textSaysMsZh && !bundleClaimsMsZh(detectedLang) &&
+                    (lowConfidence || implausible) &&
+                    suspectLadderRetries < SUSPECT_LADDER_MAX_RETRIES
                 ) {
-                    val conf = confidence?.firstOrNull()
-                    val textSaysMsZh = finalLocale.language == "ms" || finalLocale.language == "zh"
-                    val lowConfidence = conf != null && conf < SUSPECT_TRANSCRIPT_CONFIDENCE
-                    if (!textSaysMsZh && lowConfidence) {
+                    // Attempt 1: re-listen pinned to the ladder's next
+                    // language. Attempt 2: offline audio replay - no user
+                    // re-listen, so the ladder index stops gating here.
+                    val useReplay = suspectLadderRetries >= 1
+                    if (!useReplay && localeFallbackIndex < FALLBACK_RECOGNITION_LOCALES.size) {
                         // Order the retry at the last successfully SPOKEN
-                        // language when known (same heuristic as the NO_MATCH
-                        // ladder), then skip the language the recognizer
-                        // claimed in its bundle (the failed acoustic model).
+                        // language when known, then skip the language the
+                        // recognizer claimed in its bundle (the failed model).
                         if (lastPinnedLocaleTag == null && localeFallbackIndex == 0) {
-                            val idx = FALLBACK_RECOGNITION_LOCALES.indexOfFirst {
-                                it.language == lastDetectedLocale?.language
+                            val spokenMsZh = lastSpokenMsZhLocale()
+                            if (spokenMsZh != null) {
+                                val idx = FALLBACK_RECOGNITION_LOCALES.indexOfFirst {
+                                    it.language == spokenMsZh.language
+                                }
+                                if (idx > 0) localeFallbackIndex = idx
                             }
-                            if (idx > 0) localeFallbackIndex = idx
                         }
                         if (!detectedLang.isNullOrBlank() &&
                             FALLBACK_RECOGNITION_LOCALES[localeFallbackIndex]
@@ -1498,14 +1663,36 @@ class MainActivity : AppCompatActivity() {
                             val nextLocale = FALLBACK_RECOGNITION_LOCALES[localeFallbackIndex]
                             suspectLadderRetries++
                             pendingSuspectTranscript = bestMatch
-                            Log.i(TAG, "Suspect transcript (conf=$conf, no ms/zh signal) — ladder retry as ${nextLocale.toLanguageTag()} (attempt $suspectLadderRetries)")
-                            CrashLogFile.log(TAG, "SUSPECT LADDER RETRY: recognition → ${nextLocale.toLanguageTag()}")
+                            Log.i(TAG, "Suspect transcript (conf=$conf${if (implausible) ", implausible" else ""}) - ladder retry as ${nextLocale.toLanguageTag()} (attempt $suspectLadderRetries)")
+                            CrashLogFile.log(TAG, "SUSPECT LADDER RETRY: recognition -> ${nextLocale.toLanguageTag()}")
                             isListening = false
                             speechRecognizer?.cancel()
                             startListeningAfterTtsStop()
                             return
                         }
+                    } else if (useReplay) {
+                        // (R2) offline audio replay via Gemma's encoder.
+                        suspectLadderRetries++
+                        pendingSuspectTranscript = bestMatch
+                        if (attemptSuspectAudioReplay()) return
+                        // Replay unavailable - fall through and deliver the
+                        // original transcript below.
                     }
+                }
+
+                // Delivery with LOCALE PROTECTION: a garbled transcript must
+                // not re-pin the mirrored ms/zh TTS voice to en_US. If this
+                // session failed detection (no ms/zh evidence, suspect signals
+                // present) but a ms/zh locale was spoken earlier in the
+                // conversation, hand THAT locale onward instead of en_US.
+                val deliverLocale = if (!textSaysMsZh && (lowConfidence || implausible)) {
+                    lastSpokenMsZhLocale() ?: finalLocale
+                } else {
+                    finalLocale
+                }
+                if (deliverLocale != finalLocale) {
+                    Log.i(TAG, "Locale protection: garbled transcript keeps last spoken ms/zh locale $deliverLocale (bundle=$detectedLang)")
+                    lastDetectedLocale = deliverLocale
                 }
 
                 Log.i(TAG, "onResults: \"$bestMatch\" lang=$finalLocale (bundle=$detectedLang)")
@@ -1545,11 +1732,54 @@ class MainActivity : AppCompatActivity() {
 
         /**
          * Max suspect-transcript ladder retries per voice session — capped
-         * at 1 so worst-case latency is one silent re-listen (plus the
-         * engine's no-speech timeout) before the original transcript is
-         * delivered as-is.
+         * at 2: attempt 1 re-listens pinned to the ladder's next language,
+         * attempt 2 replays the captured PCM through Gemma's offline audio
+         * encoder (language-agnostic, no user re-listen). Worst case is one
+         * silent re-listen plus one offline transcription before the
+         * original transcript is delivered as-is.
          */
-        private const val SUSPECT_LADDER_MAX_RETRIES = 1
+        private const val SUSPECT_LADDER_MAX_RETRIES = 2
+
+        /**
+         * PLAUSIBILITY GATE (Phase 3): recognizer confidence below this —
+         * when the text detector finds no ms/zh evidence — is treated as
+         * probable wrong-language garble even though the transcript "looks
+         * like English". The en-US acoustic model force-translates Malay
+         * phonemes into PLAUSIBLE English words at HIGH confidence, which is
+         * exactly why the previous 0.5 threshold never fired on device:
+         * "ini apa?" became fluent-ish English scoring 0.6-0.9. The band
+         * 0.5-0.65 is where force-translated garble lands most often;
+         * genuine quiet-room English speech scores above it.
+         */
+        private const val PLAUSIBLE_TRANSCRIPT_CONFIDENCE = 0.65f
+
+        /**
+         * Malay function words strong enough to rescue a garbled-looking
+         * transcript WITHOUT a re-listen. If the transcript itself contains
+         * any of these (the recognizer can transliterate "apa" → "aba",
+         * "ini" → "any", etc.), the query is real Malay that the text
+         * detector's 2-point threshold missed — deliver it with the ms-MY
+         * locale instead of running the ladder.
+         */
+        private val STRONG_MALAY_RESCUE_WORDS = setOf(
+            "apa", "ini", "itu", "saya", "ada", "di", "depan",
+            "belakang", "baca", "tolong", "mana", "siapa", "berapa",
+            "apa ini", "ini apa"
+        )
+
+        /**
+         * Function words ANY plausible English sentence uses (the, is, what,
+         * where, this, ...). The garble plausibility test requires the
+         * transcript to contain at least one of these — real questions do;
+         * force-translated Malay phonemes ("any uppa", "inni apa") rarely do.
+         */
+        private val ENGLISH_FUNCTION_WORDS = setOf(
+            "the", "is", "are", "what", "where", "when", "who", "how",
+            "why", "this", "that", "there", "here", "can", "you", "i",
+            "me", "my", "in", "on", "at", "of", "for", "and", "a", "an",
+            "do", "does", "please", "read", "look", "see", "tell", "show",
+            "front", "behind", "left", "right", "now", "time"
+        )
 
         /**
          * Recognizer confidence below which a transcript with no ms/zh

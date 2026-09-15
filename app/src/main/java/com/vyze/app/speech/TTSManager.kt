@@ -45,8 +45,11 @@ import java.util.concurrent.atomic.AtomicLong
  * ## State Events
  * [UtteranceProgressListener] callbacks drive:
  *  - [pendingUtteranceIds] — deterministic hasPendingSpeech() tracking.
- *  - [callerListener] — the app-wide progress listener (onStart/onDone/onError),
- *    the same contract used since the first Google-TTS era.
+ *  - [utteranceCallbacks] — the per-utterance callback registry: every speak()
+ *    call registers its own onStart/onDone/onError against its utterance ID,
+ *    and the single engine-global listener dispatches each event to exactly
+ *    the flow that owns that utterance. Overlapping speech flows (answer
+ *    streaming + a follow-up cue) can never cross-deliver callbacks again.
  *
  * ## Audio Focus
  * Requests AUDIOFOCUS_GAIN (permanent) for the entire app session.
@@ -114,18 +117,34 @@ class TTSManager private constructor(context: Context) {
     var onReady: (() -> Unit)? = null
 
     /**
-     * Caller-supplied progress listener (engine-global): fired for EVERY
-     * utterance start/done, and for error on utterances dropped by
-     * stop()/QUEUE_FLUSH.
+     * Per-utterance callback registry (Phase 1 fix — listener-overwrite race).
+     *
+     * The platform engine supports exactly ONE UtteranceProgressListener per
+     * TextToSpeech instance. The previous design exposed
+     * setOnUtteranceProgressListener() and callers replaced it on every speech
+     * flow — when two flows overlapped (answer streaming + a follow-up cue),
+     * the first flow's utterances delivered their onDone to the SECOND flow's
+     * listener, firing the wrong callback: premature IDLE, mic reopened
+     * mid-answer, and the recognizer captured the answer's tail.
+     *
+     * Now every speak() call registers its callbacks here, keyed by
+     * utteranceId, and the single engine-global listener dispatches each
+     * event to exactly the flow that owns that utterance. Callbacks may fire
+     * on a TTS service thread — hop to the main thread inside them if UI
+     * state is touched.
      */
-    @Volatile
-    private var callerListener: UtteranceProgressListener? = null
+    private class PerUtteranceCallbacks(
+        val onStart: (() -> Unit)?,
+        val onDone: (() -> Unit)?,
+        val onError: (() -> Unit)?
+    )
+
+    private val utteranceCallbacks = ConcurrentHashMap<String, PerUtteranceCallbacks>()
 
     /**
      * Additive, engine-global callback fired ONLY for utterances that played
      * to completion — never for speech flushed by stop()/QUEUE_FLUSH (those
-     * are reported as onError instead). Unlike [setOnUtteranceProgressListener]
-     * this does not replace the caller listener; multiple concerns can observe
+     * are reported as onError instead). Multiple concerns can observe
      * completion independently. Used by the preference learner.
      */
     var onUtteranceCompleted: ((utteranceId: String) -> Unit)? = null
@@ -242,9 +261,10 @@ class TTSManager private constructor(context: Context) {
      * TTS engine service is bound.
      *
      * Handles SUCCESS, LANG_MISSING_DATA, and LANG_NOT_SUPPORTED, defaulting
-     * to [Locale.US]. On success: restore persisted settings, apply the
-     * engine-global [UtteranceProgressListener], drain the speech buffer,
-     * and start the drain-retry timer.
+     * to [Locale.US]. On success: restore persisted settings, install the
+     * engine-global UtteranceProgressListener (the single listener routes
+     * every event to its per-utterance registered callbacks), drain the
+     * speech buffer, and start the drain-retry timer.
      */
     fun onInit(status: Int) {
         engineInitInFlight = false
@@ -383,12 +403,16 @@ class TTSManager private constructor(context: Context) {
             if (engine != null) {
                 val enhanced = prepareForEngine(text)
                 pendingUtteranceIds.add(utteranceId)
-                speakWithEngine(
+                val accepted = speakWithEngine(
                     enhanced, utteranceId,
                     queueMode = TextToSpeech.QUEUE_ADD,
-                    onStart = { onUtteranceStart(utteranceId) },
-                    onDone = { onUtteranceDone(utteranceId) }
+                    onStart = null,
+                    onDone = null,
+                    onError = null
                 )
+                if (!accepted) {
+                    pendingUtteranceIds.remove(utteranceId)  // Phase 1 leak fix
+                }
                 Log.d(TAG, "Drained #$drained (platform, id=$utteranceId): ${text.take(60)}...")
             } else {
                 Log.d(TAG, "drainPendingQueue: engine unavailable — re-queuing: \"${text.take(60)}\"")
@@ -420,12 +444,20 @@ class TTSManager private constructor(context: Context) {
      *                   and reports them as onError); QUEUE_ADD appends.
      * @param utteranceId Optional caller-provided ID (e.g., "session_chunk_3")
      *                    If null, generates one automatically.
+     * @param onStart     Invoked when THIS utterance starts playing (may fire
+     *                    on a TTS service thread).
+     * @param onDone      Invoked when THIS utterance finishes playing.
+     * @param onError     Invoked when THIS utterance fails or is dropped by
+     *                    stop()/QUEUE_FLUSH. Exactly one of onDone/onError fires.
      * @return true if speak() succeeded
      */
     fun speak(
         text: String,
         queueMode: Int = TextToSpeech.QUEUE_ADD,
-        utteranceId: String? = null
+        utteranceId: String? = null,
+        onStart: (() -> Unit)? = null,
+        onDone: (() -> Unit)? = null,
+        onError: (() -> Unit)? = null
     ): Boolean {
         Log.i(TAG, "speak() INVOKED: text='${text.take(100)}', isReady=${isInitialized}, bufferSize=${speechBuffer.size}, pendingIds=${pendingUtteranceIds.size}")
 
@@ -457,13 +489,23 @@ class TTSManager private constructor(context: Context) {
             notifyFlushed()
         }
         val id = utteranceId ?: nextUtteranceId()
+        // Track BEFORE submission — the engine can fire onStart from its binder
+        // thread as soon as tts.speak() lands, before this call returns.
         pendingUtteranceIds.add(id)
         val accepted = speakWithEngine(
             enhancedText, id,
             queueMode = queueMode,
-            onStart = { onUtteranceStart(id) },
-            onDone = { onUtteranceDone(id) }
+            onStart = onStart,
+            onDone = onDone,
+            onError = onError
         )
+        if (!accepted) {
+            // Phase 1 LEAK FIX: a rejected submission never fires terminal
+            // callbacks. The ID used to stay in the set forever, pinning
+            // hasPendingSpeech() true and deadlocking every waitForTtsDrain /
+            // mic-reopen path until the 30s SPEAKING_TIMEOUT force-reset.
+            pendingUtteranceIds.remove(id)
+        }
         Log.d(TAG, "speak() ${if (accepted) "OK" else "REJECTED"} (platform) id=$id queueMode=$queueMode " +
             "pending=${pendingUtteranceIds.size} text=\"${text.take(60)}\"")
         return accepted
@@ -473,7 +515,12 @@ class TTSManager private constructor(context: Context) {
      * Immediate speech for urgent accessibility feedback.
      * Stops current speech, speaks with QUEUE_FLUSH.
      */
-    fun speakImmediate(text: String): Boolean {
+    fun speakImmediate(
+        text: String,
+        onStart: (() -> Unit)? = null,
+        onDone: (() -> Unit)? = null,
+        onError: (() -> Unit)? = null
+    ): Boolean {
         Log.i(TAG, "speakImmediate() INVOKED: text='${text.take(100)}', isReady=${isInitialized}, bufferSize=${speechBuffer.size}, pendingIds=${pendingUtteranceIds.size}")
 
         if (text.isBlank()) {
@@ -508,9 +555,13 @@ class TTSManager private constructor(context: Context) {
         val accepted = speakWithEngine(
             enhancedText, id,
             queueMode = TextToSpeech.QUEUE_FLUSH,
-            onStart = { onUtteranceStart(id) },
-            onDone = { onUtteranceDone(id) }
+            onStart = onStart,
+            onDone = onDone,
+            onError = onError
         )
+        if (!accepted) {
+            pendingUtteranceIds.remove(id)  // Phase 1 leak fix — see speak()
+        }
         Log.d(TAG, "speakImmediate() ${if (accepted) "OK" else "REJECTED"} (platform) id=$id " +
             "pending=${pendingUtteranceIds.size} text=\"${text.take(60)}\"")
         return accepted
@@ -545,7 +596,8 @@ class TTSManager private constructor(context: Context) {
     }
 
     /**
-     * Core engine submission. Returns the platform accept result:
+     * Core engine submission. Registers the per-utterance callbacks and
+     * returns the platform accept result:
      * TextToSpeech.queueSpeak returns SUCCESS(0) or ERROR(-1).
      */
     private fun speakWithEngine(
@@ -553,9 +605,14 @@ class TTSManager private constructor(context: Context) {
         utteranceId: String,
         queueMode: Int,
         onStart: (() -> Unit)?,
-        onDone: (() -> Unit)?
+        onDone: (() -> Unit)?,
+        onError: (() -> Unit)?
     ): Boolean {
-        val tts = engine ?: return false
+        val tts = engine
+        if (tts == null) {
+            try { onError?.invoke() } catch (_: Throwable) {}
+            return false
+        }
         return try {
             // Critical-info pacing: money amounts and medication doses are
             // safety-critical for a blind user — spoken ~15% slower so the
@@ -580,22 +637,24 @@ class TTSManager private constructor(context: Context) {
             val params = Bundle().apply {
                 putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, cachedVolume)
             }
-            // The engine-global listener receives onStart/onDone via
-            // UtteranceProgressListener; the per-call lambdas below are kept
-            // for parity with the previous per-utterance callback contract.
-            @Suppress("UNUSED_EXPRESSION")
-            onStart
-            @Suppress("UNUSED_EXPRESSION")
-            onDone
+            // Register BEFORE submission — the engine can fire onStart from
+            // its binder thread as soon as tts.speak() lands.
+            utteranceCallbacks[utteranceId] = PerUtteranceCallbacks(onStart, onDone, onError)
             val result = tts.speak(text, queueMode, params, utteranceId)
             if (result != TextToSpeech.SUCCESS) {
-                // Rejected at submission — the completion callbacks may never
-                // fire, so untrack the critical-rate marker here.
+                // Rejected at submission — no terminal callback will ever fire
+                // from the engine. Untrack everything and report the failure
+                // directly so waiting callers (drain loops, speakThen) are
+                // released instead of hanging.
+                utteranceCallbacks.remove(utteranceId)
                 criticalUtteranceIds.remove(utteranceId)
+                try { onError?.invoke() } catch (_: Throwable) {}
             }
             result == TextToSpeech.SUCCESS
         } catch (e: Throwable) {
+            utteranceCallbacks.remove(utteranceId)
             Log.e(TAG, "speakWithEngine failed: ${e.javaClass.simpleName}: ${e.message}")
+            try { onError?.invoke() } catch (_: Throwable) {}
             false
         }
     }
@@ -622,11 +681,10 @@ class TTSManager private constructor(context: Context) {
 
     // ── Utterance Event Forwarding ────────────────────────────────
 
-    // The listener is CAPTURED when the event happens, not when the posted
-    // runnable executes: speakThenCallback() assigns a fresh listener right
-    // after stop()+speak(), and a captured-at-execution listener would deliver
-    // the OLD utterance's onError to the NEW listener — firing its onDone
-    // before the new utterance even starts.
+    // Events are dispatched to the per-utterance callbacks captured in
+    // [utteranceCallbacks] at speak() time — each utterance's terminal event
+    // can only ever reach the flow that submitted it (the Phase 1 fix for
+    // the engine-global listener-overwrite race).
 
     /** Utterance IDs currently playing at the slowed critical-info rate. */
     private val criticalUtteranceIds = ConcurrentHashMap.newKeySet<String>()
@@ -644,82 +702,74 @@ class TTSManager private constructor(context: Context) {
         }
     }
 
-    /** Utterance started processing — forward to the caller listener. */
+    /** Utterance started processing — dispatch to its registered callbacks. */
     private fun onUtteranceStart(id: String) {
-        val listener = callerListener
-        mainHandler.post { listener?.onStart(id) }
+        try { utteranceCallbacks[id]?.onStart?.invoke() } catch (e: Throwable) {
+            Log.w(TAG, "onUtteranceStart: callback error: ${e.message}")
+        }
     }
 
-    /** Utterance finished playing — untrack and forward. */
+    /** Utterance finished playing — untrack, dispatch, and clean up. */
     private fun onUtteranceDone(id: String) {
         pendingUtteranceIds.remove(id)
         restoreNormalRateAfterCritical(id)
+        val callbacks = utteranceCallbacks.remove(id)
         try { onUtteranceCompleted?.invoke(id) } catch (_: Throwable) {}
-        val listener = callerListener
-        mainHandler.post { listener?.onDone(id) }
+        try { callbacks?.onDone?.invoke() } catch (e: Throwable) {
+            Log.w(TAG, "onUtteranceDone: callback error: ${e.message}")
+        }
     }
 
-    /** Utterance failed (or was flushed) — untrack and forward. */
+    /** Utterance failed (or was flushed) — untrack and dispatch. */
     private fun onUtteranceError(id: String) {
         pendingUtteranceIds.remove(id)
         restoreNormalRateAfterCritical(id)
-        val listener = callerListener
-        mainHandler.post { listener?.onError(id) }
+        val callbacks = utteranceCallbacks.remove(id)
+        try { callbacks?.onError?.invoke() } catch (e: Throwable) {
+            Log.w(TAG, "onUtteranceError: callback error: ${e.message}")
+        }
     }
 
     /**
      * Report currently-pending utterances as errored and untrack them.
      * Mirrors Google TTS, which fires onError for utterances dropped by
      * stop()/QUEUE_FLUSH — callers rely on that to leave their wait state.
+     * Each flushed utterance's OWN registered callbacks are dispatched, so a
+     * barged-in flow always resumes even while another flow is speaking.
      */
     private fun notifyFlushed() {
         val ids = pendingUtteranceIds.toList()
         if (ids.isEmpty()) return
         pendingUtteranceIds.removeAll(ids)
-        val listener = callerListener
-        ids.forEach { id -> mainHandler.post { listener?.onError(id) } }
-    }
-
-    /**
-     * Set a caller-provided UtteranceProgressListener.
-     *
-     * Engine-global: the listener fires for EVERY utterance — onStart when
-     * generation begins, onDone when its audio finishes playing, onError when
-     * it is dropped by stop()/QUEUE_FLUSH. Internal pendingUtteranceIds
-     * tracking is separate and cannot be overwritten by callers.
-     */
-    fun setOnUtteranceProgressListener(listener: UtteranceProgressListener) {
-        callerListener = listener
-        // Apply immediately if the engine is already up — the platform API
-        // supports one listener per instance, so route through the engine.
-        try {
-            engine?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                override fun onStart(utteranceId: String?) {
-                    if (utteranceId != null) onUtteranceStart(utteranceId)
-                }
-
-                override fun onDone(utteranceId: String?) {
-                    if (utteranceId != null) onUtteranceDone(utteranceId)
-                }
-
-                @Deprecated("Deprecated in Java")
-                override fun onError(utteranceId: String?) {
-                    if (utteranceId != null) onUtteranceError(utteranceId)
-                }
-            })
-        } catch (e: Throwable) {
-            Log.w(TAG, "setOnUtteranceProgressListener: engine attach failed — will attach on init", e)
+        ids.forEach { id ->
+            val callbacks = utteranceCallbacks.remove(id)
+            try { callbacks?.onError?.invoke() } catch (_: Throwable) {}
         }
     }
 
     /**
-     * Legacy Google-TTS silent tail. The platform engine handles trailing
-     * silence natively; kept as a harmless no-op for call-site compatibility.
+     * Speak [text] and invoke [onDone] exactly when THIS utterance reaches a
+     * terminal state — onDone (played fully) or onError (failed, or dropped
+     * by stop()/QUEUE_FLUSH from a later barge-in). Never fires for any other
+     * utterance, and never fires twice.
+     *
+     * Replaces the old engine-global listener swap: the platform engine has
+     * ONE listener slot, and callers that replaced it cross-delivered
+     * terminal callbacks between overlapping speech flows — the mid-sentence
+     * follow-up cutoff bug. Returns false when the submission was rejected
+     * (engine unavailable/blank text/debounce) — [onDone] has already been
+     * invoked in that case, so callers can simply proceed.
+     *
+     * The callback fires on a TTS service thread — hop to the main thread
+     * inside the callback if UI state is touched.
      */
-    fun playSilentUtterance(durationMs: Int = 300, queueMode: Int = TextToSpeech.QUEUE_ADD): Boolean {
-        if (!isInitialized) return false
-        Log.d(TAG, "playSilentUtterance: platform engine handles silence natively — no-op")
-        return false
+    fun speakThen(text: String, onDone: () -> Unit): Boolean {
+        return speak(
+            text,
+            TextToSpeech.QUEUE_FLUSH,
+            onDone = onDone,
+            onError = onDone
+        )
     }
 
     /**

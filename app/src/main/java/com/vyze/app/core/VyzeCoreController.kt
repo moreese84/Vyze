@@ -177,6 +177,18 @@ class VyzeCoreController(
     @Volatile
     private var firstChunkSent = false
 
+    /**
+     * Playback-aware batching gate (Phase 2): true once the most recently
+     * posted chunk utterance has STARTED playing — or failed/dropped (never
+     * left false, which would wedge batching). While false, completed
+     * sentences keep accumulating into the pending utterance's successor
+     * instead of being posted as separate QUEUE_ADD utterances, each of which
+     * plays with a 100-300ms inter-utterance hardware seam after it. This is
+     * what collapses most streamed answers to 1-2 seamless utterances.
+     */
+    @Volatile
+    private var currentChunkStarted = false
+
     // Language FIX: added full-width CJK sentence punctuation (。！？；) —
     // Gemma ends Chinese answers with these, not ASCII dots. Without them the
     // streaming flush never found a boundary and a Chinese answer was only
@@ -184,18 +196,9 @@ class VyzeCoreController(
     // answers), which users perceived as "no response" for Chinese queries.
     private val SENTENCE_TERMINATORS = charArrayOf('.', '!', '?', '\n', '。', '！', '？', '；')
 
-    private var flushCountersSent = 0
-
     /** True while the CURRENT flush is a mid-sentence fast-start fragment. */
     @Volatile
     private var fastStartFragment = false
-
-    /** Chars accumulated before a post-first coalesced flush may fire. */
-    // Pause FIX: 110 held most ≤2-sentence persona answers (~90-130 chars)
-    // hostage between this and the 200-char ceiling — a 0.5-2s silent gap per
-    // mid-answer. 60 ≈ one completed short sentence, so the next utterance
-    // fires at the first natural boundary; long answers still coalesce.
-    private val COALESCED_FLUSH_CHARS = 60
 
     private val minFlushChars = 10
 
@@ -402,7 +405,16 @@ class VyzeCoreController(
                                 isInferring.set(false)
                                 vlmEngine.interrupt()
                                 mainHandler.post {
-                                    onInferenceComplete?.invoke("Not clearly visible.")
+                                    // Phase 4: localized safe fallback — the hardcoded
+                                    // English string played under a Malay/Chinese voice
+                                    // after a language-mirrored answer was aborted.
+                                    onInferenceComplete?.invoke(
+                                        ttsManager.localized(
+                                            "Not clearly visible.",
+                                            "Ia tidak jelas kelihatan.",
+                                            "看不清楚。"
+                                        )
+                                    )
                                     onStatusUpdate?.invoke("Ready [low confidence]")
                                 }
                             }
@@ -653,28 +665,22 @@ class VyzeCoreController(
             // doesn't become its own clipped utterance — it joins the next one.
             if (cut + 1 < minFlushChars) return
 
-            // ── COALESCED FLUSH (post-first utterances) ───────────
-            // After the first flush, accumulate ~2 short sentences (or one
-            // long one) before speaking again. Android TTS leaves a 100-300ms
-            // hardware seam between separate utterances — one utterance per
-            // sentence made longer answers sound like stop-start reading.
-            // Coalescing turns most answers into 1-2 flowing utterances at
-            // the cost of ~0.5-1s extra wait on LATER sentences only (the
-            // first flush still speaks at the earliest possible moment).
-            if (firstChunkSent && flushCountersSent >= 1 && !fastStartFragment) {
-                val lastIdx = lastSentenceTerminatorIndex(text)
-                val coalescedLen = (lastIdx?.plus(1)) ?: text.length
-                if (coalescedLen < COALESCED_FLUSH_CHARS &&
-                    text.length < readAheadCeiling
-                ) {
-                    return // keep buffering — more sentences will join this utterance
-                }
-                // Coalescing target reached: cut at the LAST terminator so
-                // maximum content rides in this one utterance. (Past the hard
-                // ceiling the cut is already forced — speak now, boundary or not.)
-                if (lastIdx != null && text.length < readAheadCeiling) {
-                    cut = lastIdx
-                }
+            // ── PLAYBACK-AWARE BATCHING (post-first utterances) ─────
+            // Android TTS leaves a 100-300ms hardware seam between separate
+            // utterances — one utterance per sentence sounds like stop-start
+            // reading. Hold completed sentences while the PREVIOUS utterance
+            // has not STARTED PLAYING yet: while the engine is still
+            // synthesizing, every QUEUE_ADD becomes its own utterance with a
+            // seam after it, so keep accumulating instead (merging is free
+            // while nothing is audible). The moment the previous utterance
+            // starts playing, flush at the next sentence boundary so the
+            // queue never starves mid-answer. This replaces the old static
+            // 60-char coalescing gate: the hold now lasts exactly as long as
+            // actual synthesis — no dead air when generation is slow — and
+            // the read-ahead ceiling above still forces a flush if the model
+            // runs on without punctuation (cut >= 0 bypasses this hold).
+            if (cut < 0 && firstChunkSent && !currentChunkStarted && !fastStartFragment) {
+                return // previous utterance still synthesizing — keep merging
             }
 
             val cutEnd = cut + 1
@@ -682,7 +688,6 @@ class VyzeCoreController(
                 text.substring(0, cutEnd) + if (fastStartFragment) "," else ""
             )
             fastStartFragment = false
-            flushCountersSent++
 
             sentenceBuffer.delete(0, cut + 1)
             while (sentenceBuffer.isNotEmpty() && sentenceBuffer[0] == ' ') {
@@ -694,17 +699,32 @@ class VyzeCoreController(
             mainHandler.post {
                 try {
                     val chunkId = "${activeSessionId}_chunk_${chunkCounter.incrementAndGet()}"
+                    // Playback-aware batching gate: the NEXT flush holds while
+                    // THIS utterance has not started playing. onStart sets the
+                    // gate; onError also sets it so a dropped/rejected utterance
+                    // can never wedge the batching logic (the gate must only
+                    // ever be false while synthesis is genuinely pending).
+                    currentChunkStarted = false
+                    val onPlaying: () -> Unit = { currentChunkStarted = true }
                     // First utterance flushes any leftover status speech
                     // ("Analyzing scene...") so the answer starts clean.
                     if (!firstChunkSent) {
-                        ttsManager.speak(chunk, TextToSpeech.QUEUE_FLUSH, utteranceId = chunkId)
+                        ttsManager.speak(
+                            chunk, TextToSpeech.QUEUE_FLUSH, utteranceId = chunkId,
+                            onStart = onPlaying, onError = onPlaying
+                        )
                         firstChunkSent = true
                     } else {
-                        ttsManager.speak(chunk, TextToSpeech.QUEUE_ADD, utteranceId = chunkId)
+                        ttsManager.speak(
+                            chunk, TextToSpeech.QUEUE_ADD, utteranceId = chunkId,
+                            onStart = onPlaying, onError = onPlaying
+                        )
                     }
                     CrashLogFile.log(TAG, "Sentence flush (id=$chunkId): ${chunk.take(60)}...")
                 } catch (e: Throwable) {
                     Log.w(TAG, "TTS flush error: ${e.message}")
+                    // Never wedge batching on a failed post.
+                    currentChunkStarted = true
                 }
             }
         }
@@ -733,18 +753,15 @@ class VyzeCoreController(
             }
         }
 
-        // Post unconditionally: even with nothing left to speak, queue a
-        // silent tail so hasPendingSpeech() stays true while the hardware
-        // AudioTrack drains the last audible utterance — prevents the final
-        // words from being clipped when the caller polls for completion.
+        // Post only when there is text left. (The old silent-tail utterance
+        // was a no-op under the platform engine — trailing AudioTrack drain
+        // is covered by the caller's grace period instead.)
+        if (remaining.isEmpty()) return
         mainHandler.post {
             try {
-                if (remaining.isNotEmpty()) {
-                    val finalChunkId = "${activeSessionId}_final_${chunkCounter.incrementAndGet()}"
-                    ttsManager.speak(remaining, TextToSpeech.QUEUE_ADD, utteranceId = finalChunkId)
-                    CrashLogFile.log(TAG, "Final flush (id=$finalChunkId): ${remaining.take(80)}...")
-                }
-                ttsManager.playSilentUtterance(450, TextToSpeech.QUEUE_ADD)
+                val finalChunkId = "${activeSessionId}_final_${chunkCounter.incrementAndGet()}"
+                ttsManager.speak(remaining, TextToSpeech.QUEUE_ADD, utteranceId = finalChunkId)
+                CrashLogFile.log(TAG, "Final flush (id=$finalChunkId): ${remaining.take(80)}...")
             } catch (e: Throwable) {
                 Log.w(TAG, "TTS final flush error: ${e.message}")
             }
@@ -756,18 +773,10 @@ class VyzeCoreController(
             sentenceBuffer.clear()
         }
         firstChunkSent = false
-        flushCountersSent = 0
+        currentChunkStarted = false
         fastStartFragment = false
         tokenConfidenceBuffer.clear()
         confidenceCheckPassed = false
-    }
-
-    /** Index of the LAST sentence terminator in [text], or null if none. */
-    private fun lastSentenceTerminatorIndex(text: String): Int? {
-        for (i in text.length - 1 downTo 0) {
-            if (text[i] in SENTENCE_TERMINATORS) return i
-        }
-        return null
     }
 
     // ── Tap Grid Tagging (structured spatial prompting) ───────────
@@ -1391,6 +1400,17 @@ class VyzeCoreController(
                         }
                     }
                 }
+                // Phase 4: locale-aware output budget. Malay morphology runs
+                // ~30% more tokens for the same sentence — an English-sized
+                // budget truncated Malay answers mid-word, and sanitizeForTts
+                // then stamped a period onto the fragment. Chinese is denser
+                // per glyph and needs no headroom. Applied to reads too: a
+                // Malay back-panel read is the most truncation-prone case.
+                val localeMaxTokens = if (activeUserLocale.language == "ms") {
+                    (inferenceMaxTokens * 4) / 3
+                } else {
+                    inferenceMaxTokens
+                }
                 val response = vlmEngine.analyzeImage(
                     bitmap = inferenceBitmap,
                     prompt = basePrompt,
@@ -1398,7 +1418,7 @@ class VyzeCoreController(
                     similarInteractions = emptyList(),
                     sessionId = currentSessionId,
                     targetDimension = targetDimension,
-                    maxTokens = inferenceMaxTokens
+                    maxTokens = localeMaxTokens
                 )
 
                 // ── CANCELLATION CHECK: bail out after VLM call if cancelled ──
@@ -2604,12 +2624,25 @@ class VyzeCoreController(
         /** Number of characters to accumulate before checking for hedging. */
         private const val CONFIDENCE_CHECK_CHARS = 30
 
-        /** Hedging phrases that indicate low model confidence. */
+        /**
+         * Hedging phrases that indicate low model confidence. Phase 4: Malay
+         * and Chinese hedges added — the English-only list never aborted a
+         * hedging MALAY answer ("mungkin", "nampaknya"), so low-confidence
+         * guesses played through to a blind user who may act on them.
+         */
         private val HEDGING_PHRASES = listOf(
+            // English
             "i think", "maybe", "it looks like", "it appears",
             "possibly", "might be", "could be", "not sure",
             "hard to tell", "unclear", "difficult to determine",
-            "not certain", "seems like", "i guess"
+            "not certain", "seems like", "i guess",
+            // Bahasa Melayu
+            "mungkin", "agaknya", "nampaknya", "kelihatan seperti",
+            "saya rasa", "tidak pasti", "tak pasti", "sukar untuk",
+            "kurang jelas",
+            // Chinese
+            "可能", "也许", "大概", "或许", "看起来像", "好像", "不确定", "似乎",
+            "看不清", "不清楚"
         )
 
         // ── Text-Only Q&A ───────────────────────────────────────

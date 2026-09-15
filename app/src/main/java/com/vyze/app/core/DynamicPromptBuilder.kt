@@ -212,22 +212,6 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
         private const val TAG = "DynamicPromptBuilder"
 
         /**
-         * System directive — currently UNWIRED (VlmEngineManager.SYSTEM_DIRECTIVE
-         * is the live one prepended to every inference); kept mirrored so the two
-         * never diverge in intent. Conversational persona for blind users.
-         */
-        private const val SYSTEM_DIRECTIVE =
-            "You are Vyze, a voice assistant for a blind user. " +
-            "Speak naturally and conversationally, as if on a hands-free call. " +
-            "Keep answers under 2 short sentences for fast text-to-speech delivery. " +
-            "Refer to past conversation turns when they are provided. " +
-            "Describe spatial details clearly (for example: on your left, at 2 o'clock). " +
-            "Do not use markdown, bullet points, or special characters — plain spoken sentences only. " +
-            "Describe what you see directly in the language requested by the user without " +
-            "cross-translating or outputting internal reasoning chains. " +
-            "Respond only in the requested language."
-
-        /**
          * NAVIGATION MODE — used for generic taps and automatic spatial descriptions.
          */
         private const val NAV_RULES_PROSE =

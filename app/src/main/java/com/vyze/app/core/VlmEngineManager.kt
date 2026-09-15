@@ -1108,8 +1108,9 @@ class VlmEngineManager(
          * voice, ≤2 short sentences for TTS, references provided history,
          * clock/left-right spatial clarity, plain sentences only. Long OCR
          * reads override the sentence cap via an explicit carve-out in
-         * DynamicPromptBuilder. NOTE: the mirrored (currently unwired) copy
-         * lives in DynamicPromptBuilder.SYSTEM_DIRECTIVE — keep both in sync.
+         * DynamicPromptBuilder. SINGLE SOURCE (Phase 4): the former mirrored
+         * copy in DynamicPromptBuilder was removed — this is the only
+         * definition in the codebase.
          */
         private const val SYSTEM_DIRECTIVE =
             "You are Vyze, a voice assistant for a blind user. " +
