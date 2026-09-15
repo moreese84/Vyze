@@ -239,6 +239,9 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 | Sentence-buffered TTS streaming | First audio in <500ms |
 | Punctuation-guided clause flushing | Natural pauses at commas/periods |
 | Greedy decoding (topK=1, temp=0.1) | Fastest possible token generation |
+| Memoized prompt rule blocks | Six static rule + few-shot strings built once — no per-turn re-assembly |
+| Scene-gate embedding reuse | One embedding pass per continuous capture (gate + baseline from the same frame) |
+| Reused luminance row buffer | Zero allocations per idle sample (~every 600ms) |
 | GPU warm-up (dummy 1x1 inference) | Eliminates first-inference cold start |
 | Prompt trimming (~250 chars prefill) | ~60% faster prefill vs untrimmed |
 | Dynamic aspect ratio (no center-crop) | Preserves spatial accuracy, faster encoding |
