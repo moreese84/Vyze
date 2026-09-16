@@ -1,9 +1,11 @@
 package com.vyze.app.agent
 
 import android.content.Context
+import android.graphics.Bitmap
 import com.vyze.app.device.HapticManager
 import com.vyze.app.speech.TTSManager
 import com.vyze.app.vision.OcrHelper
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * PHASE 1 wiring: binds the [FastPerceptionToolContracts] and
@@ -93,13 +95,62 @@ object VyzeToolWiring {
         )
     }
 
+    private val vlmSessionSeq = AtomicLong(0)
+
     /**
-     * VLM Reasoning delegate wiring. The engine binding itself is Phase 2
-     * (approved hybrid pathing): [runQuery] will bind to
-     * VlmEngineManager.analyzeText/analyzeImage with the generationMutex
-     * staying internal. Kept as a parameter so Phase 1 ships no engine call
-     * sites at all.
+     * PHASE 2: VLM Reasoning delegate under the approved hybrid pathing.
+     *
+     * This adapter owns the AGENT-SIDE semantics only — readiness gating,
+     * text vs. frame routing, fail-safe null handling, and the `adk_*`
+     * session namespace — as pure logic over INJECTED engine hooks. It never
+     * imports or constructs [com.vyze.app.core.VlmEngineManager]; Phase 3
+     * binds the real engine as one-line hooks, e.g.:
+     *
+     * VyzeToolWiring.vlmDelegate(
+     *     isEngineReady = coreController::isEngineReady,
+     *     analyzeText = { prompt, sid -> vlm.analyzeText(prompt, sessionId = sid) },
+     *     analyzeImage = { bmp, prompt, sid -> vlm.analyzeImage(bmp, prompt, sessionId = sid) },
+     *     latestFrameProvider = frameSource,
+     * )  // F inferred as android.graphics.Bitmap
+     *
+     * The engine's `generationMutex`, session discipline, and LiteRT-LM
+     * runtime remain 100% internal — ADK orchestrates the call, never the
+     * engine. The `adk_*` session id makes the native pipeline's
+     * stale-session gate drop any engine callbacks from agent-path
+     * inference, so agent traffic cannot cross-talk with native answers.
+     *
+     * Fail-safe defaults: unwired hooks return null, which the contract maps
+     * to a structured error — a misconfigured agent degrades, never crashes.
+     *
+     * @param isEngineReady early-exit probe; Phase 3 binds
+     *   VyzeCoreController::isEngineReady (the app's authoritative signal).
+     * @param analyzeText text-only engine op (prompt, sessionId) -> answer?
+     * @param analyzeImage frame engine op (bitmap, prompt, sessionId) -> answer?
+     * @param latestFrameProvider read-only access to the most recent
+     *   camera frame already delivered by the existing analyzer — capture
+     *   itself stays exclusively inside the camera layer's isCapturing-gated
+     *   paths, which this adapter never touches.
      */
-    fun vlmContracts(runQuery: suspend (prompt: String) -> String): VlmReasoningToolContracts =
-        VlmReasoningToolContracts(runQuery)
+    fun <F : Any> vlmDelegate(
+        isEngineReady: () -> Boolean = { true },
+        analyzeText: suspend (prompt: String, sessionId: String) -> String? = { _, _ -> null },
+        analyzeImage: suspend (frame: F, prompt: String, sessionId: String) -> String? = { _, _, _ -> null },
+        latestFrameProvider: (() -> F?)? = null,
+    ): VlmReasoningToolContracts {
+        val sessionId = "adk_vlm_${vlmSessionSeq.incrementAndGet()}"
+        return VlmReasoningToolContracts(
+            isReady = isEngineReady,
+            runQuery = { prompt, includeCameraFrame ->
+                if (includeCameraFrame) {
+                    // A visual query without a frame must NOT be answered as
+                    // if sighted — fail safe to the structured error instead
+                    // of risking a hallucinated visual answer.
+                    val frame = latestFrameProvider?.invoke()
+                    if (frame != null) analyzeImage(frame, prompt, sessionId) else null
+                } else {
+                    analyzeText(prompt, sessionId)
+                }
+            },
+        )
+    }
 }

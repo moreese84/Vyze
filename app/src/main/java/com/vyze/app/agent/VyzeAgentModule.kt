@@ -122,17 +122,36 @@ class FastPerceptionToolContracts(
  * Phase 2 hybrid-pathing tool contract for the VLM Reasoning Agent.
  *
  * The agent reaches the on-device Gemma engine ONLY through this delegate,
- * which will bind to [com.vyze.app.core.VlmEngineManager.analyzeText] /
- * `analyzeImage`. The engine's `generationMutex`, session discipline, and
- * LiteRT-LM runtime (litertlm-android 0.16.1) remain 100% internal and
- * untouched - ADK orchestrates the call, never the engine.
+ * which binds to [com.vyze.app.core.VlmEngineManager.analyzeText] /
+ * `analyzeImage` (see VyzeToolWiring). The engine's `generationMutex`,
+ * session discipline, and LiteRT-LM runtime (litertlm-android 0.16.1)
+ * remain 100% internal and untouched — ADK orchestrates the call, never
+ * the engine. Camera frames come exclusively from the injected frame
+ * provider (the camera layer's isCapturing-gated paths do all capture).
+ *
+ * Delegate semantics: return the model answer, or NULL when the engine
+ * cannot serve the query (not initialized, inference error, or a requested
+ * camera frame is unavailable). Null is mapped to a structured error
+ * result so the agent degrades gracefully instead of crashing.
  */
 class VlmReasoningToolContracts(
-    /** Binds to VlmEngineManager.analyzeText / analyzeImage in Phase 2. */
-    private val runQuery: suspend (prompt: String) -> String,
+    /** Early-exit readiness probe (engine availability, thermal state). */
+    private val isReady: () -> Boolean = { true },
+    /** Binds to VlmEngineManager.analyzeText / analyzeImage in Phase 2.
+     *  Null result means "cannot answer right now" — never an exception. */
+    private val runQuery: suspend (prompt: String, includeCameraFrame: Boolean) -> String?,
 ) {
     @Tool(description = "Runs a complex visual or language reasoning query through the on-device Gemma engine")
     suspend fun runVlmQuery(
         @Param("The user's visual or conversational question") prompt: String,
-    ): Map<String, String> = mapOf("answer" to runQuery(prompt))
+        @Param("Set true to include the current camera frame for visual questions") includeCameraFrame: Boolean,
+    ): Map<String, String> {
+        if (!isReady()) {
+            return mapOf("error" to "Vision engine is not ready")
+        }
+        return when (val answer = runQuery(prompt, includeCameraFrame)) {
+            null -> mapOf("error" to "Engine could not answer this query")
+            else -> mapOf("answer" to answer)
+        }
+    }
 }

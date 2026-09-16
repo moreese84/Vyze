@@ -123,23 +123,99 @@ class VyzeToolWiringTest {
 
     @Test
     fun `generated VLM tool is exposed`() {
-        val tools = VyzeToolWiring.vlmContracts { "ok" }.generatedTools()
+        val tools = VyzeToolWiring.vlmDelegate<Any>().generatedTools()
         assertEquals(1, tools.size)
         assertEquals("runVlmQuery", tools.single().declaration()?.name)
     }
 
-    // ── VLM delegate wiring ───────────────────────────────────────
+    // ── vlmDelegate (Phase 2 hybrid pathing) ──────────────────────
 
     @Test
-    fun `vlmContracts delegates prompt verbatim and wraps answer`() = runBlocking {
-        var captured: String? = null
-        val v = VyzeToolWiring.vlmContracts { prompt ->
-            captured = prompt
-            "answer-42"
-        }
-        val out = v.runVlmQuery("what is this?")
-        assertEquals("what is this?", captured)
+    fun `vlmDelegate ready-gate short-circuits to structured error`() = runBlocking {
+        var engineCalled = false
+        val v = VyzeToolWiring.vlmDelegate<Any>(
+            isEngineReady = { false },
+            analyzeText = { _, _ ->
+                engineCalled = true
+                "should not run"
+            },
+        )
+        val out = v.runVlmQuery("what is this?", includeCameraFrame = false)
+        assertEquals(mapOf("error" to "Vision engine is not ready"), out)
+        assertEquals(false, engineCalled)
+    }
+
+    @Test
+    fun `vlmDelegate text path delegates verbatim under adk session namespace`() = runBlocking {
+        var capturedPrompt: String? = null
+        var capturedSession: String? = null
+        val v = VyzeToolWiring.vlmDelegate<Any>(
+            analyzeText = { prompt, sessionId ->
+                capturedPrompt = prompt
+                capturedSession = sessionId
+                "answer-42"
+            },
+        )
+        val out = v.runVlmQuery("what is this?", includeCameraFrame = false)
         assertEquals(mapOf("answer" to "answer-42"), out)
-        assertTrue(captured != null)
+        assertEquals("what is this?", capturedPrompt)
+        assertTrue(capturedSession!!.startsWith("adk_vlm_"))
+    }
+
+    @Test
+    fun `vlmDelegate image path passes frame and prompt to analyzeImage`() = runBlocking {
+        val frame = Any() // generic frame token — Bitmap is not instantiable in JVM tests
+        var capturedFrame: Any? = null
+        var capturedPrompt: String? = null
+        val v = VyzeToolWiring.vlmDelegate<Any>(
+            analyzeImage = { bmp, prompt, _ ->
+                capturedFrame = bmp
+                capturedPrompt = prompt
+                "it is a red can"
+            },
+            latestFrameProvider = { frame },
+        )
+        val out = v.runVlmQuery("what is in front of me?", includeCameraFrame = true)
+        assertEquals(mapOf("answer" to "it is a red can"), out)
+        assertEquals(frame, capturedFrame)
+        assertEquals("what is in front of me?", capturedPrompt)
+    }
+
+    @Test
+    fun `vlmDelegate visual query without frame fails safe to error`() = runBlocking {
+        var imageCalled = false
+        val v = VyzeToolWiring.vlmDelegate<Any>(
+            analyzeImage = { _, _, _ ->
+                imageCalled = true
+                "hallucinated"
+            },
+            latestFrameProvider = { null },
+        )
+        val out = v.runVlmQuery("what is in front of me?", includeCameraFrame = true)
+        assertEquals(mapOf("error" to "Engine could not answer this query"), out)
+        assertEquals(false, imageCalled)
+    }
+
+    @Test
+    fun `vlmDelegate engine null result maps to structured error`() = runBlocking {
+        val v = VyzeToolWiring.vlmDelegate<Any>(
+            analyzeText = { _, _ -> null },
+        )
+        val out = v.runVlmQuery("any question", includeCameraFrame = false)
+        assertEquals(mapOf("error" to "Engine could not answer this query"), out)
+    }
+
+    @Test
+    fun `vlmDelegate unwired hooks degrade to structured error`() = runBlocking {
+        val v = VyzeToolWiring.vlmDelegate<Any>()
+        val out = v.runVlmQuery("any question", includeCameraFrame = false)
+        assertEquals(mapOf("error" to "Engine could not answer this query"), out)
+    }
+
+    @Test
+    fun `vlmDelegate generates distinct session ids per delegate`() {
+        val v1 = VyzeToolWiring.vlmDelegate<Any>()
+        val v2 = VyzeToolWiring.vlmDelegate<Any>()
+        assertTrue(v1 !== v2)
     }
 }
