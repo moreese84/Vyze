@@ -365,6 +365,10 @@ class SessionEpisodeManager(
         episodes.remove(sessionId)
     }
 
+    /** True when [sessionId] currently has an open episode. */
+    @Synchronized
+    fun exists(sessionId: String): Boolean = episodes.containsKey(sessionId)
+
     /**
      * Evict idle episodes. Under elevated thermal status the idle window
      * shrinks from [idleEvictMs] to [thermalEvictMs] — fewer warm ADK
@@ -386,17 +390,130 @@ class SessionEpisodeManager(
 
     @Synchronized
     fun size(): Int = episodes.size
-}// ── Runtime holder (flag-gated; ships dark) ─────────────────────────
+}
+
+// ── Phase 6: shadow→live evaluation evidence ─────────────────────────
+
+/** One bounded eval observation (pure data; no Android deps). */
+data class ShadowEvalRecord(
+    val query: String,
+    /** The adk_text_ session id when the query EXECUTED; null on declines. */
+    val sessionId: String?,
+    val outcome: Outcome,
+    val latencyMs: Long? = null,
+    val recordedAtMs: Long = System.currentTimeMillis(),
+) {
+    enum class Outcome {
+        /** Executed through the ADK runner; a non-empty answer returned. */
+        ANSWERED,
+        /** Executed but the engine returned null/empty or threw. */
+        FAILED,
+        /** A grant gate refused (flag/action/readiness/thermal). */
+        DECLINED,
+        /** Refused because another agent-path generation was in flight. */
+        DECLINED_BUSY,
+    }
+}
 
 /**
- * Lazily constructs the ADK-native pieces and (Phase 4) executes the
- * LIVE route when the shadow flag is enabled.
+ * Bounded ring of eval observations + pure summary math. NOT a general
+ * telemetry sink: its only consumer is the Phase 6 flip review
+ * ([VyzeAgentRuntime.shouldPromoteToLive]) and JVM tests.
+ */
+class ShadowEvalRecorder(
+    private val capacity: Int = DEFAULT_CAPACITY,
+    private val nowMs: () -> Long = System::currentTimeMillis,
+) {
+    data class Summary(
+        val total: Int,
+        val answered: Int,
+        val failed: Int,
+        val declined: Int,
+        val declinedBusy: Int,
+        val avgLatencyMs: Long,
+        val successRate: Double,
+    )
+
+    private val ring = ArrayDeque<ShadowEvalRecord>(capacity)
+
+    @Synchronized
+    fun record(record: ShadowEvalRecord) {
+        if (ring.size >= capacity) ring.removeFirst()
+        ring.addLast(record)
+    }
+
+    @Synchronized
+    fun snapshot(): List<ShadowEvalRecord> = ring.toList()
+
+    @Synchronized
+    fun clear() = ring.clear()
+
+    @Synchronized
+    fun summarize(): Summary {
+        if (ring.isEmpty()) {
+            return Summary(0, 0, 0, 0, 0, 0L, 0.0)
+        }
+        var answered = 0
+        var failed = 0
+        var declined = 0
+        var declinedBusy = 0
+        var latencySum = 0L
+        var latencyCount = 0
+        for (r in ring) {
+            when (r.outcome) {
+                ShadowEvalRecord.Outcome.ANSWERED -> {
+                    answered++
+                    r.latencyMs?.let { latencySum += it; latencyCount++ }
+                }
+                ShadowEvalRecord.Outcome.FAILED -> failed++
+                ShadowEvalRecord.Outcome.DECLINED -> declined++
+                ShadowEvalRecord.Outcome.DECLINED_BUSY -> declinedBusy++
+            }
+        }
+        val total = ring.size
+        return Summary(
+            total = total,
+            answered = answered,
+            failed = failed,
+            declined = declined,
+            declinedBusy = declinedBusy,
+            avgLatencyMs = if (latencyCount == 0) 0L else latencySum / latencyCount,
+            successRate = answered.toDouble() / total,
+        )
+    }
+
+    companion object {
+        const val DEFAULT_CAPACITY = 200
+
+        /** Promotion bar: at least this many EXECUTED-or-refused observations. */
+        const val PROMOTION_MIN_ATTEMPTS = 30
+
+        /** Promotion bar: at least this many executed answers. */
+        const val PROMOTION_MIN_ANSWERED = 20
+
+        /** Promotion bar: answered/total at or above this ratio. */
+        const val PROMOTION_ANSWER_RATE = 0.80
+    }
+}
+
+// ── Runtime holder (flag-gated; ships dark) ─────────────────────────
+
+/**
+ * Lazily constructs the ADK-native pieces, executes the LIVE route when
+ * the shadow flag is enabled (Phase 4), through the REAL ADK
+ * [com.google.adk.kt.runners.InMemoryRunner] (Phase 5), and records the
+ * shadow→live evaluation evidence + runs session maintenance (Phase 6).
  *
  * LIVE ROUTING SCOPE (approved constraint: never race native generation):
- * Phase 4 routes TEXT-ONLY queries end-to-end through the ADK agent path.
- * Frame-dependent decisions decline here and fall back to the legacy
- * dispatch — frame capture remains exclusively inside the camera layer's
- * isCapturing-gated paths.
+ * the ADK agent path routes TEXT-ONLY queries end-to-end. Frame-dependent
+ * decisions decline here and fall back to the legacy dispatch — frame
+ * capture remains exclusively inside the camera layer's isCapturing-gated
+ * paths.
+ *
+ * PHASE 6 — the flip is EVAL-DRIVEN and MANUAL: [shouldPromoteToLive]
+ * summarizes the recorded outcomes so a human decides when the agent lane
+ * has earned the flag flip. The runtime never flips [shadowEnabled] by
+ * itself and never disables the legacy path.
  */
 object VyzeAgentRuntime {
 
@@ -410,6 +527,9 @@ object VyzeAgentRuntime {
     private var liveAgent: VyzeLiveQueryAgent? = null
     private var liveRunner: com.google.adk.kt.runners.InMemoryRunner? = null
     private val episodeManager = SessionEpisodeManager()
+
+    /** Phase 6: bounded shadow→live evaluation evidence for the flip review. */
+    private val evalRecorder = ShadowEvalRecorder()
 
     /** Flip point for Phase 4. Ships false; no production reader until the hook. */
     @Volatile
@@ -466,12 +586,30 @@ object VyzeAgentRuntime {
         if (!shadowEnabled || decision.action != RouterDecision.Action.VLM_VOICE_QUERY ||
             !snapshot.engineReady || !vlmInferenceAllowed()
         ) {
+            // Phase 6: the decline tally is the eval baseline — a decline is
+            // NOT a legacy mismatch; it just means the agent lane passed.
+            evalRecorder.record(
+                ShadowEvalRecord(
+                    query = textOnlyQuery,
+                    sessionId = null,
+                    outcome = ShadowEvalRecord.Outcome.DECLINED,
+                )
+            )
             return null // decline → caller falls back to the legacy dispatch
         }
 
         // One live agent-path generation at a time (decline, never queue —
         // queuing would reorder answers against the legacy pipeline).
-        if (isLiveGenerationActive) return null
+        if (isLiveGenerationActive) {
+            evalRecorder.record(
+                ShadowEvalRecord(
+                    query = textOnlyQuery,
+                    sessionId = null,
+                    outcome = ShadowEvalRecord.Outcome.DECLINED_BUSY,
+                )
+            )
+            return null
+        }
 
         // PHASE 5: the live path executes through the REAL ADK InMemoryRunner
         // (runAsync event pipeline). The session id IS the episode id — the
@@ -481,6 +619,7 @@ object VyzeAgentRuntime {
         val sessionId = "adk_text_${textSessionSeq.incrementAndGet()}"
         episodeManager.openOrTouch(sessionId)
         if (!liveGenerationActive.compareAndSet(false, true)) return null
+        val startedAt = kotlin.time.TimeSource.Monotonic.markNow()
 
         var execRunner: com.google.adk.kt.runners.InMemoryRunner? = null
         try {
@@ -513,12 +652,34 @@ object VyzeAgentRuntime {
             }
             if (answer == null) {
                 Log.w(TAG, "Live agent-path text query returned null (declining)")
+                evalRecorder.record(
+                    ShadowEvalRecord(
+                        query = textOnlyQuery,
+                        sessionId = sessionId,
+                        outcome = ShadowEvalRecord.Outcome.FAILED,
+                    )
+                )
                 return null
             }
             Log.i(TAG, "Live agent-path text query answered via $sessionId (ADK runner)")
+            evalRecorder.record(
+                ShadowEvalRecord(
+                    query = textOnlyQuery,
+                    sessionId = sessionId,
+                    outcome = ShadowEvalRecord.Outcome.ANSWERED,
+                    latencyMs = startedAt.elapsedNow().inWholeMilliseconds,
+                )
+            )
             return answer
         } catch (t: Throwable) {
             Log.w(TAG, "Live agent-path text query failed: ${t.message}")
+            evalRecorder.record(
+                ShadowEvalRecord(
+                    query = textOnlyQuery,
+                    sessionId = sessionId,
+                    outcome = ShadowEvalRecord.Outcome.FAILED,
+                )
+            )
             return null
         } finally {
             liveGenerationActive.set(false)
@@ -575,6 +736,101 @@ object VyzeAgentRuntime {
 
     fun episodes(): SessionEpisodeManager = episodeManager
 
+    // ── Phase 6: eval evidence + manual flip review ──────────────────
+
+    /** Immutable summary of the bounded eval window (pure data). */
+    data class EvalSummary(
+        val total: Int,
+        val answered: Int,
+        val failed: Int,
+        val declined: Int,
+        val declinedBusy: Int,
+        val avgLatencyMs: Long,
+        val successRate: Double,
+    )
+
+    /** Current bounded eval evidence (a snapshot; cheap to read). */
+    fun evalSummary(): EvalSummary {
+        val s = evalRecorder.summarize()
+        return EvalSummary(
+            total = s.total,
+            answered = s.answered,
+            failed = s.failed,
+            declined = s.declined,
+            declinedBusy = s.declinedBusy,
+            avgLatencyMs = s.avgLatencyMs,
+            successRate = s.successRate,
+        )
+    }
+
+    /**
+     * Whether the bounded eval window meets the promotion bar for a HUMAN
+     * to flip [shadowEnabled]. The runtime NEVER flips the flag itself and
+     * NEVER disables the legacy path — this predicate only informs review.
+     *
+     * Bar: enough executed attempts, answer rate at/above
+     * [ShadowEvalRecorder.PROMOTION_ANSWER_RATE], and the window not
+     * dominated by declines (which would say more about routing than
+     * about answer quality).
+     */
+    fun shouldPromoteToLive(): Boolean {
+        val s = evalRecorder.summarize()
+        if (s.total < ShadowEvalRecorder.PROMOTION_MIN_ATTEMPTS) return false
+        if (s.answered < ShadowEvalRecorder.PROMOTION_MIN_ANSWERED) return false
+        if (s.answered.toDouble() / s.total < ShadowEvalRecorder.PROMOTION_ANSWER_RATE) return false
+        if (s.declined + s.declinedBusy > s.total / 2) return false
+        return true
+    }
+
+    /** Clears the eval window (after a flip review is recorded elsewhere). */
+    @Synchronized
+    fun resetEvalForTests() {
+        evalRecorder.clear()
+    }
+
+    /**
+     * PHASE 6 — PERIODIC MAINTENANCE (call from a lifecycle-aware scope,
+     * e.g. every 60 s while the fragment is started):
+     *
+     *  1. Episode eviction via [SessionEpisodeManager.evictIdle] — the
+     *     idle window shrinks automatically under thermal pressure
+     *     (Section 6 design; [ThermalPowerController]-equivalent status is
+     *     supplied read-only by the caller).
+     *  2. Defense-in-depth orphan sweep: any ADK session in the live lane
+     *     that no longer has an open episode is deleted. Normal turns
+     *     already delete their session in `finally`; this catches leaks
+     *     from cancelled/aborted turns so the in-memory store stays
+     *     bounded no matter what.
+     *
+     * No VLM/TTS/hardware interaction; safe to call at any time. Returns
+     * the number of orphaned ADK sessions deleted.
+     */
+    suspend fun maintenanceTick(isThermallyConstrained: () -> Boolean): Int {
+        val evicted = episodeManager.evictIdle(isThermallyConstrained())
+        if (evicted.isNotEmpty()) {
+            Log.d(TAG, "Maintenance: evicted ${evicted.size} idle episode(s)")
+        }
+
+        val service = liveSessionService() ?: return 0
+        val live = runCatching {
+            service.listSessions(APP_NAME, USER_ID)
+        }.getOrElse { return 0 }
+        var deleted = 0
+        for (session in live.sessions) {
+            val id = session.key.id ?: continue
+            if ("adk_text_" !in id) continue // only our lane's sessions
+            if (episodeManager.exists(id)) continue
+            runCatching {
+                service.deleteSession(com.google.adk.kt.sessions.SessionKey(APP_NAME, USER_ID, id))
+                deleted++
+            }.onFailure { Log.w(TAG, "Orphan sweep delete failed for $id: ${it.message}") }
+        }
+        if (deleted > 0) {
+            Log.d(TAG, "Maintenance: deleted $deleted orphaned ADK session(s)")
+        }
+        return deleted
+    }
+
     /**
      * The live lane's ADK session service — ops/inspection hook (Phase 6
      * eviction tooling); null until the live runner is first constructed.
@@ -589,6 +845,7 @@ object VyzeAgentRuntime {
         liveRunner = null
         liveAgent = null
         liveGenerationActive.set(false)
+        evalRecorder.clear()
         shadowEnabled = false
     }
 
