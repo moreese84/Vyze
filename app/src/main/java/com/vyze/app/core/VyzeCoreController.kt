@@ -2059,6 +2059,56 @@ class VyzeCoreController(
     }
 
     /**
+     * PHASE 4 (ADK agent path): direct text-only generation for the
+     * flag-gated live route in VyzeAgentRuntime. Deliberately MINIMAL —
+     * no prompt assembly, no memory recall, no sentence streaming; those
+     * remain native-path features until the agent instructions own them.
+     *
+     * Native-resource invariants preserved exactly as in [triggerTextQuery]:
+     *  - `isInferring` CAS gate: declines (null) instead of queueing when a
+     *    native generation is already in flight — the agent path can never
+     *    race or reorder against the native pipeline.
+     *  - `generationMutex`/session discipline stay internal to
+     *    VlmEngineManager.runConversation (hybrid pathing directive).
+     *  - A hung call times out and cancels like the native watchdog:
+     *    isInferring is ALWAYS released so the lane can never wedge.
+     *
+     * @return the raw model answer, or null to decline/fail — the caller
+     *   falls back to the legacy dispatch on null.
+     */
+    suspend fun analyzeTextDirect(prompt: String, sessionId: String): String? {
+        if (!engineReady) {
+            Log.w(TAG, "analyzeTextDirect called but engine not ready")
+            return null
+        }
+        if (!isInferring.compareAndSet(false, true)) {
+            Log.d(TAG, "analyzeTextDirect: native generation in flight — declining")
+            return null
+        }
+        try {
+            // Timeout parity with the native watchdog: a wedged native call
+            // must not hold the inference lane forever.
+            val answer = kotlinx.coroutines.withTimeoutOrNull(TEXT_QUERY_TIMEOUT_MS) {
+                vlmEngine.analyzeText(
+                    prompt = prompt,
+                    sessionId = sessionId,
+                    maxTokens = TEXT_ONLY_MAX_TOKENS
+                )
+            }
+            if (answer == null) {
+                Log.w(TAG, "analyzeTextDirect timed out or returned null — cancelling inference")
+                cancelInference()
+            }
+            return answer
+        } catch (t: Throwable) {
+            CrashLogFile.logError(TAG, "analyzeTextDirect FAILED: ${t.javaClass.simpleName}: ${t.message}", t)
+            return null
+        } finally {
+            isInferring.set(false)
+        }
+    }
+
+    /**
      * Transcribe speech with the model's NATIVE audio encoder — fully
      * offline, no Google services. This is the noisy-room rescue path:
      * when Android's SpeechRecognizer fails or hears ambient chatter,
@@ -2457,6 +2507,9 @@ class VyzeCoreController(
          * indefinite ANALYZING state.
          */
         private const val WATCHDOG_TIMEOUT_MS = 15_000L
+
+        /** Agent-path direct text generation timeout (native-watchdog parity). */
+        private const val TEXT_QUERY_TIMEOUT_MS = 15_000L
 
         /** Max dimension for continuous mode bitmap downsampling. */
         private const val CONTINUOUS_MAX_DIM = 256

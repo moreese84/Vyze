@@ -101,6 +101,16 @@ android {
         noCompress += "tflite"
     }
 
+    testOptions {
+        unitTests {
+            // JVM tests exercise the agent runtime (VyzeAgentRuntime), which
+            // logs via android.util.Log. Without this, the android.jar stubs
+            // throw "not mocked". Returning defaults keeps Log.* a no-op —
+            // production code is untouched.
+            isReturnDefaultValues = true
+        }
+    }
+
     packaging {
         jniLibs {
             useLegacyPackaging = true

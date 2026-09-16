@@ -5,6 +5,8 @@ import com.vyze.app.agent.RouterSnapshot
 import com.vyze.app.agent.VyzeAgentRuntime
 import com.vyze.app.agent.VyzeShadowRouter
 import com.vyze.app.core.ThermalPowerController
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.launch
 import com.vyze.app.R
 import com.vyze.app.util.CrashLogFile
 import com.vyze.app.ui.MainViewModel
@@ -123,6 +125,108 @@ class CameraFragment : Fragment() {
             )
         } catch (t: Throwable) {
             CrashLogFile.log(TAG, "shadow route log failed: ${t.message}")
+        }
+    }
+
+    /**
+     * Launch [block] in the fragment's lifecycle scope when started.
+     * The block's result is consumed inside the coroutine.
+     */
+    private fun launchWhenStarted(block: suspend () -> Unit) {
+        val lifecycle = viewLifecycleOwner.lifecycle
+        if (!lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED)) return
+        lifecycleScope.launch { block() }
+    }
+
+    /**
+     * PHASE 4 ROUTE ORIGIN (text-only branch): try the agent path for a
+     * classified text-only query; on ANY decline (flag dark, engine busy/
+     * not ready, thermal refusal, engine error) fall back to the exact
+     * legacy text path ([VyzeCoreController.triggerTextQuery]). When the
+     * flag is dark this is a straight synchronous call into the legacy
+     * path — zero behavior change, zero coroutine hop.
+     *
+     * Caller has ALREADY set ANALYZING + "Answering..." before invoking
+     * this (identical to the legacy branch), so the state machine is
+     * consistent whether the ADK lane or the fallback answers.
+     */
+    private fun beginLiveRouteOrLegacyTextOnly(query: String) {
+        if (!VyzeAgentRuntime.shadowEnabled) {
+            coreController.triggerTextQuery(query)
+            return
+        }
+        launchWhenStarted {
+            val answered = try {
+                tryLiveRouteTextOnly(query)
+            } catch (t: Throwable) {
+                CrashLogFile.log(TAG, "live route crashed (falling back): ${t.message}")
+                false
+            }
+            if (!answered) {
+                // Staleness guard: a newer gesture/speech may have claimed
+                // the pipeline while the agent path was deciding — a stale
+                // fallback must not barge in over it (same philosophy as
+                // the fragment's existing noise/stale-error gates).
+                if (appState == AppState.ANALYZING) {
+                    coreController.triggerTextQuery(query)
+                } else {
+                    Log.d(TAG, "Live-route decline stale (state=$appState) — legacy fallback skipped")
+                }
+            }
+        }
+    }
+
+    /**
+     * PHASE 4 LIVE ROUTE: attempt to answer a text-only query end-to-end on
+     * the agent path. The decision comes from the same pure router that
+     * produced the shadow logs (same taxonomy, same reasons); execution is
+     * declined unless the route is text-only, the engine is ready, the
+     * current ThermalPowerController policy allows VLM inference (read-only
+     * consultation), and no agent-path generation is in flight. On ANY
+     * decline this returns false and the caller continues the legacy
+     * dispatch ladder unchanged — the fallback is always safe.
+     *
+     * When it returns true, the answer has ALREADY been spoken and the
+     * follow-up window reopened; the caller must not run the legacy
+     * capture/query paths for this query.
+     *
+     * Frame acquisition is NEVER performed here: the ADK path is text-only
+     * in Phase 4, and frame-dependent routes decline to the camera layer's
+     * existing isCapturing-gated paths. ThermalPowerController is only read.
+     */
+    private suspend fun tryLiveRouteTextOnly(query: String): Boolean {
+        if (!VyzeAgentRuntime.shadowEnabled) return false
+        return try {
+            val answer = VyzeAgentRuntime.tryLiveRouteTextOnly(
+                textOnlyQuery = query,
+                snapshotProvider = {
+                    RouterSnapshot(
+                        engineReady = coreController.isEngineReady(),
+                        isInferring = coreController.isCurrentlyInferring(),
+                        captureAvailable = isCapturing.get(),
+                    )
+                },
+                vlmInferenceAllowed = { thermalController().policy.vlmInferenceAllowed },
+                analyzeText = { prompt, sessionId ->
+                    coreController.analyzeTextDirect(prompt, sessionId)
+                },
+            )
+            if (answer == null) return false
+
+            // Agent-path success — mirror the native answer lifecycle.
+            Log.i(TAG, "Live route answered (agent path): \"$query\"")
+            consecutiveConfirmationAsks = 0
+            appState = AppState.SPEAKING
+            updateStatus("Answering [agent]")
+            ttsManager.speakQueued(answer)
+            waitForTtsDrain {
+                appState = AppState.IDLE
+                maybeOpenFollowUpWindow()
+            }
+            true
+        } catch (t: Throwable) {
+            CrashLogFile.log(TAG, "live route failed (falling back): ${t.message}")
+            false
         }
     }
 
@@ -1002,7 +1106,10 @@ class CameraFragment : Fragment() {
                                     coreController.resetForNewCapture()
                                     appState = AppState.ANALYZING
                                     updateStatus("Answering...")
-                                    coreController.triggerTextQuery(spokenText)
+                                    // PHASE 4: agent-path live route (ships dark
+                                    // behind the flag); triggerTextQuery runs when
+                                    // declined, dark, or stale.
+                                    beginLiveRouteOrLegacyTextOnly(spokenText)
                                 } else {
                                     consecutiveConfirmationAsks = 0
                                     coreController.resetForNewCapture()

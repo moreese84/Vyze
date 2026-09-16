@@ -266,14 +266,17 @@ class SessionEpisodeManager(
 
     @Synchronized
     fun size(): Int = episodes.size
-}
-
-// ── Runtime holder (flag-gated; dead in release) ─────────────────────
+}// ── Runtime holder (flag-gated; ships dark) ─────────────────────────
 
 /**
- * Lazily constructs the ADK-native pieces. The runner is built only when
- * [ShadowRouterConfig.enabled] is true, and nothing in production calls
- * [ensureRunner] yet — this is the Phase 4 flip point.
+ * Lazily constructs the ADK-native pieces and (Phase 4) executes the
+ * LIVE route when the shadow flag is enabled.
+ *
+ * LIVE ROUTING SCOPE (approved constraint: never race native generation):
+ * Phase 4 routes TEXT-ONLY queries end-to-end through the ADK agent path.
+ * Frame-dependent decisions decline here and fall back to the legacy
+ * dispatch — frame capture remains exclusively inside the camera layer's
+ * isCapturing-gated paths.
  */
 object VyzeAgentRuntime {
 
@@ -282,9 +285,90 @@ object VyzeAgentRuntime {
     private var routerAgent: VyzeRouterAgent? = null
     private val episodeManager = SessionEpisodeManager()
 
-    /** Flip point for Phase 4. Ships false; no production reader. */
+    /** Flip point for Phase 4. Ships false; no production reader until the hook. */
     @Volatile
     var shadowEnabled: Boolean = false
+
+    /** Monotonic counter for the `adk_text_<n>` session namespace. */
+    private val textSessionSeq = AtomicLong(0)
+
+    /** Tracks the one live agent-path generation for busy/decline gating. */
+    private val liveGenerationActive = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** True when an agent-path generation is in flight (decline gate). */
+    val isLiveGenerationActive: Boolean get() = liveGenerationActive.get()
+
+    /**
+     * Attempt a LIVE agent-path route for a text-only query.
+     *
+     * All hardware/thermal/native-engine state arrives as INJECTED gates —
+     * this runtime never touches isCapturing, never overrides
+     * ThermalPowerController, and never imports VlmEngineManager.
+     *
+     * @param textOnlyQuery the user's text-only question.
+     * @param snapshotProvider reads engine/inferring/capture state for the
+     *   decision + logs (read-only).
+     * @param vlmInferenceAllowed read-only consultation of the current
+     *   ThermalPowerController policy.
+     * @param analyzeText the engine op: (prompt, sessionId) -> answer? —
+     *   bound to VlmEngineManager.analyzeText by the caller. The engine's
+     *   generationMutex/session discipline stay 100% internal.
+     * @return the structured answer string, or null when the route was
+     *   declined (flag off, non-text-only, frame required, engine busy/
+     *   not ready, thermal refusal, or runner unavailable). Declining is
+     *   ALWAYS safe: the caller falls back to the legacy dispatch.
+     */
+    suspend fun tryLiveRouteTextOnly(
+        textOnlyQuery: String,
+        snapshotProvider: () -> RouterSnapshot,
+        vlmInferenceAllowed: () -> Boolean,
+        analyzeText: suspend (prompt: String, sessionId: String) -> String?,
+    ): String? {
+        val snapshot = snapshotProvider()
+        val signal = RouterSignal(kind = RouterSignal.Kind.SPEECH, spokenText = textOnlyQuery)
+        val decision = VyzeShadowRouter.decide(signal, snapshot)
+        VyzeShadowRouter.logDecision(signal, decision, snapshot)
+
+        // Live grant: general-knowledge voice queries ONLY. Reading intents
+        // (VLM_TEXT_READ) and scene descriptions require the camera frame,
+        // so they always decline to the camera layer's isCapturing-gated
+        // paths — a sightless answer to a sight question is never allowed.
+        // The caller (fragment text-only branch) classifies via the same
+        // isTextOnlyQuery gate the legacy path uses, so VLM_VOICE_QUERY is
+        // the semantically exact action here.
+        if (!shadowEnabled || decision.action != RouterDecision.Action.VLM_VOICE_QUERY ||
+            !snapshot.engineReady || !vlmInferenceAllowed()
+        ) {
+            return null // decline → caller falls back to the legacy dispatch
+        }
+
+        // One live agent-path generation at a time (decline, never queue —
+        // queuing would reorder answers against the legacy pipeline).
+        if (isLiveGenerationActive) return null
+
+        // NOTE: the ADK InMemoryRunner session/execution wiring lands with the
+        // Phase 5 runner-integration task; until then the live path exercises
+        // the same router decision + episode + engine-op chain directly.
+        val sessionId = "adk_text_${textSessionSeq.incrementAndGet()}"
+        episodeManager.openOrTouch(sessionId)
+        if (!liveGenerationActive.compareAndSet(false, true)) return null
+
+        try {
+            val answer = analyzeText(textOnlyQuery, sessionId)
+            if (answer == null) {
+                Log.w(TAG, "Live agent-path text query returned null (declining)")
+                return null
+            }
+            Log.i(TAG, "Live agent-path text query answered via $sessionId")
+            return answer
+        } catch (t: Throwable) {
+            Log.w(TAG, "Live agent-path text query failed: ${t.message}")
+            return null
+        } finally {
+            liveGenerationActive.set(false)
+            episodeManager.close(sessionId)
+        }
+    }
 
     @Synchronized
     fun ensureRunner(snapshotProvider: () -> RouterSnapshot): com.google.adk.kt.runners.InMemoryRunner? {
@@ -292,7 +376,7 @@ object VyzeAgentRuntime {
         if (runner == null) {
             routerAgent = VyzeRouterAgent(snapshotProvider)
             runner = com.google.adk.kt.runners.InMemoryRunner(
-                agent = routerAgent!!,
+                agent = routerAgent!!, 
                 appName = "vyze",
             )
             Log.i(TAG, "Shadow router runner constructed (shadow mode)")
@@ -306,5 +390,7 @@ object VyzeAgentRuntime {
     fun releaseForTests() {
         runner = null
         routerAgent = null
+        liveGenerationActive.set(false)
+        shadowEnabled = false
     }
 }
