@@ -4,10 +4,11 @@
 ![Gemma 4](https://img.shields.io/badge/Gemma-4%20E2B-orange)
 ![ML Kit](https://img.shields.io/badge/ML%20Kit-OCR-red)
 ![LiteRT-LM](https://img.shields.io/badge/LiteRT--LM-0.16.1-green)
+![Google ADK](https://img.shields.io/badge/Google_ADK-Kotlin_0.2.0-4285F4?logo=google)
 ![Min SDK](https://img.shields.io/badge/Min%20SDK-26-orange)
 ![License](https://img.shields.io/badge/License-Apache%202.0-blue)
 
-> **Vyze** is a fully offline AI vision assistant for visually impaired users. Powered by Gemma 4 E2B (2B parameter multimodal model) running on-device via Google's LiteRT-LM framework. Zero internet dependency. Zero subscription costs. Works anywhere.
+> **Vyze** is a fully offline AI vision assistant for visually impaired users. Powered by Gemma 4 E2B (2B parameter multimodal model) running on-device via Google's LiteRT-LM framework, with an agent-orchestration layer built on Google ADK for Kotlin. Zero internet dependency. Zero subscription costs. Works anywhere.
 
 ---
 
@@ -56,10 +57,12 @@ Camera Frame ──→ ML Kit OCR ──→ DynamicPromptBuilder
 |---|---|---|
 | **VlmEngineManager** | `core/VlmEngineManager.kt` | Gemma 4 E2B engine lifecycle, NPU/GPU fallback, inference |
 | **VyzeCoreController** | `core/VyzeCoreController.kt` | Pipeline orchestrator, session isolation, sentence streaming |
+| **VyzeShadowRouter / VyzeAgentRuntime** | `agent/VyzeShadowRouter.kt` | ADK agent lane: gesture/speech routing decisions, live text-query agent (`BaseAgent` + `InMemoryRunner`), session episodes, eval evidence |
 | **DynamicPromptBuilder** | `core/DynamicPromptBuilder.kt` | Intent-based prompt construction, language mirroring |
 | **OcrHelper** | `vision/OcrHelper.kt` | ML Kit on-device OCR (Latin + Chinese) |
 | **TTSManager** | `speech/TTSManager.kt` | Platform TextToSpeech (Google TTS engine preferred), utterance tracking, voice switching, prosody & pronunciation smoothing |
 | **BarcodeHelper** | `vision/BarcodeHelper.kt` | ML Kit on-device 1D/2D barcode detection (EAN/UPC/QR/Data Matrix) |
+| **ThermalPowerController** | `core/ThermalPowerController.kt` | Event-driven thermal governor (4-tier policy ladder); consulted read-only by the agent lane |
 | **PreferenceLearner** | `memory/PreferenceLearner.kt` | Silent behavioral adaptation — learns answer brevity from speech-active interrupts |
 | **CameraSetupDelegate** | `ui/delegates/CameraSetupDelegate.kt` | CameraX frame extraction, snapshot capture, full-resolution ImageCapture stills for OCR text reads |
 | **CameraFragment** | `ui/fragments/CameraFragment.kt` | UI, speech callbacks, auto-snapshot loop |
@@ -79,6 +82,7 @@ app/src/main/java/com/vyze/app/
 ├── ui/          Fragments, delegates, views, viewmodels
 ├── memory/      Adaptive intelligence: preference learning, scene memory
 ├── data/        Room database: DAOs, entities, repositories
+├── agent/       ADK agent lane: shadow router, live query agent, session episodes, eval
 └── util/        Crash logging
 ```
 
@@ -139,6 +143,16 @@ Vyze holds audio focus for the whole session and speaks through the **media stre
 ### Text-Only Q&A (no camera)
 Questions that don't reference the visual scene — "what is paracetamol used for?", "bagaimana cara mengikat tali?" — are answered by Gemma's text decoder alone: no camera capture, no image inference. Faster and cheaper, and it works without pointing the phone at anything. Any question mentioning "this / here / in front of me" is conservatively routed to the camera instead, so a pointing question is never stolen.
 
+### Agent Orchestration (Google ADK)
+Vyze layers **Google ADK for Kotlin** (`google-adk-kotlin-core-android:0.2.0` + KSP processor) on top of the native pipeline as a pure orchestration layer — every native subsystem (CameraX capture, TTSManager, OCR fast path, Embedding Gates, `ThermalPowerController`) stays 100% intact underneath:
+
+- **Shadow router** — a pure decision function mirrors the legacy gesture/speech dispatch taxonomy and logs `SHADOW-ROUTE:` decisions without executing anything; a real ADK `BaseAgent` runs those decisions through the `InMemoryRunner` event pipeline.
+- **Live query agent** — text-only voice questions can be answered end-to-end on the agent path: a `BaseAgent` orchestrates inside the ADK `InMemoryRunner`, carries persona/brevity context as ADK session state, and calls the Gemma engine through a watchdog-disciplined wrapper (`analyzeTextDirect`) that never touches the engine's internal `generationMutex` or session handling.
+- **Session episodes** — one episode per ADK session with idle eviction (5 min, shrunk to 90 s under thermal pressure) plus a defense-in-depth orphan-session sweep every 60 s from a lifecycle-aware ticker in `CameraFragment`.
+- **Eval-driven promotion** — every agent-lane attempt is tallied (answered / failed / declined / declined-busy) in a bounded 200-entry ring; `shouldPromoteToLive()` reports whether the window meets the promotion bar (≥30 attempts, ≥20 answered, ≥80% answer rate). The flag flip itself is always manual.
+- **Ships dark** — the live lane is flag-gated off in production; declines fall back to the exact legacy dispatch path, so the agent lane changes nothing until it is deliberately enabled after on-device eval review.
+- **Invariants** — `isCapturing` CAS gate untouched, `ThermalPowerController` consulted read-only only, no frame access from the text-only lane (a sightless answer to a sight question is never allowed).
+
 ### Noisy-Room Rescue (model-native ASR)
 When Android's recognizer gives up (no match, timeout, audio error — the classic "lost in a room full of people" case), Vyze speaks "Please say that again", records the repeat via `AudioCapture` (16 kHz mono float32 PCM), and transcribes it with Gemma 4 E2B's built-in audio encoder — fully offline, no Google services, one attempt per session, no beep loops.
 
@@ -172,6 +186,7 @@ GPU kernels are pre-compiled during warm-up to eliminate first-inference cold-st
 | Component | Technology |
 |---|---|
 | **VLM Engine** | Gemma 4 E2B (2.59 GB, multimodal) via LiteRT-LM 0.16.1 |
+| **Agent Orchestration** | Google ADK for Kotlin (`google-adk-kotlin-core-android:0.2.0` + KSP processor) — shadow router, live query agent, session episodes, eval |
 | **OCR** | Google ML Kit Text Recognition (Latin + Chinese) |
 | **Barcode** | Google ML Kit Barcode Scanning (1D + 2D) |
 | **Camera** | CameraX 1.3.1 |
@@ -217,6 +232,25 @@ Vyze needs two sets of models:
 adb install app/build/outputs/apk/debug/app-debug.apk
 ```
 
+### Agent Lane (ADK) verification
+
+The ADK lane ships dark. To exercise it on-device, enable the agent flag in a debug build, then:
+
+```bash
+# Shadow routing decisions (log-only, nothing executed)
+adb logcat -s VyzeShadowRouter | grep SHADOW-ROUTE
+
+# Eval window + promote-to-live verdict, logged every 60s while the camera screen is up
+adb logcat -s CameraFragment | grep "ADK eval"
+
+# Thermal policy verification (Android 10+: override the OS thermal status)
+adb shell cmd thermalservice override-status 2   # MODERATE — episode idle window shrinks to 90s
+adb shell cmd thermalservice override-status 4   # CRITICAL — VLM halted, OCR reads still work
+adb shell cmd thermalservice override-status 0   # clear override
+```
+
+The promotion bar (≥30 attempts, ≥20 answered, ≥80% answer rate, declines ≤ half the window) informs a **manual** flag flip — the runtime never enables itself.
+
 ---
 
 ## Permissions
@@ -250,6 +284,7 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 | Aggressive speech endpoints (300ms) | Faster voice query recognition |
 | Session isolation (UUID gating) | Prevents stale results from previous queries |
 | Watchdog timer (15s) | Prevents indefinite ANALYZING state |
+| Agent-lane maintenance ticker (60s) | Episode eviction + orphan ADK session sweep; thermal-shrunk windows keep the in-memory session store bounded |
 | Scene-unchanged gating (continuous mode) | Skips Gemma when similarity ≥ 0.9 vs last spoken scene |
 | Coalesced sentence flushing | ~2 sentences per utterance — removes inter-sentence seams |
 | Continuous mode thermal safety (3min) | Prevents SoC throttling on mid-tier chips |
