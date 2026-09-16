@@ -78,10 +78,13 @@ object VyzeAgentTopology {
  * currentChunkStarted) or its single-funnel flush logic.
  */
 class FastPerceptionToolContracts(
-    /** Runs the existing ML Kit OCR pipeline on the current camera frame. */
-    private val ocrCurrentFrame: suspend (includeChinese: Boolean) -> String,
-    /** Maps a tap to its 3x3 sector via the existing gridSectorFor logic. */
-    private val gridSectorFor: (x: Int, y: Int) -> String,
+    /** Runs the existing ML Kit OCR pipeline on the current camera frame.
+     *  Nullable result: the contract coalesces null (no text found) to "". */
+    private val ocrCurrentFrame: suspend (includeChinese: Boolean) -> String?,
+    /** Maps a tap to its 3x3 sector via the existing gridSectorFor logic.
+     * Phase 1 refinement: frame dimensions pass through verbatim so this is
+     * a zero-reimplementation delegate of the native mapper. */
+    private val gridSectorFor: (x: Int, y: Int, frameW: Int, frameH: Int) -> String,
     /** Binds to TTSManager.speakImmediate() - NEVER to the streaming path. */
     private val speakImmediate: (text: String) -> Boolean,
     /** Binds to the existing HapticManager pattern library. */
@@ -90,13 +93,15 @@ class FastPerceptionToolContracts(
     @Tool(description = "Performs instant on-device text recognition on the current camera frame; returns in under 50ms")
     suspend fun runFastOcr(
         @Param("Use true to merge the Chinese-capable recognizer for CJK signage") includeChinese: Boolean,
-    ): Map<String, String> = mapOf("text" to ocrCurrentFrame(includeChinese))
+    ): Map<String, String> = mapOf("text" to (ocrCurrentFrame(includeChinese) ?: ""))
 
     @Tool(description = "Maps raw tap pixel coordinates to one of nine grid sectors of the camera frame")
     fun calculateSpatialGrid(
         @Param("Tap x pixel") x: Int,
         @Param("Tap y pixel") y: Int,
-    ): Map<String, String> = mapOf("sector" to gridSectorFor(x, y))
+        @Param("Camera frame width in pixels") frameW: Int,
+        @Param("Camera frame height in pixels") frameH: Int,
+    ): Map<String, String> = mapOf("sector" to gridSectorFor(x, y, frameW, frameH))
 
     @Tool(description = "Speaks short deterministic text immediately without any generative model delay")
     fun speakImmediateTts(
