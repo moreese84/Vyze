@@ -204,12 +204,132 @@ class VyzeRouterAgent(
                     invocationId = ctx.invocationId,
                     author = name,
                     content = Content.fromText(
-                        "shadow:${decision.action} reason=${decision.reason}",
                         "model",
+                        "shadow:${decision.action} reason=${decision.reason}",
                     ),
                 )
             )
             emitEndOfAgent(ctx) // member-extension on FlowCollector; completion event
+        }
+}
+
+// ── Phase 5: LIVE query agent (orchestrates the native engine op) ────
+
+/**
+ * The Phase 5 live-query orchestrator. Like [VyzeRouterAgent], this is a
+ * real ADK [BaseAgent] whose [runAsyncImpl] emits real ADK [Event]s — the
+ * live answer flows through the actual runner machinery.
+ *
+ * HYBRID PATHING (Phase 0 directive #3): there is NO external LLM here.
+ * The heavyweight reasoning is performed by the native LiteRT-LM engine
+ * through the injected [answerOp] (bound to
+ * VyzeCoreController.analyzeTextDirect by the caller). The agent's job is
+ * the ORCHESTRATION that previously lived inline in the fragment's legacy
+ * ladder, moved here as data:
+ *
+ *  - CONTEXT ASSEMBLY: [queryContext] mirrors what the native text-query
+ *    path assembles (persona/directive lines, session state) — assembled
+ *    INSIDE the agent and applied to session state so every turn of the
+ *    episode carries it, instead of every call site re-string-building it.
+ *    The native path is untouched; this mirrors its behavior for the
+ *    agent lane only.
+ *  - SESSION EPISODES: the runner's session id IS the `adk_text_<n>`
+ *    episode id managed by [SessionEpisodeManager] — one ADK session per
+ *    live query, thermally-shrunk idle eviction, no cross-talk with the
+ *    native pipeline's sessions (stale-session gate).
+ *  - HARDWARE INVARIANTS: no frame access of any kind (text-only lane);
+ *    ThermalPowerController consulted read-only by the CALLER's gates,
+ *    never overridden here.
+ *
+ * Engine busy-state is declined by [com.vyze.app.core.VyzeCoreController
+ * .analyzeTextDirect] itself (isInferring CAS) — the agent can never
+ * race or reorder a native generation.
+ */
+class VyzeLiveQueryAgent(
+    /**
+     * The engine op: (prompt, sessionId) -> answer?. Bound to
+     * VyzeCoreController.analyzeTextDirect — its internal isInferring CAS
+     * + watchdog + cancelInference discipline is the decline path.
+     */
+    private val answerOp: suspend (prompt: String, sessionId: String) -> String?,
+    /**
+     * Context assembly mirroring the native text-query path (persona
+     * lines, directives). Pure over its inputs so tests can assert on it.
+     */
+    private val queryContext: QueryContext = QueryContext(),
+) : BaseAgent(
+    name = "vyze_live_query",
+    description = "Vyze live text-query orchestrator over the native LiteRT-LM engine",
+) {
+
+    /**
+     * Context assembly inputs — mirrors DynamicPromptBuilder's text-only
+     * behavior: persona/directive lines + locale brevity, applied as ADK
+     * session state so the instruction text travels with the episode.
+     */
+    data class QueryContext(
+        val personaDirective: String = DEFAULT_PERSONA_DIRECTIVE,
+        val answerStyleDirective: String = DEFAULT_ANSWER_STYLE_DIRECTIVE,
+    ) {
+        /** The system-style preamble prepended to the user's question. */
+        fun instructionFor(question: String): String =
+            "$personaDirective\n$answerStyleDirective\n\nUser question: $question"
+
+        fun asSessionState(): Map<String, Any> = mapOf(
+            "persona" to personaDirective,
+            "answer_style" to answerStyleDirective,
+            "lane" to "adk_live_text",
+        )
+
+        companion object {
+            /** Mirrors the native persona: concise, sighted-assistant voice. */
+            const val DEFAULT_PERSONA_DIRECTIVE =
+                "You are Vyze, a concise sighted assistant for a blind user. " +
+                    "Answer in the user's language (English, Bahasa Melayu, or Chinese)."
+
+            /** Mirrors the native brevity/audibility style for TTS delivery. */
+            const val DEFAULT_ANSWER_STYLE_DIRECTIVE =
+                "Answer in 1-3 short spoken sentences. No markdown, no lists, " +
+                    "no emoji. Lead with the direct answer."
+        }
+    }
+
+    override fun runAsyncImpl(ctx: InvocationContext): kotlinx.coroutines.flow.Flow<Event> =
+        kotlinx.coroutines.flow.flow {
+            val sessionId = ctx.session.key.id ?: "adk_orphan"
+            val question = ctx.userContent?.parts
+                ?.mapNotNull { it.text }
+                ?.joinToString(" ")
+                ?.trim()
+                .orEmpty()
+
+            if (question.isEmpty()) {
+                emit(
+                    Event(
+                        invocationId = ctx.invocationId,
+                        author = name,
+                        content = Content.fromText("model", ""),
+                    )
+                )
+                emitEndOfAgent(ctx)
+                return@flow
+            }
+
+            // CONTEXT ASSEMBLY inside the agent (Phase 5): the prompt that
+            // reaches the engine carries the persona + style directives.
+            val prompt = queryContext.instructionFor(question)
+
+            val answer = answerOp(prompt, sessionId)
+
+            emit(
+                Event(
+                    invocationId = ctx.invocationId,
+                    author = name,
+                    // Content.fromText(role, text) — role FIRST (0.2.0 API).
+                    content = Content.fromText("model", answer.orEmpty()),
+                )
+            )
+            emitEndOfAgent(ctx)
         }
 }
 
@@ -281,8 +401,14 @@ class SessionEpisodeManager(
 object VyzeAgentRuntime {
 
     private const val TAG = "VyzeAgentRuntime"
+    private const val APP_NAME = "vyze"
+    private const val USER_ID = "vyze_user"
     private var runner: com.google.adk.kt.runners.InMemoryRunner? = null
     private var routerAgent: VyzeRouterAgent? = null
+
+    /** Phase 5: the live query orchestrator + its runner (same session service). */
+    private var liveAgent: VyzeLiveQueryAgent? = null
+    private var liveRunner: com.google.adk.kt.runners.InMemoryRunner? = null
     private val episodeManager = SessionEpisodeManager()
 
     /** Flip point for Phase 4. Ships false; no production reader until the hook. */
@@ -323,6 +449,7 @@ object VyzeAgentRuntime {
         snapshotProvider: () -> RouterSnapshot,
         vlmInferenceAllowed: () -> Boolean,
         analyzeText: suspend (prompt: String, sessionId: String) -> String?,
+        queryContext: VyzeLiveQueryAgent.QueryContext = VyzeLiveQueryAgent.QueryContext(),
     ): String? {
         val snapshot = snapshotProvider()
         val signal = RouterSignal(kind = RouterSignal.Kind.SPEECH, spokenText = textOnlyQuery)
@@ -346,20 +473,49 @@ object VyzeAgentRuntime {
         // queuing would reorder answers against the legacy pipeline).
         if (isLiveGenerationActive) return null
 
-        // NOTE: the ADK InMemoryRunner session/execution wiring lands with the
-        // Phase 5 runner-integration task; until then the live path exercises
-        // the same router decision + episode + engine-op chain directly.
+        // PHASE 5: the live path executes through the REAL ADK InMemoryRunner
+        // (runAsync event pipeline). The session id IS the episode id — the
+        // runner auto-creates the missing session, the agent applies context
+        // and calls the injected engine op, and the final model Event carries
+        // the answer back to the caller.
         val sessionId = "adk_text_${textSessionSeq.incrementAndGet()}"
         episodeManager.openOrTouch(sessionId)
         if (!liveGenerationActive.compareAndSet(false, true)) return null
 
+        var execRunner: com.google.adk.kt.runners.InMemoryRunner? = null
         try {
-            val answer = analyzeText(textOnlyQuery, sessionId)
+            execRunner = ensureLiveRunner(analyzeText, queryContext)
+            if (execRunner == null) {
+                Log.w(TAG, "Live runner unavailable (flag off?) — declining")
+                return null
+            }
+            val events = execRunner.runAsync(
+                userId = USER_ID,
+                sessionId = sessionId,
+                invocationId = null,
+                // Content.fromText(role, text) — role FIRST (0.2.0 API).
+                newMessage = Content.fromText("user", textOnlyQuery),
+                // Context assembly travels as ADK session state — applied by
+                // the runner at invocation setup, so the whole episode carries
+                // the persona/style directives (Phase 5 design).
+                stateDelta = queryContext.asSessionState(),
+                runConfig = com.google.adk.kt.agents.RunConfig(),
+            )
+            // The agent emits exactly one text event (empty on decline) plus
+            // the end-of-agent marker; take the LAST text as the answer.
+            var answer: String? = null
+            events.collect { event ->
+                val text = event.content?.parts
+                    ?.mapNotNull { it.text }
+                    ?.joinToString("")
+                    .orEmpty()
+                if (text.isNotEmpty()) answer = text
+            }
             if (answer == null) {
                 Log.w(TAG, "Live agent-path text query returned null (declining)")
                 return null
             }
-            Log.i(TAG, "Live agent-path text query answered via $sessionId")
+            Log.i(TAG, "Live agent-path text query answered via $sessionId (ADK runner)")
             return answer
         } catch (t: Throwable) {
             Log.w(TAG, "Live agent-path text query failed: ${t.message}")
@@ -367,7 +523,40 @@ object VyzeAgentRuntime {
         } finally {
             liveGenerationActive.set(false)
             episodeManager.close(sessionId)
+            // Session-per-turn hygiene: the ADK session is never reused (each
+            // query gets a fresh adk_text_<n> id), so delete it to keep the
+            // runner's in-memory session store bounded. NonCancellable so the
+            // cleanup also runs when the caller's coroutine was cancelled.
+            if (execRunner != null) {
+                try {
+                    kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
+                        execRunner!!.sessionService.deleteSession(
+                            com.google.adk.kt.sessions.SessionKey(APP_NAME, USER_ID, sessionId)
+                        )
+                    }
+                } catch (t: Throwable) {
+                    Log.w(TAG, "ADK session cleanup failed: ${t.message}")
+                }
+            }
         }
+    }
+
+    /** Lazily constructs the Phase 5 live agent + runner over its own session service. */
+    @Synchronized
+    private fun ensureLiveRunner(
+        analyzeText: suspend (prompt: String, sessionId: String) -> String?,
+        queryContext: VyzeLiveQueryAgent.QueryContext,
+    ): com.google.adk.kt.runners.InMemoryRunner? {
+        if (!shadowEnabled) return null
+        if (liveRunner == null || liveAgent == null) {
+            liveAgent = VyzeLiveQueryAgent(answerOp = analyzeText, queryContext = queryContext)
+            liveRunner = com.google.adk.kt.runners.InMemoryRunner(
+                agent = liveAgent!!, 
+                appName = "vyze",
+            )
+            Log.i(TAG, "Live query runner constructed (agent lane over native engine)")
+        }
+        return liveRunner
     }
 
     @Synchronized
@@ -386,11 +575,27 @@ object VyzeAgentRuntime {
 
     fun episodes(): SessionEpisodeManager = episodeManager
 
+    /**
+     * The live lane's ADK session service — ops/inspection hook (Phase 6
+     * eviction tooling); null until the live runner is first constructed.
+     */
+    @Synchronized
+    fun liveSessionService(): com.google.adk.kt.sessions.SessionService? = liveRunner?.sessionService
+
     @Synchronized
     fun releaseForTests() {
         runner = null
         routerAgent = null
+        liveRunner = null
+        liveAgent = null
         liveGenerationActive.set(false)
         shadowEnabled = false
+    }
+
+    /** Forces live-lane runner reconstruction with the NEXT bound op — test isolation only. */
+    @Synchronized
+    fun resetLiveRunnerForTests() {
+        liveRunner = null
+        liveAgent = null
     }
 }

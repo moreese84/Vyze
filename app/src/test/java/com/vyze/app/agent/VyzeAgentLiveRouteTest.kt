@@ -9,14 +9,23 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * JVM unit tests for the Phase 4 live-route runtime
+ * JVM unit tests for the live-route runtime
  * ([VyzeAgentRuntime.tryLiveRouteTextOnly]).
  *
- * Scope: grant/decline semantics over injected gates. The ADK runner
- * execution wiring and Android-context bindings belong to instrumented
- * tests in Phase 5.
+ * Scope: grant/decline semantics over injected gates. Since Phase 5 the
+ * granted path executes through the REAL ADK [com.google.adk.kt.runners
+ * .InMemoryRunner] (runAsync event pipeline) with the injected engine op —
+ * so these tests also prove the runner integration end-to-end on the JVM.
+ * Android-context bindings remain with instrumented tests.
  */
 class VyzeAgentLiveRouteTest {
+
+    @org.junit.Before
+    fun isolateRunner() {
+        // The live runner caches its bound engine op; each test gets a fresh
+        // construction so injections never leak across tests.
+        VyzeAgentRuntime.resetLiveRunnerForTests()
+    }
 
     private fun snapshot(
         engineReady: Boolean = true,
@@ -43,9 +52,28 @@ class VyzeAgentLiveRouteTest {
                 gotPrompt = prompt; gotSession = sid; "A pain reliever."
             },
         )
-        assertEquals("what is paracetamol used for?", gotPrompt)
+        // Phase 5: the op receives the ASSEMBLED prompt (persona + style +
+        // question), verbatim per QueryContext.instructionFor.
+        assertEquals(
+            VyzeLiveQueryAgent.QueryContext().instructionFor("what is paracetamol used for?"),
+            gotPrompt
+        )
         assertTrue("session id must use the adk_text namespace", gotSession!!.startsWith("adk_text_"))
         assertEquals("A pain reliever.", answer)
+        // Context assembly traveled with the invocation (Phase 5): the agent
+        // prepends the persona + style directives to the raw question.
+        assertTrue(
+            "prompt must carry the persona directive",
+            gotPrompt!!.contains(VyzeLiveQueryAgent.QueryContext.DEFAULT_PERSONA_DIRECTIVE)
+        )
+        assertTrue(
+            "prompt must carry the answer-style directive",
+            gotPrompt!!.contains(VyzeLiveQueryAgent.QueryContext.DEFAULT_ANSWER_STYLE_DIRECTIVE)
+        )
+        assertTrue(
+            "prompt must end with the raw user question",
+            gotPrompt!!.endsWith("User question: what is paracetamol used for?")
+        )
         // Episode closed after the generation.
         assertEquals(0, rt.episodes().size())
         assertFalse(rt.isLiveGenerationActive)
