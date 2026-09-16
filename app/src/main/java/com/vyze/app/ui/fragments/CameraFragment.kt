@@ -1,5 +1,9 @@
 package com.vyze.app.ui.fragments
 import com.vyze.app.VyzeApplication
+import com.vyze.app.agent.RouterSignal
+import com.vyze.app.agent.RouterSnapshot
+import com.vyze.app.agent.VyzeAgentRuntime
+import com.vyze.app.agent.VyzeShadowRouter
 import com.vyze.app.core.ThermalPowerController
 import com.vyze.app.R
 import com.vyze.app.util.CrashLogFile
@@ -90,6 +94,37 @@ class CameraFragment : Fragment() {
 
     @Volatile
     private var isCameraActive = false
+
+    /**
+     * PHASE 3 SHADOW ROUTER (approved migration): logs the agent-path routing
+     * decision for every barge-in query. SHADOW-ONLY — nothing is executed,
+     * the legacy dispatch below runs unchanged, and the flag gates the whole
+     * block. Hardware invariants untouched: isCapturing and
+     * ThermalPowerController are neither read nor modified here.
+     */
+    private fun logShadowRoute(query: String) {
+        if (!VyzeAgentRuntime.shadowEnabled) return
+        try {
+            VyzeShadowRouter.logDecision(
+                signal = RouterSignal(kind = RouterSignal.Kind.SPEECH, spokenText = query),
+                decision = VyzeShadowRouter.decide(
+                    signal = RouterSignal(kind = RouterSignal.Kind.SPEECH, spokenText = query),
+                    snapshot = RouterSnapshot(
+                        engineReady = coreController.isEngineReady(),
+                        isInferring = coreController.isCurrentlyInferring(),
+                        captureAvailable = isCapturing.get(),
+                    ),
+                ),
+                snapshot = RouterSnapshot(
+                    engineReady = coreController.isEngineReady(),
+                    isInferring = coreController.isCurrentlyInferring(),
+                    captureAvailable = isCapturing.get(),
+                ),
+            )
+        } catch (t: Throwable) {
+            CrashLogFile.log(TAG, "shadow route log failed: ${t.message}")
+        }
+    }
 
     @Volatile
     private var onboardingSpoken = false
@@ -589,6 +624,9 @@ class CameraFragment : Fragment() {
     // ══════════════════════════════════════════════════════════════════
 
     private fun bargeInAndCapture(query: String) {
+        // PHASE 3 SHADOW ROUTER: observe + log only (see logShadowRoute).
+        logShadowRoute(query)
+
         // Any new gesture always ends an in-progress voice audition first.
         stopVoiceAuditionIfActive()
 
