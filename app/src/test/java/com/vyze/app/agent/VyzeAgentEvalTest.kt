@@ -185,4 +185,13 @@ class VyzeAgentEvalTest {
         assertEquals(0, rt.maintenanceTick { true })
         rt.episodes().close("adk_text_probe")
     }
+
+    @Test
+    fun `tick default-arg contract holds for the fragment ticker`() = runBlocking {
+        // The production ticker (CameraFragment, every 60s) calls
+        // maintenanceTick() with the default lambda, letting the runtime
+        // apply its NORMAL-window episode policy. Locks the signature so
+        // the no-arg call site keeps compiling.
+        assertEquals(0, VyzeAgentRuntime.maintenanceTick())
+    }
 }

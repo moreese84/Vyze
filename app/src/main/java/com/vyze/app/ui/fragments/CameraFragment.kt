@@ -4,8 +4,11 @@ import com.vyze.app.agent.RouterSignal
 import com.vyze.app.agent.RouterSnapshot
 import com.vyze.app.agent.VyzeAgentRuntime
 import com.vyze.app.agent.VyzeShadowRouter
+import com.vyze.app.core.ThermalPolicy
 import com.vyze.app.core.ThermalPowerController
 import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import com.vyze.app.R
 import com.vyze.app.util.CrashLogFile
@@ -96,6 +99,52 @@ class CameraFragment : Fragment() {
 
     @Volatile
     private var isCameraActive = false
+
+    /**
+     * PHASE 6 MAINTENANCE TICKER — the production caller for
+     * [VyzeAgentRuntime.maintenanceTick] (episode idle-eviction + orphan ADK
+     * session sweep). Runs every [MAINTENANCE_TICK_MS] while the fragment is
+     * STARTED; thermal status is supplied READ-ONLY from
+     * ThermalPowerController (the sole thermal authority — never modified,
+     * never bypassed; we only ask). Purely in-memory bookkeeping: no VLM,
+     * TTS, camera, or hardware interaction, so the tick can never contend
+     * with an active capture or generation.
+     */
+    private var maintenanceJob: Job? = null
+
+    private fun startMaintenanceTicker() {
+        if (maintenanceJob?.isActive == true) return
+        maintenanceJob = viewLifecycleOwner.lifecycleScope.launch {
+            while (true) {
+                delay(MAINTENANCE_TICK_MS)
+                try {
+                    val thermallyConstrained =
+                        thermalController().policy.tier >= ThermalPolicy.TIER_MODERATE
+                    VyzeAgentRuntime.maintenanceTick { thermallyConstrained }
+                    // Flip-review visibility: log the eval window + promote
+                    // predicate so the shadow→live decision is observable
+                    // on-device via `adb logcat -s CameraFragment`.
+                    if (VyzeAgentRuntime.shadowEnabled) {
+                        val s = VyzeAgentRuntime.evalSummary()
+                        Log.d(
+                            TAG,
+                            "ADK eval: ${s.total} attempts, ${s.answered} answered " +
+                                "(rate=${"%.2f".format(s.successRate)}), flip-candidate=" +
+                                VyzeAgentRuntime.shouldPromoteToLive(),
+                        )
+                    }
+                } catch (t: Throwable) {
+                    // Never fatal: maintenance is hygiene, not pipeline.
+                    CrashLogFile.log(TAG, "maintenance tick failed: ${t.message}")
+                }
+            }
+        }
+    }
+
+    private fun stopMaintenanceTicker() {
+        maintenanceJob?.cancel()
+        maintenanceJob = null
+    }
 
     /**
      * PHASE 3 SHADOW ROUTER (approved migration): logs the agent-path routing
@@ -684,6 +733,13 @@ class CameraFragment : Fragment() {
         stopContinuousLoop()
         endFollowUpWindow()
         cameraSetup.releaseCamera()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        // PHASE 6: periodic agent-lane hygiene (episodes + orphan sessions).
+        // Paused while backgrounded so the app does no work it cannot see.
+        startMaintenanceTicker()
     }
 
     override fun onDestroyView() {
@@ -2481,5 +2537,8 @@ class CameraFragment : Fragment() {
 
         /** Delay before re-checking TalkBack after returning from Accessibility Settings (ms). */
         private const val ACCESSIBILITY_RETURN_RECHECK_DELAY_MS = 1_800L
+
+        /** PHASE 6: agent-lane maintenance period (episode eviction + orphan session sweep). */
+        private const val MAINTENANCE_TICK_MS = 60_000L
     }
 }

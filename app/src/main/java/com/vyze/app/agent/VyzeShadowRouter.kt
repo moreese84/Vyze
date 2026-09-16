@@ -805,7 +805,9 @@ object VyzeAgentRuntime {
      * No VLM/TTS/hardware interaction; safe to call at any time. Returns
      * the number of orphaned ADK sessions deleted.
      */
-    suspend fun maintenanceTick(isThermallyConstrained: () -> Boolean): Int {
+    suspend fun maintenanceTick(
+        isThermallyConstrained: () -> Boolean = { false },
+    ): Int {
         val evicted = episodeManager.evictIdle(isThermallyConstrained())
         if (evicted.isNotEmpty()) {
             Log.d(TAG, "Maintenance: evicted ${evicted.size} idle episode(s)")
