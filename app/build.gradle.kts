@@ -105,6 +105,20 @@ android {
         jniLibs {
             useLegacyPackaging = true
         }
+        resources {
+            // ADK transitives (google-genai, google-auth-library, api-common)
+            // ship overlapping jar METADATA entries. These are inert manifest
+            // files — excluding them has no runtime effect; merging is what
+            // fails otherwise (mergeReleaseJavaResource).
+            excludes += setOf(
+                "META-INF/INDEX.LIST",
+                "META-INF/DEPENDENCIES",
+                "META-INF/LICENSE",
+                "META-INF/LICENSE.txt",
+                "META-INF/NOTICE",
+                "META-INF/NOTICE.txt",
+            )
+        }
     }
 }
 
@@ -149,6 +163,42 @@ dependencies {
 
     // LiteRT-LM runtime for on-device VLM inference (SmolVLM2-500M)
     implementation("com.google.ai.edge.litertlm:litertlm-android:0.16.1")
+
+    // ── Google ADK for Kotlin (ADK migration Phase 0) ─────────────
+    // Orchestration layer ONLY. Inert until Phase 3/4: the VyzeAgentModule
+    // declares the agent/tool facades but nothing in production calls them
+    // yet. The Android artifact REPLACES the JVM one — never add both
+    // (per developer.android.com/ai/adk).
+    implementation("com.google.adk:google-adk-kotlin-core-android:0.2.0")
+    // KSP processor that generates tool descriptors from @Tool-annotated
+    // functions (consumed via generatedTools() in Phase 1).
+    ksp("com.google.adk:google-adk-kotlin-processor:0.2.0")
+
+    // ADK conflict-resolution FIX: ADK's transitive graph requests the
+    // empty marker jar com.google.guava:listenablefuture:9999.0
+    // (-empty-to-avoid-conflict-with-guava), which outranks the real
+    // listenablefuture:1.0 that CameraX-dependent code
+    // (FlashlightManager, CameraSetupDelegate) compiles against. Scope the
+    // force to COMPILE classpaths only: runtime must keep ADK's own
+    // resolution (empty marker + full guava) — forcing the real jar onto
+    // runtime graphs too would duplicate ListenableFuture at packaging
+    // (checkReleaseDuplicateClasses) alongside ADK's guava:33.4.0.
+    // (If a later ADK phase ever needs full Guava on the compile classpath,
+    // add com.google.guava:guava deliberately at that point instead.)
+    configurations.matching { it.name.endsWith("CompileClasspath") }.all {
+        resolutionStrategy.force("com.google.guava:listenablefuture:1.0")
+    }
+
+    configurations.all {
+        // R8 FIX: kxml2 (ADK cloud transitive) packages its own copy of
+        // org.xmlpull.v1.XmlPullParser, flipping it from a platform library
+        // class to a program class — R8 then hard-errors on
+        // "library class android.content.res.XmlResourceParser implements
+        // program class org.xmlpull.v1.XmlPullParser". Android provides
+        // org.xmlpull.v1 in the platform, so the jar is redundant on-device
+        // (and absent from the pre-ADK classpath).
+        exclude(group = "net.sf.kxml", module = "kxml2")
+    }
 
     // Room (local database for scan history + VLM memory)
     val room_version = "2.7.0"
