@@ -294,6 +294,14 @@ The promotion bar (≥30 attempts, ≥20 answered, ≥80% answer rate, declines 
 
 ---
 
+## Credits & Acknowledgements
+
+| Contributor | Contribution |
+|---|---|
+| [**ctaxnagomi**](https://github.com/ctaxnagomi) | Architecture Review & Orchestrator Design Specification (agentic AI systems) |
+
+---
+
 ## License
 
 Licensed under the Apache License, Version 2.0 — see [LICENSE](LICENSE) for details.
