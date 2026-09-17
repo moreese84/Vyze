@@ -284,12 +284,14 @@ class VyzeLiveQueryAgent(
         companion object {
             /** Mirrors the native persona: concise, sighted-assistant voice. */
             const val DEFAULT_PERSONA_DIRECTIVE =
-                "You are Vyze, a concise sighted assistant for a blind user. " +
+                "You are Vyze, a fast, friendly sighted assistant for a blind user. " +
+                    "Always address the user in the second person ('you', 'your', 'in front of you') — " +
+                    "never 'in front of me' or 'to my left'. " +
                     "Answer in the user's language (English, Bahasa Melayu, or Chinese)."
 
             /** Mirrors the native brevity/audibility style for TTS delivery. */
             const val DEFAULT_ANSWER_STYLE_DIRECTIVE =
-                "Answer in 1-3 short spoken sentences. No markdown, no lists, " +
+                "Answer in 1 short spoken sentence. No markdown, no lists, " +
                     "no emoji. Lead with the direct answer."
         }
     }

@@ -86,11 +86,14 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
             //     must never be cut short, regardless of brevity.)
             when (brevityLevel) {
                 com.vyze.app.memory.PreferenceLearner.BrevityLevel.BRIEF -> {
-                    sb.appendLine("LENGTH: Keep your answer concise — at most 2 short sentences. The user is pressed for time.")
+                    // PERSPECTIVE FIX: the global persona now caps answers at ONE
+                    // short spoken sentence (VlmEngineManager.SYSTEM_DIRECTIVE) —
+                    // the adaptive BRIEF level must not instruct a LOOSER cap.
+                    sb.appendLine("LENGTH: Answer in ONE short sentence, kept tight — the user is pressed for time.")
                     sb.appendLine()
                 }
                 com.vyze.app.memory.PreferenceLearner.BrevityLevel.TERSE -> {
-                    sb.appendLine("LENGTH: Answer in ONE short sentence. The user consistently prefers minimal answers.")
+                    sb.appendLine("LENGTH: Answer in ONE short sentence with only the essential detail. The user consistently prefers minimal answers.")
                     sb.appendLine()
                 }
                 com.vyze.app.memory.PreferenceLearner.BrevityLevel.NORMAL -> { /* no adaptation */ }
