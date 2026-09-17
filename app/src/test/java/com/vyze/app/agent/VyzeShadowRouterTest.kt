@@ -6,12 +6,13 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * JVM unit tests for the Phase 3 shadow router.
+ * JVM unit tests for the pure decision router (single-master migration:
+ * the ADK-native sub-agents were removed — execution now lives in
+ * [AdkAgentManager] / [VyzeMasterAgent]).
  *
  * Scope: the PURE decision function ([VyzeShadowRouter.decide]) and the
- * [SessionEpisodeManager] lifecycle. The ADK-native [VyzeRouterAgent] and
- * [VyzeAgentRuntime] touch the ADK runner pipeline and belong to
- * instrumented tests in a later phase.
+ * [SessionEpisodeManager] lifecycle. The master-agent runner pipeline
+ * belongs to instrumented tests in a later phase.
  */
 class VyzeShadowRouterTest {
 

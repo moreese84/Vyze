@@ -1,29 +1,27 @@
 package com.vyze.app.agent
 
 import android.util.Log
-import com.google.adk.kt.agents.BaseAgent
-import com.google.adk.kt.agents.InvocationContext
-import com.google.adk.kt.events.Event
-import com.google.adk.kt.types.Content
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * PHASE 3 — SHADOW ROUTER (approved migration plan, Phase 3).
+ * VYZE MIGRATION PLAN v3 — PURE DECISION TAXONOMY (sub-agents removed).
  *
- * The [VyzeRouterAgent] runs the same routing decision as the legacy
- * gesture dispatch and logs `SHADOW-ROUTE:` lines — every decision is
- * observable in logcat, NONE is executed. Production behavior is
- * byte-identical to pre-Phase 3 unless the caller explicitly flips
- * [ShadowRouterConfig.enabled] (a Phase 4 decision; the flag ships false
- * and is not referenced by any production call path).
+ * This file now holds ONLY the pure, unit-testable decision machinery:
+ * the legacy-mirroring route taxonomy ([RouterSignal] / [RouterDecision] /
+ * [VyzeShadowRouter.decide]), the session-episode store, and the bounded
+ * shadow→live evaluation evidence. The ADK-native sub-agents that used to
+ * live here ([VyzeRouterAgent], [VyzeLiveQueryAgent]) are DELETED per the
+ * single-master plan: every query entry point now goes directly through
+ * [VyzeMasterAgent] via [AdkAgentManager.execute], and execution-side
+ * state (runner, busy gate, timeout, fallback) lives in [AdkAgentManager].
  *
- * Hardware invariants (binding constraints, Phase 0 directive #4):
+ * Hardware invariants (binding constraints, unchanged):
  *  - `isCapturing` (CameraFragment AtomicBoolean CAS gate) is NEVER read,
  *    written, or bypassed here — frame acquisition stays exclusively in
  *    the camera layer.
  *  - [com.vyze.app.core.ThermalPowerController] remains the sole thermal
- *    authority: [SessionEpisodeManager] only *asks* it for the current
- *    thermal status and never overrides its decisions.
+ *    authority: callers only *ask* it for the current thermal status and
+ *    never override its decisions.
  */
 
 // ── Pure decision taxonomy ───────────────────────────────────────────
@@ -76,6 +74,9 @@ object VyzeShadowRouter {
     // (OCR reading included automatically via reading keywords).
     private val READ_KEYWORDS =
         listOf("read", "text", "label", "sign", "baca", "teks", "字", "读", "念")
+
+    /** Monotonic count of logged decisions (observability hook). */
+    val decisionCount = AtomicLong(0)
 
     /**
      * The routing decision for [signal] under [snapshot]. PURE — no I/O,
@@ -149,13 +150,14 @@ object VyzeShadowRouter {
     }
 
     /**
-     * Log one shadow decision. Kept as the single funnel so the Phase 4
-     * flip only changes what happens AFTER this line, never the logging.
+     * Log one decision. Kept as the single funnel so routing stays
+     * observable in logcat while execution happens in [AdkAgentManager].
      */
     fun logDecision(signal: RouterSignal, decision: RouterDecision, snapshot: RouterSnapshot) {
+        decisionCount.incrementAndGet()
         Log.i(
             TAG,
-            "SHADOW-ROUTE: signal=${signal.kind} text=\"${signal.spokenText.take(40)}\" " +
+            "ROUTE: signal=${signal.kind} text=\"${signal.spokenText.take(40)}\" " +
                 "→ ${decision.action} (vlm=${decision.requiresVlm}, " +
                 "frame=${decision.includeCameraFrame}) | engineReady=${snapshot.engineReady} " +
                 "inferring=${snapshot.isInferring} | ${decision.reason}"
@@ -163,179 +165,7 @@ object VyzeShadowRouter {
     }
 }
 
-// ── ADK-native agent wrapper ─────────────────────────────────────────
-
-/**
- * Real ADK [BaseAgent]: the decision runs inside the ADK event pipeline
- * ([runAsyncImpl] emits ADK [Event]s), so shadow logs are produced by the
- * actual runner machinery that Phase 4/5 will use for live routing.
- *
- * Constructed lazily and only *run* when the debug flag is on; see
- * [VyzeAgentRuntime]. It performs no hardware access of any kind.
- */
-class VyzeRouterAgent(
-    private val snapshotProvider: () -> RouterSnapshot,
-) : BaseAgent(
-    name = "vyze_host_router",
-    description = "Vyze host router (shadow mode): mirrors legacy gesture/speech dispatch",
-) {
-    val decisionCount = AtomicLong(0)
-
-    override fun runAsyncImpl(ctx: InvocationContext): kotlinx.coroutines.flow.Flow<Event> =
-        kotlinx.coroutines.flow.flow {
-            val userText = ctx.userContent?.parts
-                ?.mapNotNull { it.text }
-                ?.joinToString(" ")
-                .orEmpty()
-
-            val signal = RouterSignal(
-                kind = RouterSignal.Kind.SPEECH, // agent-path invocations are speech queries
-                spokenText = userText,
-            )
-            val snapshot = snapshotProvider()
-            val decision = VyzeShadowRouter.decide(signal, snapshot)
-            VyzeShadowRouter.logDecision(signal, decision, snapshot)
-            decisionCount.incrementAndGet()
-
-            // Shadow mode: emit the decision as an event payload. Nothing is
-            // executed — no VLM call, no TTS call, no capture.
-            emit(
-                Event(
-                    invocationId = ctx.invocationId,
-                    author = name,
-                    content = Content.fromText(
-                        "model",
-                        "shadow:${decision.action} reason=${decision.reason}",
-                    ),
-                )
-            )
-            emitEndOfAgent(ctx) // member-extension on FlowCollector; completion event
-        }
-}
-
-// ── Phase 5: LIVE query agent (orchestrates the native engine op) ────
-
-/**
- * The Phase 5 live-query orchestrator. Like [VyzeRouterAgent], this is a
- * real ADK [BaseAgent] whose [runAsyncImpl] emits real ADK [Event]s — the
- * live answer flows through the actual runner machinery.
- *
- * HYBRID PATHING (Phase 0 directive #3): there is NO external LLM here.
- * The heavyweight reasoning is performed by the native LiteRT-LM engine
- * through the injected [answerOp] (bound to
- * VyzeCoreController.analyzeTextDirect by the caller). The agent's job is
- * the ORCHESTRATION that previously lived inline in the fragment's legacy
- * ladder, moved here as data:
- *
- *  - CONTEXT ASSEMBLY: [queryContext] mirrors what the native text-query
- *    path assembles (persona/directive lines, session state) — assembled
- *    INSIDE the agent and applied to session state so every turn of the
- *    episode carries it, instead of every call site re-string-building it.
- *    The native path is untouched; this mirrors its behavior for the
- *    agent lane only.
- *  - SESSION EPISODES: the runner's session id IS the `adk_text_<n>`
- *    episode id managed by [SessionEpisodeManager] — one ADK session per
- *    live query, thermally-shrunk idle eviction, no cross-talk with the
- *    native pipeline's sessions (stale-session gate).
- *  - HARDWARE INVARIANTS: no frame access of any kind (text-only lane);
- *    ThermalPowerController consulted read-only by the CALLER's gates,
- *    never overridden here.
- *
- * Engine busy-state is declined by [com.vyze.app.core.VyzeCoreController
- * .analyzeTextDirect] itself (isInferring CAS) — the agent can never
- * race or reorder a native generation.
- */
-class VyzeLiveQueryAgent(
-    /**
-     * The engine op: (prompt, sessionId) -> answer?. Bound to
-     * VyzeCoreController.analyzeTextDirect — its internal isInferring CAS
-     * + watchdog + cancelInference discipline is the decline path.
-     */
-    private val answerOp: suspend (prompt: String, sessionId: String) -> String?,
-    /**
-     * Context assembly mirroring the native text-query path (persona
-     * lines, directives). Pure over its inputs so tests can assert on it.
-     */
-    private val queryContext: QueryContext = QueryContext(),
-) : BaseAgent(
-    name = "vyze_live_query",
-    description = "Vyze live text-query orchestrator over the native LiteRT-LM engine",
-) {
-
-    /**
-     * Context assembly inputs — mirrors DynamicPromptBuilder's text-only
-     * behavior: persona/directive lines + locale brevity, applied as ADK
-     * session state so the instruction text travels with the episode.
-     */
-    data class QueryContext(
-        val personaDirective: String = DEFAULT_PERSONA_DIRECTIVE,
-        val answerStyleDirective: String = DEFAULT_ANSWER_STYLE_DIRECTIVE,
-    ) {
-        /** The system-style preamble prepended to the user's question. */
-        fun instructionFor(question: String): String =
-            "$personaDirective\n$answerStyleDirective\n\nUser question: $question"
-
-        fun asSessionState(): Map<String, Any> = mapOf(
-            "persona" to personaDirective,
-            "answer_style" to answerStyleDirective,
-            "lane" to "adk_live_text",
-        )
-
-        companion object {
-            /** Mirrors the native persona: concise, sighted-assistant voice. */
-            const val DEFAULT_PERSONA_DIRECTIVE =
-                "You are Vyze, a fast, friendly sighted assistant for a blind user. " +
-                    "Always address the user in the second person ('you', 'your', 'in front of you') — " +
-                    "never 'in front of me' or 'to my left'. " +
-                    "Answer in the user's language (English, Bahasa Melayu, or Chinese)."
-
-            /** Mirrors the native brevity/audibility style for TTS delivery. */
-            const val DEFAULT_ANSWER_STYLE_DIRECTIVE =
-                "Answer in 1 short spoken sentence. No markdown, no lists, " +
-                    "no emoji. Lead with the direct answer."
-        }
-    }
-
-    override fun runAsyncImpl(ctx: InvocationContext): kotlinx.coroutines.flow.Flow<Event> =
-        kotlinx.coroutines.flow.flow {
-            val sessionId = ctx.session.key.id ?: "adk_orphan"
-            val question = ctx.userContent?.parts
-                ?.mapNotNull { it.text }
-                ?.joinToString(" ")
-                ?.trim()
-                .orEmpty()
-
-            if (question.isEmpty()) {
-                emit(
-                    Event(
-                        invocationId = ctx.invocationId,
-                        author = name,
-                        content = Content.fromText("model", ""),
-                    )
-                )
-                emitEndOfAgent(ctx)
-                return@flow
-            }
-
-            // CONTEXT ASSEMBLY inside the agent (Phase 5): the prompt that
-            // reaches the engine carries the persona + style directives.
-            val prompt = queryContext.instructionFor(question)
-
-            val answer = answerOp(prompt, sessionId)
-
-            emit(
-                Event(
-                    invocationId = ctx.invocationId,
-                    author = name,
-                    // Content.fromText(role, text) — role FIRST (0.2.0 API).
-                    content = Content.fromText("model", answer.orEmpty()),
-                )
-            )
-            emitEndOfAgent(ctx)
-        }
-}
-
-// ── Section 6: session episodes + idle eviction ──────────────────────
+// ── Session episodes + idle eviction ─────────────────────────────────
 
 /**
  * One conversational episode = one ADK session, mirroring the native
@@ -394,19 +224,19 @@ class SessionEpisodeManager(
     fun size(): Int = episodes.size
 }
 
-// ── Phase 6: shadow→live evaluation evidence ─────────────────────────
+// ── Shadow→live evaluation evidence ──────────────────────────────────
 
 /** One bounded eval observation (pure data; no Android deps). */
 data class ShadowEvalRecord(
     val query: String,
-    /** The adk_text_ session id when the query EXECUTED; null on declines. */
+    /** The adk_master_ session id when the query EXECUTED; null on declines. */
     val sessionId: String?,
     val outcome: Outcome,
     val latencyMs: Long? = null,
     val recordedAtMs: Long = System.currentTimeMillis(),
 ) {
     enum class Outcome {
-        /** Executed through the ADK runner; a non-empty answer returned. */
+        /** Executed through the master agent; a non-empty answer returned. */
         ANSWERED,
         /** Executed but the engine returned null/empty or threw. */
         FAILED,
@@ -419,8 +249,8 @@ data class ShadowEvalRecord(
 
 /**
  * Bounded ring of eval observations + pure summary math. NOT a general
- * telemetry sink: its only consumer is the Phase 6 flip review
- * ([VyzeAgentRuntime.shouldPromoteToLive]) and JVM tests.
+ * telemetry sink: its only consumer is the flip review
+ * ([ShadowEvalRecorder] promotion bar) and JVM tests.
  */
 class ShadowEvalRecorder(
     private val capacity: Int = DEFAULT_CAPACITY,
@@ -495,368 +325,5 @@ class ShadowEvalRecorder(
 
         /** Promotion bar: answered/total at or above this ratio. */
         const val PROMOTION_ANSWER_RATE = 0.80
-    }
-}
-
-// ── Runtime holder (flag-gated; ships dark) ─────────────────────────
-
-/**
- * Lazily constructs the ADK-native pieces, executes the LIVE route when
- * the shadow flag is enabled (Phase 4), through the REAL ADK
- * [com.google.adk.kt.runners.InMemoryRunner] (Phase 5), and records the
- * shadow→live evaluation evidence + runs session maintenance (Phase 6).
- *
- * LIVE ROUTING SCOPE (approved constraint: never race native generation):
- * the ADK agent path routes TEXT-ONLY queries end-to-end. Frame-dependent
- * decisions decline here and fall back to the legacy dispatch — frame
- * capture remains exclusively inside the camera layer's isCapturing-gated
- * paths.
- *
- * PHASE 6 — the flip is EVAL-DRIVEN and MANUAL: [shouldPromoteToLive]
- * summarizes the recorded outcomes so a human decides when the agent lane
- * has earned the flag flip. The runtime never flips [shadowEnabled] by
- * itself and never disables the legacy path.
- */
-object VyzeAgentRuntime {
-
-    private const val TAG = "VyzeAgentRuntime"
-    private const val APP_NAME = "vyze"
-    private const val USER_ID = "vyze_user"
-    private var runner: com.google.adk.kt.runners.InMemoryRunner? = null
-    private var routerAgent: VyzeRouterAgent? = null
-
-    /** Phase 5: the live query orchestrator + its runner (same session service). */
-    private var liveAgent: VyzeLiveQueryAgent? = null
-    private var liveRunner: com.google.adk.kt.runners.InMemoryRunner? = null
-    private val episodeManager = SessionEpisodeManager()
-
-    /** Phase 6: bounded shadow→live evaluation evidence for the flip review. */
-    private val evalRecorder = ShadowEvalRecorder()
-
-    /** Flip point for Phase 4. Ships false; no production reader until the hook. */
-    @Volatile
-    var shadowEnabled: Boolean = false
-
-    /** Monotonic counter for the `adk_text_<n>` session namespace. */
-    private val textSessionSeq = AtomicLong(0)
-
-    /** Tracks the one live agent-path generation for busy/decline gating. */
-    private val liveGenerationActive = java.util.concurrent.atomic.AtomicBoolean(false)
-
-    /** True when an agent-path generation is in flight (decline gate). */
-    val isLiveGenerationActive: Boolean get() = liveGenerationActive.get()
-
-    /**
-     * Attempt a LIVE agent-path route for a text-only query.
-     *
-     * All hardware/thermal/native-engine state arrives as INJECTED gates —
-     * this runtime never touches isCapturing, never overrides
-     * ThermalPowerController, and never imports VlmEngineManager.
-     *
-     * @param textOnlyQuery the user's text-only question.
-     * @param snapshotProvider reads engine/inferring/capture state for the
-     *   decision + logs (read-only).
-     * @param vlmInferenceAllowed read-only consultation of the current
-     *   ThermalPowerController policy.
-     * @param analyzeText the engine op: (prompt, sessionId) -> answer? —
-     *   bound to VlmEngineManager.analyzeText by the caller. The engine's
-     *   generationMutex/session discipline stay 100% internal.
-     * @return the structured answer string, or null when the route was
-     *   declined (flag off, non-text-only, frame required, engine busy/
-     *   not ready, thermal refusal, or runner unavailable). Declining is
-     *   ALWAYS safe: the caller falls back to the legacy dispatch.
-     */
-    suspend fun tryLiveRouteTextOnly(
-        textOnlyQuery: String,
-        snapshotProvider: () -> RouterSnapshot,
-        vlmInferenceAllowed: () -> Boolean,
-        analyzeText: suspend (prompt: String, sessionId: String) -> String?,
-        queryContext: VyzeLiveQueryAgent.QueryContext = VyzeLiveQueryAgent.QueryContext(),
-    ): String? {
-        val snapshot = snapshotProvider()
-        val signal = RouterSignal(kind = RouterSignal.Kind.SPEECH, spokenText = textOnlyQuery)
-        val decision = VyzeShadowRouter.decide(signal, snapshot)
-        VyzeShadowRouter.logDecision(signal, decision, snapshot)
-
-        // Live grant: general-knowledge voice queries ONLY. Reading intents
-        // (VLM_TEXT_READ) and scene descriptions require the camera frame,
-        // so they always decline to the camera layer's isCapturing-gated
-        // paths — a sightless answer to a sight question is never allowed.
-        // The caller (fragment text-only branch) classifies via the same
-        // isTextOnlyQuery gate the legacy path uses, so VLM_VOICE_QUERY is
-        // the semantically exact action here.
-        if (!shadowEnabled || decision.action != RouterDecision.Action.VLM_VOICE_QUERY ||
-            !snapshot.engineReady || !vlmInferenceAllowed()
-        ) {
-            // Phase 6: the decline tally is the eval baseline — a decline is
-            // NOT a legacy mismatch; it just means the agent lane passed.
-            evalRecorder.record(
-                ShadowEvalRecord(
-                    query = textOnlyQuery,
-                    sessionId = null,
-                    outcome = ShadowEvalRecord.Outcome.DECLINED,
-                )
-            )
-            return null // decline → caller falls back to the legacy dispatch
-        }
-
-        // One live agent-path generation at a time (decline, never queue —
-        // queuing would reorder answers against the legacy pipeline).
-        if (isLiveGenerationActive) {
-            evalRecorder.record(
-                ShadowEvalRecord(
-                    query = textOnlyQuery,
-                    sessionId = null,
-                    outcome = ShadowEvalRecord.Outcome.DECLINED_BUSY,
-                )
-            )
-            return null
-        }
-
-        // PHASE 5: the live path executes through the REAL ADK InMemoryRunner
-        // (runAsync event pipeline). The session id IS the episode id — the
-        // runner auto-creates the missing session, the agent applies context
-        // and calls the injected engine op, and the final model Event carries
-        // the answer back to the caller.
-        val sessionId = "adk_text_${textSessionSeq.incrementAndGet()}"
-        episodeManager.openOrTouch(sessionId)
-        if (!liveGenerationActive.compareAndSet(false, true)) return null
-        val startedAt = kotlin.time.TimeSource.Monotonic.markNow()
-
-        var execRunner: com.google.adk.kt.runners.InMemoryRunner? = null
-        try {
-            execRunner = ensureLiveRunner(analyzeText, queryContext)
-            if (execRunner == null) {
-                Log.w(TAG, "Live runner unavailable (flag off?) — declining")
-                return null
-            }
-            val events = execRunner.runAsync(
-                userId = USER_ID,
-                sessionId = sessionId,
-                invocationId = null,
-                // Content.fromText(role, text) — role FIRST (0.2.0 API).
-                newMessage = Content.fromText("user", textOnlyQuery),
-                // Context assembly travels as ADK session state — applied by
-                // the runner at invocation setup, so the whole episode carries
-                // the persona/style directives (Phase 5 design).
-                stateDelta = queryContext.asSessionState(),
-                runConfig = com.google.adk.kt.agents.RunConfig(),
-            )
-            // The agent emits exactly one text event (empty on decline) plus
-            // the end-of-agent marker; take the LAST text as the answer.
-            var answer: String? = null
-            events.collect { event ->
-                val text = event.content?.parts
-                    ?.mapNotNull { it.text }
-                    ?.joinToString("")
-                    .orEmpty()
-                if (text.isNotEmpty()) answer = text
-            }
-            if (answer == null) {
-                Log.w(TAG, "Live agent-path text query returned null (declining)")
-                evalRecorder.record(
-                    ShadowEvalRecord(
-                        query = textOnlyQuery,
-                        sessionId = sessionId,
-                        outcome = ShadowEvalRecord.Outcome.FAILED,
-                    )
-                )
-                return null
-            }
-            Log.i(TAG, "Live agent-path text query answered via $sessionId (ADK runner)")
-            evalRecorder.record(
-                ShadowEvalRecord(
-                    query = textOnlyQuery,
-                    sessionId = sessionId,
-                    outcome = ShadowEvalRecord.Outcome.ANSWERED,
-                    latencyMs = startedAt.elapsedNow().inWholeMilliseconds,
-                )
-            )
-            return answer
-        } catch (t: Throwable) {
-            Log.w(TAG, "Live agent-path text query failed: ${t.message}")
-            evalRecorder.record(
-                ShadowEvalRecord(
-                    query = textOnlyQuery,
-                    sessionId = sessionId,
-                    outcome = ShadowEvalRecord.Outcome.FAILED,
-                )
-            )
-            return null
-        } finally {
-            liveGenerationActive.set(false)
-            episodeManager.close(sessionId)
-            // Session-per-turn hygiene: the ADK session is never reused (each
-            // query gets a fresh adk_text_<n> id), so delete it to keep the
-            // runner's in-memory session store bounded. NonCancellable so the
-            // cleanup also runs when the caller's coroutine was cancelled.
-            if (execRunner != null) {
-                try {
-                    kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
-                        execRunner!!.sessionService.deleteSession(
-                            com.google.adk.kt.sessions.SessionKey(APP_NAME, USER_ID, sessionId)
-                        )
-                    }
-                } catch (t: Throwable) {
-                    Log.w(TAG, "ADK session cleanup failed: ${t.message}")
-                }
-            }
-        }
-    }
-
-    /** Lazily constructs the Phase 5 live agent + runner over its own session service. */
-    @Synchronized
-    private fun ensureLiveRunner(
-        analyzeText: suspend (prompt: String, sessionId: String) -> String?,
-        queryContext: VyzeLiveQueryAgent.QueryContext,
-    ): com.google.adk.kt.runners.InMemoryRunner? {
-        if (!shadowEnabled) return null
-        if (liveRunner == null || liveAgent == null) {
-            liveAgent = VyzeLiveQueryAgent(answerOp = analyzeText, queryContext = queryContext)
-            liveRunner = com.google.adk.kt.runners.InMemoryRunner(
-                agent = liveAgent!!, 
-                appName = "vyze",
-            )
-            Log.i(TAG, "Live query runner constructed (agent lane over native engine)")
-        }
-        return liveRunner
-    }
-
-    @Synchronized
-    fun ensureRunner(snapshotProvider: () -> RouterSnapshot): com.google.adk.kt.runners.InMemoryRunner? {
-        if (!shadowEnabled) return null
-        if (runner == null) {
-            routerAgent = VyzeRouterAgent(snapshotProvider)
-            runner = com.google.adk.kt.runners.InMemoryRunner(
-                agent = routerAgent!!, 
-                appName = "vyze",
-            )
-            Log.i(TAG, "Shadow router runner constructed (shadow mode)")
-        }
-        return runner
-    }
-
-    fun episodes(): SessionEpisodeManager = episodeManager
-
-    // ── Phase 6: eval evidence + manual flip review ──────────────────
-
-    /** Immutable summary of the bounded eval window (pure data). */
-    data class EvalSummary(
-        val total: Int,
-        val answered: Int,
-        val failed: Int,
-        val declined: Int,
-        val declinedBusy: Int,
-        val avgLatencyMs: Long,
-        val successRate: Double,
-    )
-
-    /** Current bounded eval evidence (a snapshot; cheap to read). */
-    fun evalSummary(): EvalSummary {
-        val s = evalRecorder.summarize()
-        return EvalSummary(
-            total = s.total,
-            answered = s.answered,
-            failed = s.failed,
-            declined = s.declined,
-            declinedBusy = s.declinedBusy,
-            avgLatencyMs = s.avgLatencyMs,
-            successRate = s.successRate,
-        )
-    }
-
-    /**
-     * Whether the bounded eval window meets the promotion bar for a HUMAN
-     * to flip [shadowEnabled]. The runtime NEVER flips the flag itself and
-     * NEVER disables the legacy path — this predicate only informs review.
-     *
-     * Bar: enough executed attempts, answer rate at/above
-     * [ShadowEvalRecorder.PROMOTION_ANSWER_RATE], and the window not
-     * dominated by declines (which would say more about routing than
-     * about answer quality).
-     */
-    fun shouldPromoteToLive(): Boolean {
-        val s = evalRecorder.summarize()
-        if (s.total < ShadowEvalRecorder.PROMOTION_MIN_ATTEMPTS) return false
-        if (s.answered < ShadowEvalRecorder.PROMOTION_MIN_ANSWERED) return false
-        if (s.answered.toDouble() / s.total < ShadowEvalRecorder.PROMOTION_ANSWER_RATE) return false
-        if (s.declined + s.declinedBusy > s.total / 2) return false
-        return true
-    }
-
-    /** Clears the eval window (after a flip review is recorded elsewhere). */
-    @Synchronized
-    fun resetEvalForTests() {
-        evalRecorder.clear()
-    }
-
-    /**
-     * PHASE 6 — PERIODIC MAINTENANCE (call from a lifecycle-aware scope,
-     * e.g. every 60 s while the fragment is started):
-     *
-     *  1. Episode eviction via [SessionEpisodeManager.evictIdle] — the
-     *     idle window shrinks automatically under thermal pressure
-     *     (Section 6 design; [ThermalPowerController]-equivalent status is
-     *     supplied read-only by the caller).
-     *  2. Defense-in-depth orphan sweep: any ADK session in the live lane
-     *     that no longer has an open episode is deleted. Normal turns
-     *     already delete their session in `finally`; this catches leaks
-     *     from cancelled/aborted turns so the in-memory store stays
-     *     bounded no matter what.
-     *
-     * No VLM/TTS/hardware interaction; safe to call at any time. Returns
-     * the number of orphaned ADK sessions deleted.
-     */
-    suspend fun maintenanceTick(
-        isThermallyConstrained: () -> Boolean = { false },
-    ): Int {
-        val evicted = episodeManager.evictIdle(isThermallyConstrained())
-        if (evicted.isNotEmpty()) {
-            Log.d(TAG, "Maintenance: evicted ${evicted.size} idle episode(s)")
-        }
-
-        val service = liveSessionService() ?: return 0
-        val live = runCatching {
-            service.listSessions(APP_NAME, USER_ID)
-        }.getOrElse { return 0 }
-        var deleted = 0
-        for (session in live.sessions) {
-            val id = session.key.id ?: continue
-            if ("adk_text_" !in id) continue // only our lane's sessions
-            if (episodeManager.exists(id)) continue
-            runCatching {
-                service.deleteSession(com.google.adk.kt.sessions.SessionKey(APP_NAME, USER_ID, id))
-                deleted++
-            }.onFailure { Log.w(TAG, "Orphan sweep delete failed for $id: ${it.message}") }
-        }
-        if (deleted > 0) {
-            Log.d(TAG, "Maintenance: deleted $deleted orphaned ADK session(s)")
-        }
-        return deleted
-    }
-
-    /**
-     * The live lane's ADK session service — ops/inspection hook (Phase 6
-     * eviction tooling); null until the live runner is first constructed.
-     */
-    @Synchronized
-    fun liveSessionService(): com.google.adk.kt.sessions.SessionService? = liveRunner?.sessionService
-
-    @Synchronized
-    fun releaseForTests() {
-        runner = null
-        routerAgent = null
-        liveRunner = null
-        liveAgent = null
-        liveGenerationActive.set(false)
-        evalRecorder.clear()
-        shadowEnabled = false
-    }
-
-    /** Forces live-lane runner reconstruction with the NEXT bound op — test isolation only. */
-    @Synchronized
-    fun resetLiveRunnerForTests() {
-        liveRunner = null
-        liveAgent = null
     }
 }

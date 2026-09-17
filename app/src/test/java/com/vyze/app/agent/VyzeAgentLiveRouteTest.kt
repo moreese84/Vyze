@@ -52,30 +52,30 @@ class VyzeAgentLiveRouteTest {
                 gotPrompt = prompt; gotSession = sid; "A pain reliever."
             },
         )
-        // Phase 5: the op receives the ASSEMBLED prompt (persona + style +
-        // question), verbatim per QueryContext.instructionFor.
+        // The op receives the ASSEMBLED prompt (persona + style +
+        // question), verbatim per VyzeQueryContext.instructionFor.
         assertEquals(
-            VyzeLiveQueryAgent.QueryContext().instructionFor("what is paracetamol used for?"),
+            VyzeQueryContext().instructionFor("what is paracetamol used for?"),
             gotPrompt
         )
-        assertTrue("session id must use the adk_text namespace", gotSession!!.startsWith("adk_text_"))
+        assertTrue("session id must use the adk_master namespace", gotSession!!.startsWith("adk_master_"))
         assertEquals("A pain reliever.", answer)
         // Context assembly traveled with the invocation (Phase 5): the agent
         // prepends the persona + style directives to the raw question.
         assertTrue(
             "prompt must carry the persona directive",
-            gotPrompt!!.contains(VyzeLiveQueryAgent.QueryContext.DEFAULT_PERSONA_DIRECTIVE)
+            gotPrompt!!.contains(VyzeQueryContext.DEFAULT_PERSONA_DIRECTIVE)
         )
         assertTrue(
             "prompt must carry the answer-style directive",
-            gotPrompt!!.contains(VyzeLiveQueryAgent.QueryContext.DEFAULT_ANSWER_STYLE_DIRECTIVE)
+            gotPrompt!!.contains(VyzeQueryContext.DEFAULT_ANSWER_STYLE_DIRECTIVE)
         )
         assertTrue(
             "prompt must end with the raw user question",
             gotPrompt!!.endsWith("User question: what is paracetamol used for?")
         )
         // Episode closed after the generation.
-        assertEquals(0, rt.episodes().size())
+        assertEquals(0, rt.episodes.size())
         assertFalse(rt.isLiveGenerationActive)
     }
 
@@ -164,7 +164,7 @@ class VyzeAgentLiveRouteTest {
         releaseFirst.complete(Unit)
         job.join()
         assertFalse(rt.isLiveGenerationActive)
-        assertEquals(0, rt.episodes().size())
+        assertEquals(0, rt.episodes.size())
     }
 
     @Test
@@ -178,7 +178,7 @@ class VyzeAgentLiveRouteTest {
         )
         assertNull(answer)
         assertFalse(rt.isLiveGenerationActive)
-        assertEquals(0, rt.episodes().size())
+        assertEquals(0, rt.episodes.size())
     }
 
     @Test
@@ -192,7 +192,7 @@ class VyzeAgentLiveRouteTest {
         )
         assertNull(answer)
         assertFalse(rt.isLiveGenerationActive)
-        assertEquals(0, rt.episodes().size())
+        assertEquals(0, rt.episodes.size())
     }
 
     // ── Decision logging is unchanged (shadow funnel intact) ─────

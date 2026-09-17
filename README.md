@@ -57,7 +57,8 @@ Camera Frame ──→ ML Kit OCR ──→ DynamicPromptBuilder
 |---|---|---|
 | **VlmEngineManager** | `core/VlmEngineManager.kt` | Gemma 4 E2B engine lifecycle, NPU/GPU fallback, inference |
 | **VyzeCoreController** | `core/VyzeCoreController.kt` | Pipeline orchestrator, session isolation, sentence streaming |
-| **VyzeShadowRouter / VyzeAgentRuntime** | `agent/VyzeShadowRouter.kt` | ADK agent lane: gesture/speech routing decisions, live text-query agent (`BaseAgent` + `InMemoryRunner`), session episodes, eval evidence |
+| **VyzeMasterAgent / AdkAgentManager** | `agent/VyzeMasterAgent.kt`, `agent/AdkAgentManager.kt` | Single Master Orchestrator: one agent, all native tools bound directly (OCR/TTS/haptics/spatial + direct LiteRT-LM VLM inference), one-pass dispatch; manager invokes it directly with timeout/error fallback to the native legacy dispatch |
+| **VyzeShadowRouter / VyzeAgentRuntime** | `agent/VyzeShadowRouter.kt`, `agent/VyzeAgentRuntime.kt` | Pure gesture/speech routing decisions + session episodes + eval evidence; facade preserving the fragment call surface |
 | **DynamicPromptBuilder** | `core/DynamicPromptBuilder.kt` | Intent-based prompt construction, language mirroring |
 | **OcrHelper** | `vision/OcrHelper.kt` | ML Kit on-device OCR (Latin + Chinese) |
 | **TTSManager** | `speech/TTSManager.kt` | Platform TextToSpeech (Google TTS engine preferred), utterance tracking, voice switching, prosody & pronunciation smoothing |

@@ -1,6 +1,5 @@
 package com.vyze.app.agent
 
-import com.google.adk.kt.sessions.SessionKey
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -153,22 +152,21 @@ class VyzeAgentEvalTest {
     }
 
     @Test
-    fun `tick sweeps orphaned lane sessions but keeps foreign sessions`() = runBlocking {
+    fun `master lane leaves no orphan sessions after a normal turn`() = runBlocking {
         val rt = enabledRuntime()
-        assertEquals("ok", runQuery(rt)) // constructs the live runner
-        val svc = rt.liveSessionService()!!
+        assertEquals("ok", runQuery(rt)) // one direct master-agent turn
 
-        // Plant an orphan in the agent lane (as a cancelled/aborted turn
-        // would leave behind) and a foreign session outside the lane.
-        svc.createSession(SessionKey("vyze", "vyze_user", "adk_text_999"), emptyMap())
-        svc.createSession(SessionKey("vyze", "vyze_user", "vyze_foreign"), emptyMap())
-
-        assertEquals("exactly the orphan is deleted", 1, rt.maintenanceTick { false })
-
-        val remaining = svc.listSessions("vyze", "vyze_user")
-            .sessions.mapNotNull { it.key.id }
-        assertFalse("orphan swept", remaining.contains("adk_text_999"))
-        assertTrue("foreign session untouched", remaining.contains("vyze_foreign"))
+        // The master lane deletes its ADK session in a finally on every
+        // turn, so the in-memory store must hold ZERO lane sessions here —
+        // no orphan sweep is needed anymore (single-master migration).
+        val svc = AdkAgentManager.sessionServiceForInspection()
+        if (svc != null) {
+            val laneSessions = svc.listSessions(AdkAgentManager.APP_NAME, AdkAgentManager.USER_ID)
+                .sessions.mapNotNull { it.key.id }
+                .filter { it.startsWith("adk_master_") }
+            assertTrue("master lane must not leak sessions: $laneSessions", laneSessions.isEmpty())
+        }
+        assertEquals(0, rt.maintenanceTick { false })
     }
 
     @Test
@@ -180,10 +178,10 @@ class VyzeAgentEvalTest {
     @Test
     fun `tick is clean with an open fresh episode and thermal pressure`() = runBlocking {
         val rt = enabledRuntime()
-        rt.episodes().openOrTouch("adk_text_probe")
+        rt.episodes.openOrTouch("adk_text_probe")
         // Fresh episode: nothing to evict even under thermal shrink.
         assertEquals(0, rt.maintenanceTick { true })
-        rt.episodes().close("adk_text_probe")
+        rt.episodes.close("adk_text_probe")
     }
 
     @Test

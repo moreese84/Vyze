@@ -27,6 +27,9 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import com.vyze.app.device.HapticManager
+import com.vyze.app.agent.AdkAgentManager
+import com.vyze.app.agent.VyzeAgentRuntime
 import java.io.ByteArrayOutputStream
 import java.util.Locale
 import java.util.UUID
@@ -533,6 +536,20 @@ class VyzeCoreController(
                 if (engineReady) {
                     Log.i(TAG, "VLM ready [${vlmEngine.getActiveBackend()}]")
                     onStatusUpdate("VLM ready [${vlmEngine.getActiveBackend()}]")
+
+                    // ── WIRING DIRECTIVE: PRODUCTION MASTER-AGENT BINDING ──
+                    // The single [VyzeMasterAgent] lane is bound HERE — to
+                    // the REAL engine and native pipelines, no stubs:
+                    //   text  → analyzeTextDirect → VlmEngineManager
+                    //           (local LiteRT-LM, gemma-4-E2B-it.litertlm)
+                    //   image → analyzeImageDirect → VlmEngineManager
+                    //           (GPU vision encoder path)
+                    //   OCR   → the real ML Kit OcrHelper
+                    //   TTS   → TTSManager.speakImmediate (bypass lane)
+                    //   haptics → HapticManager pattern library
+                    // Rebind on every readiness report (model reload
+                    // (resetSession re-init) re-lands on the fresh engine).
+                    bindMasterAgentLane()
                 } else {
                     Log.e(TAG, "VLM engine failed to initialize")
                     mainHandler.post {
@@ -563,6 +580,99 @@ class VyzeCoreController(
     private fun onStatusUpdate(msg: String) {
         mainHandler.post { onStatusUpdate?.invoke(msg) }
     }
+
+    // ══ PRODUCTION MASTER-AGENT BINDING (wiring directive) ═════════
+
+    /**
+     * Bind the single-master agent lane to THIS controller's real engine
+     * and native pipelines (no mocks/stubs/placeholders). Called the
+     * moment the real VlmEngineManager reports ready, and re-bound on
+     * every subsequent readiness report so a re-initialized engine is
+     * always the one serving the agent lane.
+     */
+    private fun bindMasterAgentLane() {
+        try {
+            VyzeAgentRuntime.bindProduction(this)
+            Log.i(TAG, "AdkAgentManager bound to PRODUCTION VlmEngineManager + native pipelines")
+        } catch (t: Throwable) {
+            // Binding failure must never break the native pipeline: the
+            // master lane simply stays unbound and every agent-path route
+            // declines to the legacy dispatch (fallback contract).
+            CrashLogFile.log(TAG, "master-agent production binding failed: ${t.message}")
+        }
+    }
+
+    /**
+     * REAL text engine op for the agent lane — routes through the SAME
+     * gated path the native pipeline uses: engine-ready check, isInferring
+     * CAS (decline, never queue), watchdog timeout, and cancelInference on
+     * timeout, then VlmEngineManager.analyzeText on the local LiteRT-LM
+     * engine (gemma-4-E2B-it.litertlm). No re-platforming of the engine.
+     */
+    suspend fun analyzeTextDirect(prompt: String, sessionId: String): String? =
+        analyzeTextDirectInternal(prompt, sessionId)
+
+    /**
+     * REAL image engine op for the agent lane — routes through
+     * VlmEngineManager.analyzeImage (GPU vision encoder) with a modest
+     * token budget for a single spoken sentence. Same engine, same
+     * generationMutex serialization as every native inference.
+     */
+    suspend fun analyzeImageDirect(frame: Bitmap, prompt: String, sessionId: String): String? {
+        if (!engineReady) {
+            Log.w(TAG, "analyzeImageDirect called but engine not ready")
+            return null
+        }
+        return try {
+            vlmEngine.analyzeImage(
+                bitmap = frame,
+                prompt = prompt,
+                memoryContext = null,
+                similarInteractions = emptyList(),
+                sessionId = sessionId,
+                maxTokens = AGENT_LANE_IMAGE_MAX_TOKENS,
+            )
+        } catch (t: Throwable) {
+            CrashLogFile.logError(TAG, "analyzeImageDirect FAILED: ${t.javaClass.simpleName}: ${t.message}", t)
+            null
+        }
+    }
+
+    /**
+     * REAL OCR tool op for the agent lane — the SAME ML Kit
+     * [OcrHelper] pipeline the native read path uses (Latin + Chinese
+     * recognizers merged in reading order). Null frame → null text;
+     * the tool layer coalesces to an empty result.
+     */
+    suspend fun ocrFrameDirect(frame: Bitmap): String? = ocrHelper.extractText(frame)
+
+    /**
+     * REAL deterministic TTS for the agent lane — the EXISTING
+     * [TTSManager.speakImmediate] bypass lane. The streaming sentence
+     * buffer state machine (firstChunkSent / currentChunkStarted /
+     * single-funnel flush) is never reachable from here.
+     */
+    fun speakImmediateDirect(text: String): Boolean = ttsManager.speakImmediate(text)
+
+    /**
+     * REAL haptic tool op for the agent lane — the EXISTING
+     * [HapticManager] pattern library, constructed from the app context
+     * exactly as the native gesture-confirm path does.
+     */
+    fun hapticPatternDirect(pattern: String) {
+        if (haptics == null) haptics = HapticManager(context)
+        when (pattern.uppercase()) {
+            "TAP" -> haptics?.vibrateTap()
+            "DOUBLE_TAP" -> haptics?.vibrateDoubleTap()
+            "LONG_PRESS" -> haptics?.vibrateLongPress()
+            "WARNING" -> haptics?.vibrateWarning()
+            // Unknown names are ignored: haptics must never crash or
+            // misfire from a malformed tool argument.
+        }
+    }
+
+    /** Agent-lane haptics, lazily created from the app context. */
+    private var haptics: HapticManager? = null
 
     // ── Text Sanitization ──────────────────────────────────────────
 
@@ -2140,7 +2250,7 @@ class VyzeCoreController(
      * @return the raw model answer, or null to decline/fail — the caller
      *   falls back to the legacy dispatch on null.
      */
-    suspend fun analyzeTextDirect(prompt: String, sessionId: String): String? {
+    private suspend fun analyzeTextDirectInternal(prompt: String, sessionId: String): String? {
         if (!engineReady) {
             Log.w(TAG, "analyzeTextDirect called but engine not ready")
             return null
@@ -2855,5 +2965,11 @@ class VyzeCoreController(
 
         /** Output cap for model-native speech transcriptions (short). */
         private const val ASR_MAX_TOKENS = 96
+
+        /**
+         * Output cap for agent-lane image answers (one spoken sentence) —
+         * sized between the native scene budget and text-only budget.
+         */
+        private const val AGENT_LANE_IMAGE_MAX_TOKENS = 48
     }
 }
