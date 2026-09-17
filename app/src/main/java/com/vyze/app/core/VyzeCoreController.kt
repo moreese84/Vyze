@@ -603,17 +603,29 @@ class VyzeCoreController(
     }
 
     /**
-     * REAL text engine op for the agent lane — routes through the SAME
-     * gated path the native pipeline uses: engine-ready check, isInferring
-     * CAS (decline, never queue), watchdog timeout, and cancelInference on
-     * timeout, then VlmEngineManager.analyzeText on the local LiteRT-LM
-     * engine (gemma-4-E2B-it.litertlm). No re-platforming of the engine.
+     * REAL text engine op for the agent lane. The controller OWNS language
+     * mirroring for every agent dispatch: the raw query is routed through
+     * the FULL [DynamicPromptBuilder.buildPrompt] pipeline — the same
+     * [OUTPUT LANGUAGE: {lang}] top anchor and "REMEMBER: Respond only in
+     * {lang}" bottom anchor the native text path uses — with the locale
+     * read FRESH from [activeUserLocale] at call time (never a stale
+     * snapshot). Without this, the 2B model drifts back to English or
+     * sticks to previous-turn history. Engine gating/decline semantics are
+     * unchanged: engine-ready check, isInferring CAS (decline, never
+     * queue), watchdog timeout, cancelInference on timeout, then
+     * VlmEngineManager.analyzeText on the local LiteRT-LM engine
+     * (gemma-4-E2B-it.litertlm). No re-platforming of the engine.
      */
-    suspend fun analyzeTextDirect(prompt: String, sessionId: String): String? =
-        analyzeTextDirectInternal(prompt, sessionId)
+    suspend fun analyzeTextDirect(prompt: String, sessionId: String): String? {
+        val formattedPrompt = buildPromptForAgent(prompt)
+        CrashLogFile.log(TAG, "Agent-lane TEXT prompt built: ${formattedPrompt.length} chars")
+        return analyzeTextDirectInternal(formattedPrompt, sessionId)
+    }
 
     /**
-     * REAL image engine op for the agent lane — routes through
+     * REAL image engine op for the agent lane. Language mirroring is
+     * applied identically to the text lane ([buildPromptForAgent] with a
+     * FRESH locale read), then the query routes through
      * VlmEngineManager.analyzeImage (GPU vision encoder) with a modest
      * token budget for a single spoken sentence. Same engine, same
      * generationMutex serialization as every native inference.
@@ -623,10 +635,12 @@ class VyzeCoreController(
             Log.w(TAG, "analyzeImageDirect called but engine not ready")
             return null
         }
+        val formattedPrompt = buildPromptForAgent(prompt)
+        CrashLogFile.log(TAG, "Agent-lane IMAGE prompt built: ${formattedPrompt.length} chars")
         return try {
             vlmEngine.analyzeImage(
                 bitmap = frame,
-                prompt = prompt,
+                prompt = formattedPrompt,
                 memoryContext = null,
                 similarInteractions = emptyList(),
                 sessionId = sessionId,
@@ -637,6 +651,30 @@ class VyzeCoreController(
             null
         }
     }
+
+    /**
+     * Build the agent-lane prompt through the SAME dynamic pipeline as the
+     * native paths. The locale is read at CALL TIME from [activeUserLocale]
+     * — which setUserLocale keeps in sync with the SpeechRecognizer's
+     * detected language — so every tool invocation carries the CURRENT
+     * language binding, never a stale one. Direct-query mode with dialogue
+     * context (follow-up resolution) but no OCR/memory injection: those
+     * remain native-path features until the agent instructions own them.
+     */
+    private suspend fun buildPromptForAgent(rawQuery: String): String =
+        promptBuilder.buildPrompt(
+            snapshotDescription = rawQuery,
+            queryOverride = rawQuery,
+            continuousMode = false,
+            userLocale = activeUserLocale,
+            ocrText = null,
+            currencyMode = false,
+            bankCardMode = false,
+            memoryContext = null,
+            textOnlyMode = false,
+            brevityLevel = PreferenceLearner.BrevityLevel.NORMAL,
+            dialogueContext = dialogueContextForPrompt()
+        )
 
     /**
      * REAL OCR tool op for the agent lane — the SAME ML Kit
@@ -2373,6 +2411,15 @@ class VyzeCoreController(
         // dispatched, so the fresh query always builds against clean state.
         val newLanguage = locale.language
         if (lastDialogueLanguage != null && lastDialogueLanguage != newLanguage) {
+            // AGENT-LANE PARITY (language-mirroring fix): an explicit language
+            // switch is a conversation boundary for BOTH lanes. A generation
+            // still in flight from the PREVIOUS language must be cancelled
+            // before it streams an old-language answer (or seeds engine KV
+            // history) into the new-language turn — otherwise legacy turn
+            // history contaminates the active language no matter how the
+            // prompt is anchored. Session gating already drops its callbacks;
+            // this stops the generation itself.
+            cancelInference()
             synchronized(dialogueLock) {
                 if (dialogueTurns.isNotEmpty()) {
                     Log.d(TAG, "Language switch $lastDialogueLanguage → $newLanguage — clearing dialogue history")
