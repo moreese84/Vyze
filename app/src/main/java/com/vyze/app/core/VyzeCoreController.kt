@@ -578,6 +578,52 @@ class VyzeCoreController(
             .replace(Regex("\\s+"), " ")
             .trim()
 
+        // HESITATION-MARKER CLEANUP: strip repeated fillers ("ya ya", "yes,
+        // yes, yes,", "uh… um…") that the model streams when uncertain,
+        // BEFORE the TTS queue hears them. Only a REPEATED token is a
+        // hesitation — a single "yes" / "ya" / "boleh" can be the entire
+        // legitimate answer ("Can you see it?" — "Yes."), so one occurrence
+        // always survives. Backreference replace keeps the FIRST occurrence's
+        // original casing and only collapses CONSECUTIVE repeats (two
+        // sentences that each legitimately start with "Yes" are untouched).
+        if (cleaned.isNotEmpty()) {
+            for (filler in HESITATION_FILLERS) {
+                val wordRegex = Regex("(?i)\\b" + Regex.escape(filler) + "\\b")
+                if (wordRegex.findAll(cleaned).count() < 2) continue
+                // Pair-collapse pattern: FILLER + CLAUSE-LEVEL separator run
+                // + the SAME FILLER. Repeated until stable, so runs of any
+                // length ("ya, ya, ya, ya") collapse to one. "$1" keeps the
+                // FIRST occurrence's original casing; group 2 keeps the
+                // separators AFTER the last collapsed copy so mid-sentence
+                // flow is preserved ("ya, ya, seekor kucing" -> "ya, seekor
+                // kucing"). Only CONSECUTIVE occurrences collapse — the
+                // separator class is clause-level ONLY (whitespace, commas,
+                // semicolons, ellipsis), deliberately EXCLUDING sentence
+                // terminators, so "Yes." followed by "Yes, ..." in two real
+                // sentences is never merged.
+                val pairRegex = Regex(
+                    "(?i)\\b(" + Regex.escape(filler) + ")\\b[\\s,，、;；…]*\\1\\b([\\s,，、;；]*)"
+                )
+                while (true) {
+                    val collapsed = pairRegex.replace(cleaned, "$1$2")
+                    if (collapsed == cleaned) break
+                    cleaned = collapsed
+                }
+            }
+            // CJK hesitation runs ("嗯嗯嗯") have no word boundaries —
+            // collapse consecutive runs to a single token (one 嗯 = a
+            // legitimate answer particle).
+            if (cleaned.contains("嗯嗯")) {
+                cleaned = cleaned.replace(Regex("嗯{2,}"), "嗯").trim()
+            }
+            // Lone trailing-comma artifacts: "... ," / "...，" with nothing
+            // after them read as a dangling rise; drop the comma and let the
+            // trailing-punctuation stamp below close the fragment properly.
+            cleaned = cleaned.replace(Regex("[\\s]*[,，][\\s]*$"), "")
+                .replace(Regex("[\\s]*;;+[\\s]*$"), ";")
+                .trim()
+        }
+
         // Enforce trailing punctuation — Android TTS clips phonemes on
         // unpunctuated final words. Append '.' if missing. A trailing ',' or
         // ';' is kept as-is: it is already punctuation (anti-clipping
@@ -637,13 +683,14 @@ class VyzeCoreController(
 
             // ── Boundary scan: strongest boundary wins ─────────────
             // Sentence terminators (., !, ?, newline) are the strongest cut
-            // points and are scanned first. Clause delimiters (',' '，' ';'
-            // '；') and the word-count fallback (clause-level flush below)
-            // provide mid-sentence cuts so speech never stalls while
-            // downstream tokens are still generating — those cuts are queued
-            // back-to-back with the in-flight utterance, keeping the audio
-            // continuous instead of chopping one sentence into full-stop
-            // fragments separated by dead air.
+            // points and are scanned first — full sentences DRIVE the primary
+            // speech flushes. Clause delimiters (',' '，' ';' '；') and the
+            // word-count fallback (clause-level flush below) are mid-sentence
+            // dead-air cuts, deliberately gated on a FULL-CLAUSE length so
+            // short phrases stay concatenated inside one continuous utterance
+            // instead of spawning a separate TTS audio track every few words
+            // (each Android TTS utterance start costs a hardware-latency
+            // pause).
             var cut = -1
             // True when `cut` landed on a clause delimiter rather than a
             // sentence terminator or the word-aligned fallback — clause cuts
@@ -672,42 +719,44 @@ class VyzeCoreController(
                 cut = text.length - 1
             }
 
-            // ── CLAUSE-LEVEL FLUSHING (dead-air fix, revised) ─────
-            // No sentence terminator yet. Flush at the strongest WEAK
-            // boundary already in the buffer — a clause delimiter (',' '，'
-            // ';' '；') — or, if none, a word-aligned cut once ≥3 spoken
-            // units are held.
-            //
-            // REVISION: the first version of this fix gated the block on
-            // pendingUtteranceCount() == 0 && currentChunkStarted, i.e. it
-            // only fired AFTER the engine had gone silent — exactly when the
-            // user was already hearing dead air. It now runs UNCONDITIONALLY
-            // on engine state (beyond the backpressure ceiling above): while
-            // the previous utterance is still synthesizing/playing, a clause
-            // cut simply queues as the next utterance and playback continues
-            // without a gap; whole-sentence MERGING is still preserved by the
-            // batching hold below, which keeps applying to sentence cuts.
-            // Sentence terminators still win (scanned first above).
+            // ── CLAUSE-LEVEL FLUSHING (dead-air fix, over-segmentation FIX) ─
+            // No sentence terminator yet. Cut at the strongest WEAK boundary
+            // already in the buffer — but ONLY once the buffer holds a full
+            // grammatical clause (>= CLAUSE_FLUSH_MIN_WORDS spoken units).
+            // OVER-SEGMENTATION FIX: the previous revision cut on EVERY
+            // standalone comma regardless of length, which made Android TTS
+            // spin up a separate audio track every ~3 words — each utterance
+            // start paying its hardware-latency pause ("di hadapan kamu..
+            // [pause] .. seekor kucing.."). The comma cut below now requires
+            // the text BEFORE the comma to already be a full clause, so short
+            // phrases stay concatenated inside one continuous utterance while
+            // genuinely long clause chains still stream without dead air.
+            // Sentence terminators still drive the primary flushes (scanned
+            // first above); this block only protects long no-sentence runs.
             if (cut < 0 && firstChunkSent) {
-                // 1) Clause boundary: cut AFTER the last clause delimiter.
-                //    cutEnd below keeps the delimiter itself, and
-                //    sanitizeForTts preserves trailing ',' / '，' / ';' —
-                //    listing intonation, no stamped period, no full-stop
-                //    seam.
+                // 1) Clause boundary: cut AFTER the last clause delimiter —
+                //    but only if what precedes it is already a full clause
+                //    (>= CLAUSE_FLUSH_MIN_WORDS spoken units). cutEnd below
+                //    keeps the delimiter itself, and sanitizeForTts preserves
+                //    trailing ',' / '，' / ';' — listing intonation, no
+                //    stamped period, no full-stop seam.
                 for (i in text.length - 1 downTo 0) {
                     if (text[i] in CLAUSE_DELIMITERS) {
-                        cut = i
-                        pendingClauseCut = true
+                        if (spokenUnitCount(text.substring(0, i)) >= CLAUSE_FLUSH_MIN_WORDS) {
+                            cut = i
+                            pendingClauseCut = true
+                        }
+                        // Under-length clause: keep buffering — the delimiter
+                        // stays inside the utterance and joins the next phrase.
                         break
                     }
                 }
-                // 2) Word-count fallback: no clause delimiter either —
-                //    once ≥ CLAUSE_FLUSH_MIN_WORDS spoken units (words;
-                //    CJK chars count individually) are held with no
-                //    boundary in sight, cut at the last word boundary.
-                //    fastStartFragment appends a ',' so the voice stays in
-                //    listing intonation (same Continuity FIX as the
-                //    first-utterance path below).
+                // 2) Word-count fallback: no usable clause delimiter — once
+                //    >= CLAUSE_FLUSH_MIN_WORDS spoken units (words; CJK chars
+                //    count individually) are held with no boundary in sight,
+                //    cut at the last word boundary. fastStartFragment appends
+                //    a ',' so the voice stays in listing intonation (same
+                //    Continuity FIX as the first-utterance path below).
                 if (cut < 0 && spokenUnitCount(text) >= CLAUSE_FLUSH_MIN_WORDS) {
                     val spaceIdx = text.lastIndexOf(' ')
                     val hasCjk = text.any { it.code in 0x2E80..0x9FFF || it.code in 0x3000..0x303F || it.code in 0xFF00..0xFFEF }
@@ -860,10 +909,12 @@ class VyzeCoreController(
             }
         }
 
-        // Post only when there is text left. (The old silent-tail utterance
-        // was a no-op under the platform engine — trailing AudioTrack drain
-        // is covered by the caller's grace period instead.)
-        if (remaining.isEmpty()) return
+        // Post only when there is SPEAKABLE text left. (The old silent-tail
+        // utterance was a no-op under the platform engine — trailing
+        // AudioTrack drain is covered by the caller's grace period instead.)
+        // Punctuation-only remnants (a lone ',' left by a clause cut) are
+        // skipped — nothing phonetic remains to speak.
+        if (remaining.isEmpty() || remaining.none { it.isLetterOrDigit() }) return
         mainHandler.post {
             try {
                 val finalChunkId = "${activeSessionId}_final_${chunkCounter.incrementAndGet()}"
@@ -2617,15 +2668,30 @@ class VyzeCoreController(
         private const val FIRST_FLUSH_MIN_WORDS = 5
 
         /**
-         * Clause-flush word threshold (dead-air fix): when the buffer holds
-         * at least this many spoken units with NO sentence terminator and NO
-         * clause delimiter, flush a word-aligned fragment so speech never
-         * stalls waiting for downstream tokens. Tokens arrive 1-3 words at a
-         * time, so actual cuts land at ~3-5 words — immediate enough that no
-         * audible silence gap opens, while clause/sentence cuts still keep
-         * most utterances multi-clause.
+         * Clause-flush word threshold (dead-air fix + OVER-SEGMENTATION
+         * FIX): a clause cut fires only once the buffer holds at least this
+         * many spoken units. Threshold of 3 made Android TTS spawn a
+         * separate audio track every ~3 words — each utterance start paying
+         * a hardware-latency pause between tiny phrases. 6 lets short
+         * phrases concatenate inside one continuous utterance while still
+         * protecting long no-sentence runs from dead air. Applies BOTH to
+         * the word-aligned fallback and to comma cuts (the text before the
+         * comma must already be a full clause).
          */
-        private const val CLAUSE_FLUSH_MIN_WORDS = 3
+        private const val CLAUSE_FLUSH_MIN_WORDS = 6
+
+        /**
+         * Multilingual hesitation fillers for [sanitizeForTts]: only a
+         * CONSECUTIVE repetition of one of these is stripped (repeated
+         * "ya ya", "yes, yes", "uh uh"). A single occurrence is always a
+         * legitimate spoken word — "Yes." can be a complete answer — so
+         * single tokens are never touched. Covers the model's English and
+         * Malay hesitation vocabulary ("ya" doubles as both).
+         */
+        private val HESITATION_FILLERS = listOf(
+            "ya", "yes", "yeah", "yep", "uh", "um", "erm", "hmm",
+            "ah", "oh", "eh", "mmm", "okay", "ok", "boleh"
+        )
 
         // ── Dynamic Resolution Constants ──────────────────────────
 
