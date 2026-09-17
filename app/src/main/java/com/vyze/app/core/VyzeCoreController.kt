@@ -194,12 +194,18 @@ class VyzeCoreController(
     // streaming flush never found a boundary and a Chinese answer was only
     // spoken after the whole generation finished (or stalled entirely on long
     // answers), which users perceived as "no response" for Chinese queries.
-    // Streaming FIX: ASCII ';' added as a strong clause delimiter — flushes
-    // may cut on it just like a sentence end. Commas stay INSIDE the sentence
-    // while audio is flowing; they become flush points ONLY when the TTS
-    // engine has gone quiet (clause-level dead-air fix in
-    // flushSentenceBufferIfReady).
+    // Streaming FIX: ASCII ';' is BOTH a sentence terminator (strong clause,
+    // always flushes) and a clause delimiter (see CLAUSE_DELIMITERS below).
     private val SENTENCE_TERMINATORS = charArrayOf('.', '!', '?', ';', '\n', '。', '！', '？', '；')
+
+    /**
+     * Weak clause delimiters for the dead-air fix: post-first-utterance, the
+     * buffer may cut on these as soon as one arrives — WITHOUT waiting for a
+     * full sentence terminator or for the engine to go quiet. Trailing
+     * ',' / '，' / ';' survive sanitizeForTts un-stamped, so the continuation
+     * keeps flowing (listing) intonation instead of a full-stop seam.
+     */
+    private val CLAUSE_DELIMITERS = charArrayOf(',', '，', ';', '；')
 
     /** True while the CURRENT flush is a mid-sentence fast-start fragment. */
     @Volatile
@@ -629,19 +635,20 @@ class VyzeCoreController(
                 return
             }
 
-            // ── Sentence-boundary flushing only ─────────────────────
-            // Flush ONLY at real sentence ends (., !, ?, newline). Commas and
-            // colons stay INSIDE the sentence. Previously the buffer also
-            // flushed at commas (and even spoke the first 2-3 words instantly),
-            // which chopped one sentence into many tiny utterances — each one
-            // spoken with a full-stop intonation and a dead-air gap, so users
-            // heard "A red can. …(seconds of silence)… with a white label."
-            // Whole sentences are the natural spoken unit: buffer until one
-            // completes, then speak it in one flowing utterance (the TTS voice
-            // renders internal commas as short natural pauses). Clause-level
-            // flushing (commas / word-count fallback) activates ONLY when the
-            // engine has gone quiet — see the dead-air fix below.
+            // ── Boundary scan: strongest boundary wins ─────────────
+            // Sentence terminators (., !, ?, newline) are the strongest cut
+            // points and are scanned first. Clause delimiters (',' '，' ';'
+            // '；') and the word-count fallback (clause-level flush below)
+            // provide mid-sentence cuts so speech never stalls while
+            // downstream tokens are still generating — those cuts are queued
+            // back-to-back with the in-flight utterance, keeping the audio
+            // continuous instead of chopping one sentence into full-stop
+            // fragments separated by dead air.
             var cut = -1
+            // True when `cut` landed on a clause delimiter rather than a
+            // sentence terminator or the word-aligned fallback — clause cuts
+            // bypass the playback-synthesis batching hold below.
+            var pendingClauseCut = false
             for (i in text.length - 1 downTo 0) {
                 if (text[i] in SENTENCE_TERMINATORS) {
                     cut = i
@@ -663,6 +670,52 @@ class VyzeCoreController(
             }
             if (cut < 0 && text.length >= readAheadCeiling) {
                 cut = text.length - 1
+            }
+
+            // ── CLAUSE-LEVEL FLUSHING (dead-air fix, revised) ─────
+            // No sentence terminator yet. Flush at the strongest WEAK
+            // boundary already in the buffer — a clause delimiter (',' '，'
+            // ';' '；') — or, if none, a word-aligned cut once ≥3 spoken
+            // units are held.
+            //
+            // REVISION: the first version of this fix gated the block on
+            // pendingUtteranceCount() == 0 && currentChunkStarted, i.e. it
+            // only fired AFTER the engine had gone silent — exactly when the
+            // user was already hearing dead air. It now runs UNCONDITIONALLY
+            // on engine state (beyond the backpressure ceiling above): while
+            // the previous utterance is still synthesizing/playing, a clause
+            // cut simply queues as the next utterance and playback continues
+            // without a gap; whole-sentence MERGING is still preserved by the
+            // batching hold below, which keeps applying to sentence cuts.
+            // Sentence terminators still win (scanned first above).
+            if (cut < 0 && firstChunkSent) {
+                // 1) Clause boundary: cut AFTER the last clause delimiter.
+                //    cutEnd below keeps the delimiter itself, and
+                //    sanitizeForTts preserves trailing ',' / '，' / ';' —
+                //    listing intonation, no stamped period, no full-stop
+                //    seam.
+                for (i in text.length - 1 downTo 0) {
+                    if (text[i] in CLAUSE_DELIMITERS) {
+                        cut = i
+                        pendingClauseCut = true
+                        break
+                    }
+                }
+                // 2) Word-count fallback: no clause delimiter either —
+                //    once ≥ CLAUSE_FLUSH_MIN_WORDS spoken units (words;
+                //    CJK chars count individually) are held with no
+                //    boundary in sight, cut at the last word boundary.
+                //    fastStartFragment appends a ',' so the voice stays in
+                //    listing intonation (same Continuity FIX as the
+                //    first-utterance path below).
+                if (cut < 0 && spokenUnitCount(text) >= CLAUSE_FLUSH_MIN_WORDS) {
+                    val spaceIdx = text.lastIndexOf(' ')
+                    val hasCjk = text.any { it.code in 0x2E80..0x9FFF || it.code in 0x3000..0x303F || it.code in 0xFF00..0xFFEF }
+                    if (spaceIdx >= 0 || hasCjk) {
+                        cut = if (spaceIdx >= 0) spaceIdx else text.length
+                        fastStartFragment = true
+                    }
+                }
             }
 
             // ── FIRST-UTTERANCE BUFFER THRESHOLD ──────────────────
@@ -701,53 +754,6 @@ class VyzeCoreController(
                     }
                 }
             }
-            // ── CLAUSE-LEVEL DEAD-AIR FIX ─────────────────────────
-            // No sentence terminator has arrived, but the TTS engine has gone
-            // quiet (nothing pending AND the last posted utterance already
-            // started): holding further would be dead air while Gemma keeps
-            // generating downstream tokens. Flush at the strongest WEAK
-            // boundary available — a clause delimiter (',' / '，'), or, if
-            // none, a word-aligned cut once ~6-8 words have accumulated.
-            // While ANYTHING is pending or playing this block never fires:
-            // audio is flowing, so the buffer keeps merging into whole-
-            // sentence utterances — which is exactly what prevents comma
-            // flushing from reintroducing the old "A red can. … with a
-            // white label." utterance-choppiness. Gating on engine quiet
-            // means a weak cut happens at most once per silence gap, and
-            // never splits audio that is already seamless. If generation
-            // ends while text is held here, flushRemainingSentenceBuffer
-            // drains it (no text can be lost by holding).
-            if (cut < 0 && firstChunkSent &&
-                ttsManager.pendingUtteranceCount() == 0 && currentChunkStarted) {
-                // 1) Clause boundary: cut AFTER the last comma (ASCII or
-                //    full-width). cutEnd below keeps the comma itself, and
-                //    sanitizeForTts preserves a trailing ',' — listing
-                //    intonation, no stamped period, no full-stop seam.
-                for (i in text.length - 1 downTo 0) {
-                    if (text[i] == ',' || text[i] == '，') {
-                        cut = i
-                        break
-                    }
-                }
-                // 2) Word-count fallback: no comma either — once ≥6 spoken
-                //    units (words; CJK chars count individually) are held
-                //    with no terminator in sight, cut at the last word
-                //    boundary. fastStartFragment appends a ',' so the voice
-                //    stays in listing intonation (same Continuity FIX as
-                //    the first-utterance path above).
-                if (cut < 0) {
-                    val spaceIdx = text.lastIndexOf(' ')
-                    val hasCjk = text.any { it.code in 0x2E80..0x9FFF || it.code in 0x3000..0x303F || it.code in 0xFF00..0xFFEF }
-                    val candidate = if (spaceIdx >= 0) text.substring(0, spaceIdx).trim() else text.trim()
-                    if ((spaceIdx >= 0 || hasCjk) &&
-                        spokenUnitCount(candidate) >= CLAUSE_FLUSH_MIN_WORDS &&
-                        candidate.length >= minFlushChars) {
-                        cut = if (spaceIdx >= 0) spaceIdx else text.length
-                        fastStartFragment = true
-                    }
-                }
-            }
-
             if (cut < 0) {
                 return
             }
@@ -755,21 +761,24 @@ class VyzeCoreController(
             // doesn't become its own clipped utterance — it joins the next one.
             if (cut + 1 < minFlushChars) return
 
-            // ── PLAYBACK-AWARE BATCHING (post-first utterances) ─────
+            // ── PLAYBACK-AWARE BATCHING (sentence cuts only) ────────
             // Android TTS leaves a 100-300ms hardware seam between separate
             // utterances — one utterance per sentence sounds like stop-start
-            // reading. Hold completed sentences while the PREVIOUS utterance
-            // has not STARTED PLAYING yet: while the engine is still
-            // synthesizing, every QUEUE_ADD becomes its own utterance with a
-            // seam after it, so keep accumulating instead (merging is free
-            // while nothing is audible). The moment the previous utterance
+            // reading. While the PREVIOUS utterance has not STARTED PLAYING
+            // yet (still synthesizing), hold COMPLETED SENTENCES and keep
+            // accumulating instead (merging is free while nothing is
+            // audible) — this is what collapses most streamed answers to
+            // 1-2 seamless utterances. The moment the previous utterance
             // starts playing, flush at the next sentence boundary so the
-            // queue never starves mid-answer. This replaces the old static
-            // 60-char coalescing gate: the hold now lasts exactly as long as
-            // actual synthesis — no dead air when generation is slow — and
-            // the read-ahead ceiling above still forces a flush if the model
-            // runs on without punctuation (cut >= 0 bypasses this hold).
-            if (cut < 0 && firstChunkSent && !currentChunkStarted && !fastStartFragment) {
+            // queue never starves mid-answer.
+            //
+            // CLAUSE CUTS BYPASS THIS HOLD (pendingClauseCut /
+            // fastStartFragment): they exist to kill dead air, so they must
+            // queue immediately — the engine plays them back-to-back with
+            // the in-flight utterance, and the seam lands BETWEEN clauses,
+            // where a short natural pause is the prosodically correct
+            // behavior anyway.
+            if (firstChunkSent && !currentChunkStarted && !pendingClauseCut && !fastStartFragment) {
                 return // previous utterance still synthesizing — keep merging
             }
 
@@ -2255,6 +2264,11 @@ class VyzeCoreController(
         } ?: Locale.US
 
         activeUserLocale = locale
+        // LANGUAGE-MIRRORING FIX: mirror the locale into the engine BEFORE the
+        // query dispatches, so the perspective directive is assembled in the
+        // active language (second-person spatial rules for ms/zh arrive in
+        // their own script instead of hardcoded English persona wording).
+        vlmEngine.setUserLocale(locale)
         Log.i(TAG, "setUserLocale: $locale (language=${locale.language})")
 
         // LANGUAGE-SWITCH HISTORY TRIM: a detected language change is a
@@ -2603,15 +2617,15 @@ class VyzeCoreController(
         private const val FIRST_FLUSH_MIN_WORDS = 5
 
         /**
-         * Clause-flush word threshold (dead-air fix): when the TTS engine has
-         * gone quiet and the buffer holds at least this many spoken units
-         * with NO sentence terminator and NO comma, flush a word-aligned
-         * fragment so speech never stalls waiting for downstream tokens.
-         * Tokens arrive 1-3 words at a time, so actual cuts land at ~6-8
-         * words — fast enough to kill dead air, large enough to avoid
-         * micro-utterance choppiness.
+         * Clause-flush word threshold (dead-air fix): when the buffer holds
+         * at least this many spoken units with NO sentence terminator and NO
+         * clause delimiter, flush a word-aligned fragment so speech never
+         * stalls waiting for downstream tokens. Tokens arrive 1-3 words at a
+         * time, so actual cuts land at ~3-5 words — immediate enough that no
+         * audible silence gap opens, while clause/sentence cuts still keep
+         * most utterances multi-clause.
          */
-        private const val CLAUSE_FLUSH_MIN_WORDS = 6
+        private const val CLAUSE_FLUSH_MIN_WORDS = 3
 
         // ── Dynamic Resolution Constants ──────────────────────────
 

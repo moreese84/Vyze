@@ -36,6 +36,7 @@ import com.vyze.app.memory.SimilarInteraction
 import java.io.ByteArrayOutputStream
 import java.io.Closeable
 import java.io.File
+import java.util.Locale
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
@@ -114,6 +115,38 @@ class VlmEngineManager(
     var onError: ((String, String) -> Unit)? = null            // (error, sessionId)
     var onModelCopyProgress: ((copied: Long, total: Long) -> Unit)? = null
     var onStepProgress: ((Int, String) -> Unit)? = null
+
+    /**
+     * The active user speech locale, mirrored from VyzeCoreController on
+     * every setUserLocale(). Default US English until the first locale
+     * detection lands (matching the controller's default).
+     */
+    @Volatile
+    var activeUserLocale: Locale = Locale.US
+        private set
+
+    /** Called by VyzeCoreController.setUserLocale() — keeps the engine's
+     *  directive assembly in sync with the active speech language. */
+    fun setUserLocale(locale: Locale) {
+        activeUserLocale = locale
+    }
+
+    /**
+     * Language-bound second-person clause for the system directive, in the
+     * ACTIVE language (LANGUAGE-MIRRORING FIX): the persona constant is
+     * deliberately English-neutral, and these spatial rules are appended per
+     * turn so a 2B model never sees conflicting English persona examples
+     * while producing Malay/Chinese output. English full rule; Malay and
+     * Chinese translations carry the same binding in their own script;
+     * unknown languages fall back to English wording (harmless — the
+     * [OUTPUT LANGUAGE] / REMEMBER wrappers in DynamicPromptBuilder remain
+     * the language authority on every turn).
+     */
+    private fun perspectiveClauseFor(locale: Locale): String = when (locale.language) {
+        "ms" -> PERSPECTIVE_MS
+        "zh" -> PERSPECTIVE_ZH
+        else -> PERSPECTIVE_EN
+    }
 
     /**
      * Latch for the currently active inference. Promoted to instance field
@@ -400,7 +433,10 @@ class VlmEngineManager(
             //    System directive is folded into the user turn (Gemma has no system role).
             //    User rules come from DynamicPromptBuilder inside the user payload.
             val userPayload = buildUserPayload(prompt, memoryContext)
-            val formattedPrompt = buildGemmaTurnPrompt(userPayload, SYSTEM_DIRECTIVE)
+            val formattedPrompt = buildGemmaTurnPrompt(
+                userPayload,
+                SYSTEM_DIRECTIVE + perspectiveClauseFor(activeUserLocale)
+            )
             CrashLogFile.log(TAG, "Formatted prompt: ${formattedPrompt.take(120)}...")
 
             // 4. Build multimodal contents — formatted prompt text + clamped bitmap.
@@ -458,7 +494,10 @@ class VlmEngineManager(
         maxTokens: Int = TEXT_ONLY_MAX_TOKENS
     ): String? = withContext(Dispatchers.Default) {
         CrashLogFile.log(TAG, "=== ANALYZE TEXT (no image) ===")
-        val formattedPrompt = buildGemmaTurnPrompt(prompt, TEXT_ONLY_SYSTEM_DIRECTIVE)
+        val formattedPrompt = buildGemmaTurnPrompt(
+            prompt,
+            TEXT_ONLY_SYSTEM_DIRECTIVE + perspectiveClauseFor(activeUserLocale)
+        )
         runConversation(
             contents = Contents.of(Content.Text(formattedPrompt)),
             maxTokens = maxTokens,
@@ -1078,19 +1117,27 @@ class VlmEngineManager(
         /**
          * System directive for TEXT-ONLY inference (analyzeText) — a general
          * knowledge assistant, NOT a scene describer. PERSPECTIVE FIX: strict
-         * second-person binding (never "in front of me" / "to my left") and a
-         * 1-sentence cap for fast spoken delivery, in the user's language.
+         * second-person binding and a 1-sentence cap for fast spoken delivery.
+         *
+         * LANGUAGE-MIRRORING FIX (regression from the first perspective commit):
+         * this directive contains NO hardcoded English spatial wording and NO
+         * hardcoded English second-person examples. A 2B on-device model gives
+         * the LAST-seen persona wording high attention weight — a pure-English
+         * persona here overrode the [OUTPUT LANGUAGE] wrapper that
+         * DynamicPromptBuilder prepends, dragging Malay/Chinese answers back
+         * into English. The persona stays English-neutral; the language-bound
+         * second-person rules are appended per turn by
+         * [perspectiveClauseFor] in the ACTIVE language, and the
+         * `[OUTPUT LANGUAGE: …]` (top) + `REMEMBER: Respond only in …`
+         * (bottom) wrappers remain the sole language authorities.
          */
         private const val TEXT_ONLY_SYSTEM_DIRECTIVE =
             "You are Vyze, a fast, friendly visual assistant speaking aloud to a blind user. " +
             "Answer in 1 short spoken sentence. " +
-            "Always address the user directly in the second person ('you', 'your', 'in front of you'). " +
-            "NEVER say 'in front of me' or 'to my left' — always describe positions relative to the " +
-            "user ('in front of you', 'to your left', 'at 12 o'clock'). " +
+            "Always address the user directly. " +
             "If past conversation turns are provided, refer to them when relevant. " +
             "No markdown, no bullets, no lists — plain flowing sentences only. " +
             "Use clear punctuation (periods and commas) for spoken delivery. " +
-            "Respond only in the language requested by the user. " +
             "Do not mention that you are an AI or offline."
 
         // Timeouts
@@ -1107,25 +1154,47 @@ class VlmEngineManager(
 
         /**
          * Gemma 4 system directive — folded into the user turn (Gemma has no system role).
-         * CONVERSATIONAL PERSONA + PERSPECTIVE FIX (verbatim product spec): strict
-         * second-person binding (never "in front of me" / "to my left"), 1 short
-         * spoken sentence, clock/left-right spatial clarity relative to the USER,
-         * plain sentences only. Long OCR reads override the sentence cap via an
-         * explicit carve-out in DynamicPromptBuilder. SINGLE SOURCE (Phase 4): the
-         * former mirrored copy in DynamicPromptBuilder was removed — this is the
-         * only definition in the codebase.
+         * CONVERSATIONAL PERSONA + PERSPECTIVE FIX: strict second-person binding,
+         * 1 short spoken sentence, clock/left-right spatial clarity relative to the
+         * USER, plain sentences only. Long OCR reads override the sentence cap via
+         * an explicit carve-out in DynamicPromptBuilder. SINGLE SOURCE (Phase 4):
+         * the former mirrored copy in DynamicPromptBuilder was removed — this is
+         * the only definition in the codebase.
+         *
+         * LANGUAGE-MIRRORING FIX: no hardcoded English spatial wording or
+         * second-person examples here (see TEXT_ONLY_SYSTEM_DIRECTIVE for the
+         * regression rationale). Language-bound second-person rules arrive per
+         * turn via [perspectiveClauseFor] in the ACTIVE language; the
+         * `[OUTPUT LANGUAGE: …]` / `REMEMBER: Respond only in …` wrappers from
+         * DynamicPromptBuilder stay strictly enforced on every turn.
          */
         private const val SYSTEM_DIRECTIVE =
             "You are Vyze, a fast, friendly visual assistant speaking aloud to a blind user. " +
             "Answer in 1 short spoken sentence about what you see. " +
-            "Always address the user directly in the second person ('you', 'your', 'in front of you'). " +
-            "NEVER say 'in front of me' or 'to my left' — always describe positions relative to the " +
-            "user ('in front of you', 'to your left', 'at 12 o'clock'). " +
+            "Always address the user directly. " +
             "Refer to past conversation turns when they are provided. " +
             "No markdown, no bullets, no lists — plain spoken sentences only. " +
-            "Describe what you see directly in the language requested by the user without " +
-            "cross-translating or outputting internal reasoning chains. " +
-            "Respond only in the requested language."
+            "Describe what you see directly without cross-translating or outputting " +
+            "internal reasoning chains."
+
+        /**
+         * Second-person spatial directive, emitted in the ACTIVE language by
+         * [perspectiveClauseFor]. English carries the full never-say rule;
+         * the Malay and Chinese translations carry the same second-person
+         * binding in their own script so a 2B model never sees conflicting
+         * English persona examples when mirroring ms/zh output.
+         */
+        private const val PERSPECTIVE_EN =
+            "Always address the user directly in the second person ('you', 'your', 'in front of you'). " +
+            "NEVER say 'in front of me' or 'to my left' — always describe positions relative to the " +
+            "user ('in front of you', 'to your left', 'at 12 o'clock')."
+        private const val PERSPECTIVE_MS =
+            "Sentiasa rujuk pengguna dalam kata ganti nama kedua ('anda', 'di hadapan anda'). " +
+            "JANGAN sesekali kata 'di hadapan saya' atau 'di sebelah kiri saya' — sentiasa nyatakan " +
+            "kedudukan relatif kepada pengguna ('di hadapan anda', 'di sebelah kiri anda', 'pukul 12')."
+        private const val PERSPECTIVE_ZH =
+            "始终使用第二人称直接称呼用户（'你'、'在你面前'）。" +
+            "绝不要说'在我面前'或'在我左边'——始终以用户为基准描述位置（'在你面前'、'在你的左边'、'12点钟方向'）。"
 
         // ── Mid-Tier / Low-RAM Thresholds ───────────────────────
         /** Minimum free device RAM (MB) required to attempt model init on standard devices. */
