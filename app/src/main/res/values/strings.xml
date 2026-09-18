@@ -147,6 +147,14 @@
     <!-- ── Color Analysis ──────────────────────────────────────────── -->
     <string name="color_analyzing">Analyzing color&#8230;</string>
     <string name="color_result">Color detected: %1$s</string>
+
+    <!-- TalkBack 50/50 gesture overlay -->
+    <string name="overlay_look_desc">Look. Take picture and describe scene. Double tap and hold to check light level.</string>
+    <string name="overlay_ask_desc">Ask. Start voice question.</string>
+
+    <!-- Dual-script onboarding tutorial (dispatched from CameraFragment) -->
+    <string name="script_tutorial_talkback_off">Vyze is ready. Tap once to describe what is in front of you. Double tap to ask a question by voice. Press and hold to check the light.</string>
+    <string name="script_tutorial_talkback_on">Welcome to Vyze. TalkBack is active. The screen is split into two halves. Touch the left side for Look, or the right side for Ask. Double-tap anywhere to activate the focused action.</string>
     <string name="color_unknown">Unknown</string>
 
     <!-- ── Reading Mode ──────────────────────────────────────────── -->

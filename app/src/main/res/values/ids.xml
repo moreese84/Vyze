@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Custom accessibility action IDs for the CameraFragment TalkBack overlay.
+    Registered via AccessibilityNodeInfoCompat.AccessibilityActionCompat so
+    screen-reader users can reach the infrequent utilities from the TalkBack
+    actions menu. Frequent verbs (Look / Ask / light check) are handled by
+    the clickable overlay halves themselves.
+-->
+<resources>
+    <item name="action_color_analysis" type="id" />
+    <item name="action_emergency_sos" type="id" />
+</resources>

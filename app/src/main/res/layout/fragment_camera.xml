@@ -31,6 +31,38 @@
         android:importantForAccessibility="no"
         app:scaleType="fillStart"/>
 
+    <!-- 50/50 gesture overlay (TalkBack co-existence).
+         Active ONLY while touch exploration is enabled (toggled from
+         CameraFragment). Each half exposes its contentDescription to
+         TalkBack and click/long-click handlers that fire the same verbs as
+         the physical gesture map, so TalkBack's double-tap-to-activate has
+         a clean target and never collides with the multi-tap gesture
+         vocabulary underneath. -->
+    <LinearLayout
+        android:id="@+id/gesture_overlay"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="horizontal"
+        android:importantForAccessibility="no">
+
+        <View
+            android:id="@+id/overlay_look"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:background="@android:color/transparent"
+            android:contentDescription="@string/overlay_look_desc" />
+
+        <View
+            android:id="@+id/overlay_ask"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:background="@android:color/transparent"
+            android:contentDescription="@string/overlay_ask_desc" />
+
+    </LinearLayout>
+
     <!-- Minimal floating status bar — bottom center -->
     <FrameLayout
         android:id="@+id/status_bar_container"

@@ -24,8 +24,10 @@ import com.vyze.app.vision.ColorAnalyzer
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.Intent
 import android.content.res.Configuration
 import android.graphics.Bitmap
+import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -36,6 +38,11 @@ import android.util.Log
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.view.accessibility.AccessibilityManager
+import android.view.accessibility.AccessibilityNodeInfo
+import androidx.core.view.AccessibilityDelegateCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.accessibility.AccessibilityNodeInfoCompat
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.activityViewModels
 import androidx.fragment.app.viewModels
@@ -80,6 +87,20 @@ class CameraFragment : Fragment() {
 
     private lateinit var cameraSetup: CameraSetupDelegate
     private lateinit var gestureRouter: GestureRouter
+
+    /** One-time guard for the TalkBack overlay/delegate install. */
+    private var talkbackDelegateInstalled = false
+
+    /** Live touch-exploration listener; registered on install, removed in onDestroyView. */
+    private var talkbackStateListener: AccessibilityManager.TouchExplorationStateChangeListener? = null
+
+    /**
+     * Fragment-owned repository for TalkBack color-scan persistence. A second
+     * lightweight instance over the same Room DB (GestureRouter holds its own).
+     */
+    private val talkbackScanRepository by lazy {
+        ScanRepository(requireContext().applicationContext)
+    }
 
     private lateinit var coreController: VyzeCoreController
     private lateinit var memoryDao: MemoryDao
@@ -581,17 +602,9 @@ class CameraFragment : Fragment() {
                         val mainActivity = activity as? MainActivity
                         if (mainActivity != null && mainActivity.isTtsReady()) {
                             appState = AppState.IDLE
-                            val talkBackHint = if (mainActivity.talkBackDetected) {
-                                " TalkBack detected. Vyze needs the full screen to work: " +
-                                "hold both volume keys for three seconds to turn it off, " +
-                                "or say open accessibility settings and I will take you there. "
-                            } else ""
-                            mainActivity.speakThenCallback(
-                                "${talkBackHint}Vyze is ready. Tap once to describe what is in front of you. " +
-                                "Double tap to ask a question by voice. Press and hold to check the light."
-                            ) {
-                                Log.d(TAG, "Onboarding spoken — staying quiet (mic closed at IDLE)")
-                            }
+                            // Dual-script tutorial: TTS when TalkBack is off,
+                            // TalkBack-native announcement when on (TTS bypassed).
+                            playOnboardingTutorial(mainActivity)
                         }
                     }
                 }
@@ -607,17 +620,9 @@ class CameraFragment : Fragment() {
                     val mainActivity = activity as? MainActivity
                     if (mainActivity != null && mainActivity.isTtsReady()) {
                         appState = AppState.IDLE
-                        val talkBackHint = if (mainActivity.talkBackDetected) {
-                            " TalkBack detected. Vyze needs the full screen to work: " +
-                            "hold both volume keys for three seconds to turn it off, " +
-                            "or say open accessibility settings and I will take you there. "
-                        } else ""
-                        mainActivity.speakThenCallback(
-                            "${talkBackHint}Vyze is ready. Tap once to describe what is in front of you. " +
-                            "Double tap to ask a question by voice. Press and hold to check the light."
-                        ) {
-                            Log.d(TAG, "Onboarding spoken — staying quiet (mic closed at IDLE)")
-                        }
+                        // Dual-script tutorial: TTS when TalkBack is off,
+                        // TalkBack-native announcement when on (TTS bypassed).
+                        playOnboardingTutorial(mainActivity)
                     }
                 }
             } else {
@@ -674,6 +679,12 @@ class CameraFragment : Fragment() {
         }
 
         gestureRouter.attach(fragmentCameraBinding.cameraContainer)
+
+        // ── TalkBack co-existence (overlay + dual-script tutorial) ──
+        // Transparent Look/Ask overlay halves + color/SOS custom actions.
+        // The overlay only intercepts touches while touch exploration is ON,
+        // so the physical gesture map is untouched when TalkBack is off.
+        installTalkbackAccessibilityActions()
 
         // Demand-driven capture (Phase 2 Step A): the fragment no longer
         // owns a background executor — CameraSetupDelegate's analysis
@@ -743,6 +754,13 @@ class CameraFragment : Fragment() {
     }
 
     override fun onDestroyView() {
+        // TalkBack overlay hygiene: drop the touch-exploration listener and
+        // release overlay handlers with the view hierarchy.
+        try {
+            val am = requireContext().getSystemService(Context.ACCESSIBILITY_SERVICE) as? AccessibilityManager
+            talkbackStateListener?.let { am?.removeTouchExplorationStateChangeListener(it) }
+        } catch (_: Throwable) {}
+        talkbackStateListener = null
         _fragmentCameraBinding = null
         super.onDestroyView()
 
@@ -782,6 +800,282 @@ class CameraFragment : Fragment() {
     // ══════════════════════════════════════════════════════════════════
     // Barge-In + Capture
     // ══════════════════════════════════════════════════════════════════
+
+    // ══════════════════════════════════════════════════════════════════
+    // TalkBack Co-Existence: 50/50 Gesture Overlay + Dual-Script Tutorial
+    // ══════════════════════════════════════════════════════════════════
+    // When touch exploration (TalkBack) is ON, the transparent overlay
+    // halves intercept touches BEFORE TalkBack converts them to hovers:
+    //   • Left half  → tap = Look (scene description), long-press = light check
+    //   • Right half → tap = Ask (voice query)
+    // TalkBack's double-tap-to-activate lands on the focused half and fires
+    // the same handler, so every verb maps 1:1 with the physical gesture map
+    // (which remains 100% active whenever touch exploration is OFF — the
+    // overlay is passive then and never intercepts).
+    // Infrequent utilities (color analysis, SOS) ride the two overlay nodes
+    // as custom accessibility actions in TalkBack's actions menu.
+    // The tutorial is dual-script: TTS narration when TalkBack is off,
+    // announceForAccessibility (TalkBack-native queue) when on — the TTS
+    // engine is bypassed entirely so the two audio paths never overlap.
+    // ══════════════════════════════════════════════════════════════════
+
+    /**
+     * Install the TalkBack gesture overlay and accessibility wiring.
+     * Idempotent; safe to call multiple times. Adds no new permissions,
+     * services, or manifest entries.
+     */
+    private fun installTalkbackAccessibilityActions() {
+        if (talkbackDelegateInstalled) return
+        talkbackDelegateInstalled = true
+
+        val binding = _fragmentCameraBinding ?: return
+
+        // ── Overlay tap/long-click handlers (same verbs as gestures) ──
+        binding.overlayLook.setOnClickListener {
+            systemVibrator?.vibrate(VibrationEffect.createOneShot(50, VibrationEffect.DEFAULT_AMPLITUDE))
+            Log.i(TAG, "Overlay[Look] click → scene description")
+            performTalkbackLook()
+        }
+        binding.overlayLook.setOnLongClickListener {
+            systemVibrator?.vibrate(VibrationEffect.createOneShot(50, VibrationEffect.DEFAULT_AMPLITUDE))
+            Log.i(TAG, "Overlay[Look] long-click → light check")
+            performTalkbackLightCheck()
+            true
+        }
+        binding.overlayAsk.setOnClickListener {
+            systemVibrator?.vibrate(VibrationEffect.createOneShot(50, VibrationEffect.DEFAULT_AMPLITUDE))
+            Log.i(TAG, "Overlay[Ask] click → voice query")
+            performTalkbackVoiceQuery()
+        }
+
+        // ── Infrequent utilities as custom actions on both overlay nodes ──
+        val colorAction = AccessibilityNodeInfoCompat.AccessibilityActionCompat(
+            R.id.action_color_analysis, "Analyze center color"
+        )
+        val sosAction = AccessibilityNodeInfoCompat.AccessibilityActionCompat(
+            R.id.action_emergency_sos, "Trigger emergency SOS"
+        )
+        val overlayDelegate = object : AccessibilityDelegateCompat() {
+            override fun onInitializeAccessibilityNodeInfo(host: View, info: AccessibilityNodeInfoCompat) {
+                super.onInitializeAccessibilityNodeInfo(host, info)
+                info.addAction(colorAction)
+                info.addAction(sosAction)
+            }
+
+            override fun performAccessibilityAction(host: View, action: Int, args: Bundle?): Boolean {
+                return when (action) {
+                    R.id.action_color_analysis -> { performTalkbackColorAnalysis(); true }
+                    R.id.action_emergency_sos -> { performTalkbackEmergencySos(); true }
+                    else -> super.performAccessibilityAction(host, action, args)
+                }
+            }
+        }
+        ViewCompat.setAccessibilityDelegate(binding.overlayLook, overlayDelegate)
+        ViewCompat.setAccessibilityDelegate(binding.overlayAsk, overlayDelegate)
+
+        // ── Touch-exploration gating (live) ──────────────────────
+        // Overlay touches are only consumed while exploration is ON. When
+        // TalkBack is off the overlay does not intercept anything, so the
+        // physical gesture map (GestureRouter) stays exactly as shipped.
+        applyTouchExplorationGating()
+
+        val am = requireContext().getSystemService(Context.ACCESSIBILITY_SERVICE) as? AccessibilityManager
+        val listener = AccessibilityManager.TouchExplorationStateChangeListener { enabled ->
+            mainHandler.post { applyTouchExplorationGating() }
+            if (enabled) {
+                // Live TalkBack activation: teach the split-screen model once.
+                _fragmentCameraBinding?.overlayLook?.announceForAccessibility(
+                    getString(R.string.script_tutorial_talkback_on)
+                )
+            }
+        }
+        talkbackStateListener = listener
+        try {
+            am?.addTouchExplorationStateChangeListener(listener)
+        } catch (e: Throwable) {
+            Log.w(TAG, "TouchExploration listener registration failed: ${e.message}")
+        }
+
+        Log.i(TAG, "TalkBack overlay installed (Look | Ask + color/SOS custom actions)")
+    }
+
+    /**
+     * Gate the overlay's touch interception on the CURRENT touch-exploration
+     * state, re-read fresh on every call. While exploration is off every
+     * overlay is not clickable, so touches fall through untouched and the
+     * physical gesture map behaves exactly as before this feature existed.
+     */
+    private fun applyTouchExplorationGating() {
+        val binding = _fragmentCameraBinding ?: return
+        val am = requireContext().getSystemService(Context.ACCESSIBILITY_SERVICE) as? AccessibilityManager
+        val exploring = try {
+            am != null && am.isEnabled && am.isTouchExplorationEnabled
+        } catch (e: Throwable) {
+            Log.w(TAG, "Touch-exploration probe failed: ${e.message}")
+            false
+        }
+        listOf(binding.overlayLook, binding.overlayAsk).forEach { overlay ->
+            overlay.isClickable = exploring
+            overlay.isLongClickable = exploring
+            overlay.isFocusable = exploring
+            overlay.importantForAccessibility =
+                if (exploring) View.IMPORTANT_FOR_ACCESSIBILITY_YES
+                else View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+        }
+        Log.d(TAG, "Touch-exploration gating: overlay intercept=$exploring")
+    }
+
+    /**
+     * Dual-script onboarding tutorial (dispatch point for both engine-ready
+     * callbacks). TalkBack OFF → [R.string.script_tutorial_talkback_off] via
+     * TTS. TalkBack ON → [R.string.script_tutorial_talkback_on] announced
+     * through TalkBack's native queue via announceForAccessibility — the TTS
+     * engine is completely bypassed so the two audio paths never overlap.
+     */
+    private fun playOnboardingTutorial(mainActivity: MainActivity) {
+        val exploring = try {
+            val am = requireContext().getSystemService(Context.ACCESSIBILITY_SERVICE) as? AccessibilityManager
+            am != null && am.isEnabled && am.isTouchExplorationEnabled
+        } catch (e: Throwable) {
+            false
+        }
+        if (exploring) {
+            val host = _fragmentCameraBinding?.overlayLook
+                ?: _fragmentCameraBinding?.cameraContainer
+            if (host != null) {
+                host.announceForAccessibility(getString(R.string.script_tutorial_talkback_on))
+                Log.i(TAG, "Tutorial: TalkBack ON → announceForAccessibility (TTS bypassed)")
+                return
+            }
+            // No view host available — fall through to TTS rather than stay silent.
+        }
+        mainActivity.speakThenCallback(getString(R.string.script_tutorial_talkback_off)) {
+            Log.d(TAG, "Tutorial spoken — staying quiet (mic closed at IDLE)")
+        }
+    }
+
+    // ── TalkBack action handlers (route into the existing verbs only) ──
+
+    private fun performTalkbackLook() {
+        systemVibrator?.vibrate(VibrationEffect.createOneShot(50, VibrationEffect.DEFAULT_AMPLITUDE))
+        Log.i(TAG, "TalkBack action: look (single-tap equivalent)")
+        // Same prompt as the physical single-tap; coordinates are the view
+        // center since a screen-reader activation carries no touch position.
+        val container = _fragmentCameraBinding?.cameraContainer
+        val x = (container?.width ?: 0) / 2f
+        val y = (container?.height ?: 0) / 2f
+        bargeInAndCapture(
+            "User tapped at position (${x.toInt()}, ${y.toInt()}). " +
+            "Describe what is in front of me and around me for navigation, in 1-2 " +
+            "complete, natural spoken sentences with a subject and a verb — the way " +
+            "you would tell a person standing next to me. For each key object include " +
+            "color, size, material, and state. " +
+            "If the tapped object is a packaged product (packet, box, bottle, can), " +
+            "first say its BRAND name and product type exactly as printed " +
+            "(for example: Maggi instant noodle packet), then its details, then continue. " +
+            "If the tapped object has text on it (a label, box, or sign), " +
+            "read it aloud verbatim as whole words and sentences, never spelling letter by letter. " +
+            "Read the ENTIRE text on the object in reading order; do not stop halfway."
+        )
+    }
+
+    private fun performTalkbackVoiceQuery() {
+        systemVibrator?.vibrate(VibrationEffect.createOneShot(50, VibrationEffect.DEFAULT_AMPLITUDE))
+        Log.i(TAG, "TalkBack action: voice query (double-tap equivalent)")
+        openVoiceQuery()
+    }
+
+    private fun performTalkbackLightCheck() {
+        systemVibrator?.vibrate(VibrationEffect.createOneShot(50, VibrationEffect.DEFAULT_AMPLITUDE))
+        Log.i(TAG, "TalkBack action: light check (long-press equivalent)")
+        performLightCheck()
+    }
+
+    private fun performTalkbackColorAnalysis() {
+        systemVibrator?.vibrate(VibrationEffect.createOneShot(50, VibrationEffect.DEFAULT_AMPLITUDE))
+        Log.i(TAG, "TalkBack action: color analysis (triple-tap equivalent)")
+        performColorAnalysisTalkback()
+    }
+
+    private fun performTalkbackEmergencySos() {
+        systemVibrator?.vibrate(VibrationEffect.createOneShot(120, VibrationEffect.DEFAULT_AMPLITUDE))
+        Log.i(TAG, "TalkBack action: emergency SOS (triple-tap-hold equivalent)")
+        triggerEmergencySosFromTalkback()
+    }
+
+    /**
+     * Color analysis for the TalkBack path: mirrors GestureRouter's
+     * triple-tap pipeline — "analyzing" cue → container bitmap →
+     * ColorAnalyzer.analyzeCenterColor → localized announcement, persisted
+     * via the fragment-owned ScanRepository.
+     */
+    private fun performColorAnalysisTalkback() {
+        val mainActivity = activity as? MainActivity ?: return
+        val containerView = _fragmentCameraBinding?.cameraContainer ?: return
+        ttsManager.speakImmediate(
+            ttsManager.localized(
+                mainActivity.getString(R.string.color_analyzing),
+                "Menganalisis warna...",
+                "正在分析颜色"
+            )
+        )
+        try {
+            val bitmap = Bitmap.createBitmap(
+                containerView.width.coerceAtLeast(1),
+                containerView.height.coerceAtLeast(1),
+                Bitmap.Config.ARGB_8888
+            )
+            val canvas = android.graphics.Canvas(bitmap)
+            containerView.draw(canvas)
+
+            val colorName = ColorAnalyzer().analyzeCenterColor(mainActivity, bitmap)
+            bitmap.recycle()
+
+            ttsManager.speak(
+                mainActivity.getString(R.string.color_result, colorName)
+            )
+
+            lifecycleScope.launch {
+                talkbackScanRepository.saveColorScan(colorName)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "TalkBack color analysis failed", e)
+            ttsManager.speakImmediate(
+                ttsManager.localized(
+                    "Color analysis failed.",
+                    "Analisis warna gagal.",
+                    "颜色分析失败。"
+                )
+            )
+        }
+    }
+
+    /**
+     * Emergency SOS for the TalkBack path: localized announcement, then the
+     * dialer on 999 (dial delay mirrors GestureRouter's SOS constant).
+     */
+    private fun triggerEmergencySosFromTalkback() {
+        val mainActivity = activity as? MainActivity ?: return
+        ttsManager.speakImmediate(
+            ttsManager.localized(
+                mainActivity.getString(R.string.sos_activated),
+                "Mod kecemasan diaktifkan. Membuka dialer.",
+                "紧急模式已激活，正在打开拨号器。"
+            )
+        )
+        mainHandler.postDelayed({
+            try {
+                val intent = Intent(Intent.ACTION_DIAL).apply {
+                    data = Uri.parse("tel:999")
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                startActivity(intent)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to open dialer for SOS", e)
+                ttsManager.speakImmediate("Could not open dialer.")
+            }
+        }, 1500L /* mirrors GestureRouter.SOS_DIAL_DELAY_MS (private) */)
+    }
 
     private fun bargeInAndCapture(query: String) {
         // PHASE 3 SHADOW ROUTER: observe + log only (see logShadowRoute).
