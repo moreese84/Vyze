@@ -79,6 +79,10 @@ generate_vyze_*.py
 
 # Play Store mockups (local only)
 playstore-screenshots/
+store/kit/node_modules/
+# ...but keep the rendered PNGs of the store kit
+!store/kit/out/
+!store/kit/out/**
 
 # Local doc/pitch-deck generator scripts
 tools/

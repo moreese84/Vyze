@@ -1,0 +1,236 @@
+/* Vyze Play Store visual kit — shared styles
+   Brand: black #231F20, red #CE2028, yellow #FBD10A, off-white #F5F6F7
+   Panels are 1080×1920 (Play Store phone screenshot spec). */
+
+:root {
+  --black: #231F20;
+  --red:   #CE2028;
+  --red-d: #A8151C;
+  --red-l: #FF8A90;
+  --yellow:#FBD10A;
+  --off:   #F5F6F7;
+  --bg-d:  #191718;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; -webkit-font-smoothing: antialiased; }
+
+body {
+  background: #43464A;
+  font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+}
+
+/* ── Panel canvas ─────────────────────────────────────────────── */
+.shot {
+  position: relative; width: 1080px; height: 1920px;
+  margin: 24px auto; overflow: hidden;
+  background: var(--black); color: var(--off);
+}
+
+/* rotated brand wedge backdrop */
+.wedge {
+  position: absolute; width: 2600px; height: 2600px; border-radius: 480px;
+  background: linear-gradient(160deg, #E5242C 0%, var(--red) 55%, var(--red-d) 100%);
+  transform: rotate(-14deg);
+}
+.wedge2 {
+  position: absolute; width: 2400px; height: 2400px; border-radius: 440px;
+  background: linear-gradient(160deg, #F0DC4E 0%, var(--yellow) 100%);
+  transform: rotate(-14deg); opacity: .95;
+}
+
+/* ── Logo (paths injected by logo.js) ─────────────────────────── */
+.logo { position: absolute; z-index: 6; }
+.logo svg { display: block; }
+
+/* ── Captions ─────────────────────────────────────────────────── */
+.cap { position: absolute; left: 96px; right: 96px; z-index: 5; }
+.cap h1 { font-weight: 800; letter-spacing: -0.02em; line-height: 1.05; font-size: 96px; }
+.cap h1 em { font-style: normal; }
+.cap p { font-weight: 500; line-height: 1.32; opacity: .94; font-size: 40px; margin-top: 30px; }
+.kicker {
+  display: inline-block; font-size: 30px; font-weight: 800; letter-spacing: .2em;
+  text-transform: uppercase; padding: 12px 26px; border-radius: 999px; margin-bottom: 34px;
+}
+
+/* ── Phone mock ───────────────────────────────────────────────── */
+.phone {
+  position: absolute; z-index: 4; width: 840px; height: 1720px;
+  border-radius: 60px; overflow: hidden; border: 10px solid #0E0C0D;
+  box-shadow: 0 60px 120px rgba(0,0,0,.55);
+  transform: scale(.52);
+}
+.ph-cam {
+  position: absolute; top: 26px; left: 50%; transform: translateX(-50%);
+  width: 22px; height: 22px; border-radius: 50%; background: #0E0C0D; z-index: 9;
+}
+.statusbar {
+  position: absolute; top: 0; left: 0; right: 0; height: 54px; z-index: 8;
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0 30px; font-size: 24px; font-weight: 600; color: #fff;
+}
+.notchpill {
+  position: absolute; top: 14px; left: 50%; transform: translateX(-50%);
+  width: 180px; height: 26px; border-radius: 999px; background: rgba(0,0,0,.85); z-index: 9;
+}
+.status-pill {
+  position: absolute; bottom: 44px; left: 50%; transform: translateX(-50%); z-index: 8;
+  background: rgba(0,0,0,.66); color: #fff; font-size: 25px; font-weight: 600;
+  padding: 12px 30px; border-radius: 999px; white-space: nowrap;
+}
+
+/* camera screen internals */
+.scr { position: absolute; inset: 0; }
+.viewfinder {
+  position: absolute; inset: 0;
+  background:
+    radial-gradient(1200px 800px at 70% 25%, rgba(251,209,10,.30), transparent 55%),
+    radial-gradient(1000px 900px at 25% 80%, rgba(206,32,40,.28), transparent 65%),
+    linear-gradient(150deg, #3E3A3B 0%, #232021 45%, #141213 100%);
+}
+.hud {
+  position: absolute; left: 40px; top: 86px; width: 10px; height: 300px; border-radius: 8px;
+  background: linear-gradient(var(--yellow), rgba(251,209,10,0)); opacity: .85;
+}
+.target { position: absolute; left: 50%; top: 46%; width: 420px; height: 420px; transform: translate(-50%,-50%); }
+.target .ring { position: absolute; inset: 0; border: 4px solid rgba(255,255,255,.85); border-radius: 50%; box-shadow: 0 0 0 14px rgba(255,255,255,.10); }
+.target .cross-h { position: absolute; left: -34px; right: -34px; top: 50%; height: 4px; background: rgba(255,255,255,.85); }
+.target .cross-v { position: absolute; top: -34px; bottom: -34px; left: 50%; width: 4px; background: rgba(255,255,255,.85); }
+.target .center { position: absolute; left: 50%; top: 50%; width: 18px; height: 18px; border-radius: 50%; background: var(--yellow); transform: translate(-50%,-50%); }
+.gesture {
+  position: absolute; width: 92px; height: 92px; border-radius: 50%;
+  background: rgba(255,255,255,.16); border: 3px solid rgba(255,255,255,.75);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 40px; color: #fff; font-weight: 700;
+}
+
+/* ── Speech bubble (streamed answer) ──────────────────────────── */
+.bubble {
+  position: absolute; z-index: 7; background: #fff; color: var(--black);
+  border-radius: 44px 44px 44px 12px; padding: 34px 42px;
+  font-size: 34px; font-weight: 600; line-height: 1.35;
+  box-shadow: 0 26px 60px rgba(0,0,0,.45);
+}
+.bubble .spoken { color: #B01720; }
+.bubble .amount { font-size: 62px; font-weight: 800; color: #B01720; }
+.bubble.b2 { border-radius: 44px 44px 12px 44px; background: var(--yellow); }
+
+/* ── Dot grid + chips ─────────────────────────────────────────── */
+.dotgrid { position: absolute; z-index: 6; display: grid; grid-template-columns: repeat(4, 22px); gap: 24px; opacity: .2; }
+.dotgrid i { width: 22px; height: 22px; border-radius: 50%; background: var(--off); }
+.dotgrid i:nth-child(4n+1) { background: var(--yellow); }
+.dotgrid i:nth-child(4n+3) { background: var(--red); }
+
+.chip-row { position: absolute; z-index: 6; display: flex; gap: 20px; }
+.chip {
+  background: rgba(255,255,255,.14); border: 2px solid rgba(255,255,255,.35);
+  color: #fff; font-size: 30px; font-weight: 700;
+  padding: 14px 30px; border-radius: 999px;
+}
+.chip.dark { background: rgba(35,31,32,.08); border-color: rgba(35,31,32,.4); color: var(--black); }
+
+/* disclaimer tag on concept mockups */
+.panel-note {
+  position: absolute; right: 40px; bottom: 36px; z-index: 8;
+  font-size: 22px; font-weight: 600; opacity: .55; color: currentColor;
+}
+
+/* ── Per-panel placement ──────────────────────────────────────── */
+
+/* S1 — hero (red wedge) */
+#s1 .wedge { left: -700px; top: -430px; }
+#s1 .logo { left: 96px; top: 120px; }
+#s1 .cap { top: 470px; }
+#s1 h1 { font-size: 118px; color: var(--black); }
+#s1 h1 em { color: var(--off); }
+#s1 .hero-sub { color: var(--black); font-size: 44px; font-weight: 500; margin-top: 36px; max-width: 850px; line-height: 1.3; }
+#s1 .phone { left: 120px; top: 950px; transform-origin: top left; }
+#s1 .dots { right: 70px; top: 1560px; }
+#s1 .chip-row { left: 96px; top: 940px; }
+
+/* S2 — one tap (dark) */
+#s2 { background: var(--bg-d); }
+#s2 .wedge { right: -1650px; top: -1500px; }
+#s2 .logo { left: 96px; top: 110px; }
+#s2 .cap { top: 300px; }
+#s2 .kicker { background: rgba(251,209,10,.14); color: var(--yellow); }
+#s2 h1 em { color: var(--yellow); }
+#s2 .phone { left: 120px; top: 880px; transform-origin: top left; }
+#s2 .bubble { left: 470px; top: 1490px; width: 560px; }
+#s2 .dots { right: 90px; bottom: 120px; }
+
+/* S3 — ask anything (dark, phone right) */
+#s3 { background: var(--bg-d); }
+#s3 .wedge { left: -1650px; top: -1500px; }
+#s3 .logo { right: 96px; top: 110px; }
+#s3 .cap { top: 300px; right: 470px; }
+#s3 .kicker { background: rgba(206,32,40,.25); color: var(--red-l); }
+#s3 h1 em { color: var(--red-l); }
+#s3 .phone { right: 120px; top: 880px; transform-origin: top right; }
+#s3 .bubble { left: 60px; top: 1210px; width: 520px; }
+#s3 .bubble.b2 { left: 120px; top: 1690px; }
+#s3 .mic-badge {
+  position: absolute; z-index: 7; width: 150px; height: 150px; border-radius: 50%;
+  background: var(--yellow); display: flex; align-items: center; justify-content: center;
+  box-shadow: 0 24px 50px rgba(0,0,0,.5);
+}
+#s3 .mic-badge svg { width: 72px; height: 72px; }
+#s3 .dots { left: 96px; bottom: 100px; }
+
+/* S4 — read labels (off-white) */
+#s4 { background: var(--off); color: var(--black); }
+#s4 .wedge { right: -1750px; bottom: -1900px; }
+#s4 .wedge2 { left: -1780px; bottom: -2000px; }
+#s4 .logo { left: 96px; top: 110px; }
+#s4 .cap { top: 300px; }
+#s4 .kicker { background: rgba(206,32,40,.10); color: var(--red); }
+#s4 h1 em { color: var(--red); }
+#s4 .phone { left: 120px; top: 880px; transform-origin: top left; }
+#s4 .bubble { left: 470px; top: 1560px; width: 560px; font-size: 32px; }
+#s4 .dots { right: 80px; top: 1150px; }
+
+/* S5 — currency (dark, phone right) */
+#s5 { background: var(--bg-d); }
+#s5 .wedge { left: -1700px; bottom: -1950px; }
+#s5 .logo { right: 96px; top: 110px; }
+#s5 .cap { top: 300px; right: 470px; }
+#s5 .kicker { background: rgba(251,209,10,.14); color: var(--yellow); }
+#s5 h1 em { color: var(--yellow); }
+#s5 .phone { right: 120px; top: 890px; transform-origin: top right; }
+#s5 .bubble { left: 60px; top: 1370px; width: 560px; font-size: 38px; }
+#s5 .dots { left: 96px; bottom: 120px; }
+
+/* S6 — light check (yellow stage) */
+#s6 { background: var(--yellow); color: var(--black); }
+#s6 .wedge { right: -1780px; bottom: -1980px; }
+#s6 .logo { left: 96px; top: 110px; }
+#s6 .cap { top: 300px; }
+#s6 .kicker { background: rgba(35,31,32,.10); color: var(--black); }
+#s6 h1 em { color: #B01720; }
+#s6 .phone { left: 120px; top: 880px; transform-origin: top left; }
+#s6 .bubble { left: 470px; top: 1500px; width: 560px; }
+#s6 .dots { right: 80px; top: 1150px; }
+
+/* ── Feature graphic 1024×500 ─────────────────────────────────── */
+.feature {
+  position: relative; width: 1024px; height: 500px; margin: 24px auto;
+  overflow: hidden; background: var(--black); color: var(--off);
+}
+.feature .wedge { left: -430px; top: -560px; }
+.feature .logo { left: 56px; top: 64px; }
+.feature .tag {
+  position: absolute; left: 56px; top: 240px; z-index: 5;
+  font-size: 52px; font-weight: 800; letter-spacing: -0.01em; line-height: 1.12; max-width: 560px;
+}
+.feature .tag em { font-style: normal; color: var(--yellow); }
+.feature .sub {
+  position: absolute; left: 56px; top: 400px; z-index: 5;
+  font-size: 26px; font-weight: 600; opacity: .9;
+}
+.feature .phone {
+  width: 640px; height: 1310px; right: -150px; top: 90px;
+  transform: scale(.62); transform-origin: top right; border-width: 8px;
+}
+.feature .phone .status-pill { font-size: 20px; bottom: 34px; padding: 9px 22px; }
+.feature .phone .notchpill { width: 130px; height: 20px; }
+.feature .phone .statusbar { font-size: 18px; height: 40px; }
+.feature .phone .ph-cam { width: 16px; height: 16px; top: 18px; }
