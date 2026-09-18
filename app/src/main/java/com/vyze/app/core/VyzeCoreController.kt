@@ -1463,6 +1463,66 @@ class VyzeCoreController(
                     }
                 }
 
+                // ── LONG-DOCUMENT DIRECT READ LANE ───────────────
+                // Long reads (> [LONG_READ_CHAR_THRESHOLD] chars) with solid
+                // OCR confidence bypass the VLM entirely: the OCR block is
+                // spoken verbatim through TTSManager's queue. Why a separate
+                // lane instead of a bigger token budget: the tier caps exist
+                // to keep output inside the device's context window — a
+                // full-page letter on Tier 2/3 would need a budget at or over
+                // that ceiling, which is native context-overflow territory.
+                // Direct playback is untruncated on EVERY tier (including
+                // Tier 0, where the VLM is bypassed but OCR still runs),
+                // starts in ~1s instead of a multi-second model round-trip,
+                // and adds zero KV-cache memory risk. Short reads stay on
+                // the VLM, which adds language mirroring and number rules
+                // the raw playback cannot.
+                // Runs AFTER medicine lookup so a long read of a medicine
+                // panel still carries the DB info, and deliberately placed
+                // BEFORE the dense-document sanity gate: that gate protects
+                // the FAST-PATH from confidently reading a tiny fragment of
+                // a dense page, while this lane requires a LONG extraction
+                // (>= threshold chars), which a partial read cannot fake.
+                val longReadOcr = ocrText
+                if (isTextQuery && !isTapQuery &&
+                    !longReadOcr.isNullOrBlank() &&
+                    isLongDirectRead(longReadOcr, ocrConfidence)
+                ) {
+                    val fullText: String = longReadOcr
+                    scope.launch {
+                        try {
+                            ttsManager.speakQueued(
+                                ttsManager.localized(
+                                    "Long document. Reading now.",
+                                    "Dokumen panjang. Baca sekarang.",
+                                    "长文档。正在朗读。"
+                                )
+                            )
+                            ttsManager.speakQueued(fullText)
+                        } catch (t: Throwable) {
+                            CrashLogFile.logError(TAG, "Long-read TTS failed: ${t.message}", t)
+                        }
+                    }
+                    isInferring.set(false)
+                    flushRemainingSentenceBuffer()
+                    mainHandler.removeCallbacks(watchdogRunnable)
+                    if (currentSessionId == activeSessionId) {
+                        // Empty payload: the read goes to the user via the
+                        // direct TTS lane above, NOT through the fragment's
+                        // speakThenCallback — delivering the text here would
+                        // play it twice. The empty string still drives the
+                        // post-answer state machine (appState → IDLE, follow-up
+                        // window closed) so the session settles while the
+                        // long read plays. A double-tap during playback
+                        // barges in and stops the read.
+                        mainHandler.post {
+                            onInferenceComplete?.invoke("")
+                            onStatusUpdate?.invoke("Ready [long read]")
+                        }
+                    }
+                    return@launch
+                }
+
                 // ── VLM DIMENSION — decided AFTER OCR ────────────
                 // Pay the full 512px prefill only when OCR actually found text
                 // for the model to echo; a tap/pointing query with no readable
@@ -2612,6 +2672,32 @@ class VyzeCoreController(
     }
 
     /**
+     * Decide whether an explicit text read should take the DIRECT OCR-to-TTS
+     * lane instead of VLM inference.
+     *
+     * Conditions, all required:
+     *  - OCR found substantial text (>= [LONG_READ_CHAR_THRESHOLD] chars) —
+     *    the definition of a LONG read; a tiny fragment can never qualify,
+     *    which is why the dense-document sanity gate below it stays intact.
+     *  - Confidence >= [LONG_READ_MIN_CONFIDENCE] — lower than the fast-path's
+     *    0.85 so long but slightly noisy captures still go direct, while
+     *    doubtful text keeps the VLM's grounding and "Text is unclear" honesty.
+     *  - Only spoken reads qualify: non-null, non-blank queries. Taps and
+     *    automatic captures always keep the VLM in the loop — its scene
+     *    framing (brand-first, object details) is the value there, and the
+     *    fast-path's tap-exclusion rationale applies unchanged.
+     *
+     * Currency/bank-card reads are naturally excluded: their captures are
+     * short (well under the char threshold).
+     */
+    internal fun isLongDirectRead(ocrText: String?, ocrConfidence: Float): Boolean {
+        if (ocrText.isNullOrBlank()) return false
+        if (ocrText.length < LONG_READ_CHAR_THRESHOLD) return false
+        if (ocrConfidence < LONG_READ_MIN_CONFIDENCE) return false
+        return true
+    }
+
+    /**
      * Size the output-token budget to the text actually found by OCR.
      * The model mostly echoes the OCR block (~1 token per 4 chars) plus a
      * short intro, so a dense panel gets a proportionally large budget —
@@ -2825,6 +2911,16 @@ class VyzeCoreController(
          * (~800 words of output) is as close to "unlimited" as the stack allows.
          */
         private const val TEXT_QUERY_MAX_TOKENS_CEILING = 1024
+
+        /**
+         * Long-document DIRECT READ lane — OCR text at or above this many
+         * characters (with [LONG_READ_MIN_CONFIDENCE]) is spoken verbatim
+         * through the TTS queue, bypassing the VLM. Untruncated on every
+         * device tier; see the lane comment in triggerSnapshot.
+         */
+        private const val LONG_READ_CHAR_THRESHOLD = 600
+        /** Min OCR confidence for the direct long-read lane (fast-path uses 0.85). */
+        private const val LONG_READ_MIN_CONFIDENCE = 0.75f
 
         /** Rough output tokens needed to echo OCR text verbatim (~1 per 4 chars). */
         private const val OCR_CHARS_PER_OUTPUT_TOKEN = 4
