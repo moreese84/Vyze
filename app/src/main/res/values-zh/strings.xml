@@ -2,17 +2,6 @@
 <resources>
     <string name="app_name">Vyze</string>
 
-    <!-- ── Spatial Announcements ─────────────────────────────────────── -->
-    <string name="spatial_ahead">正前方</string>
-    <string name="spatial_left">在您左边</string>
-    <string name="spatial_right">在您右边</string>
-    <string name="spatial_close">近处</string>
-    <string name="spatial_far">远处</string>
-    <string name="spatial_facing_you">面对您</string>
-    <string name="spatial_side_profile">侧面</string>
-    <string name="spatial_person_single">一个人%1$s，%2$s，%3$s</string>
-    <string name="spatial_person_multi">检测到%1$d个人%2$s</string>
-    <string name="spatial_scene_summary">您正面对%1$s。</string>
 
     <!-- ── Onboarding ────────────────────────────────────────────────── -->
     <string name="onboarding_welcome">欢迎使用Vyze。我是您的眼睛。让我教您如何使用我。</string>

@@ -375,6 +375,10 @@ data class VyzeQueryContext(
          */
         const val DEFAULT_ANSWER_STYLE_DIRECTIVE =
             "Answer in 1 short spoken sentence. Lead with the direct answer. " +
+                "NEVER start a sentence with 'You are in front of', 'You are looking at', " +
+                "or 'You are facing'. State the location or the object first instead: " +
+                "'In front of you is a white mug.', 'To your left is a door.', " +
+                "'A mug is directly ahead on the table.' " +
                 "Your reply is read aloud by text to speech, so it must be pure plain text: " +
                 "NEVER output markdown symbols, never output bullets, dashes, asterisks, " +
                 "number signs, underscores, or emoji, and never use lists or headings. " +

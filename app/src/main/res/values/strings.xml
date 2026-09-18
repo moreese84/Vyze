@@ -9,17 +9,6 @@
 
 
 
-    <!-- ── Spatial Announcements ─────────────────────────────────────── -->
-    <string name="spatial_ahead">directly ahead</string>
-    <string name="spatial_left">on your left</string>
-    <string name="spatial_right">on your right</string>
-    <string name="spatial_close">close</string>
-    <string name="spatial_far">far</string>
-    <string name="spatial_facing_you">facing you</string>
-    <string name="spatial_side_profile">side profile</string>
-    <string name="spatial_person_single">Person %1$s, %2$s, %3$s</string>
-    <string name="spatial_person_multi">%1$d people detected %2$s</string>
-    <string name="spatial_scene_summary">You are facing %1$s.</string>
 
     <!-- ── Onboarding ────────────────────────────────────────────────── -->
     <string name="onboarding_welcome">Welcome to Vyze. I am your eyes. Let me teach you how to use me.</string>

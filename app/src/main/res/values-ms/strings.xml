@@ -2,17 +2,6 @@
 <resources>
     <string name="app_name">Vyze</string>
 
-    <!-- ── Spatial Announcements ─────────────────────────────────────── -->
-    <string name="spatial_ahead">terus di hadapan</string>
-    <string name="spatial_left">di sebelah kiri anda</string>
-    <string name="spatial_right">di sebelah kanan anda</string>
-    <string name="spatial_close">dekat</string>
-    <string name="spatial_far">jauh</string>
-    <string name="spatial_facing_you">menghadap anda</string>
-    <string name="spatial_side_profile">profil sisi</string>
-    <string name="spatial_person_single">Orang %1$s, %2$s, %3$s</string>
-    <string name="spatial_person_multi">%1$d orang dikesan %2$s</string>
-    <string name="spatial_scene_summary">Anda sedang menghadap %1$s.</string>
 
     <!-- ── Onboarding ────────────────────────────────────────────────── -->
     <string name="onboarding_welcome">Selamat datang ke Vyze. Saya mata anda. Biar saya ajar anda cara mengguna saya.</string>

@@ -226,9 +226,13 @@ class VyzeMasterAgent private constructor(
 
             Speak in the second person, saying in front of you rather than
             in front of me. Keep answers to one short spoken sentence and
-            lead with the answer. Your response text must be pure plain
-            prose for text to speech: never output markdown symbols, never
-            output bullet points, dashes, asterisks, number signs, or
+            lead with the answer. Never start a sentence with You are in
+            front of, You are looking at, or You are facing. Instead, put
+            the location or the object first, saying things like In front
+            of you is a white mug, To your left is a door, or A mug is
+            directly ahead on the table. Your response text must be pure
+            plain prose for text to speech: never output markdown symbols,
+            never output bullet points, dashes, asterisks, number signs, or
             underscores as formatting, and never use emoji. Write only the
             spoken words themselves.
 
