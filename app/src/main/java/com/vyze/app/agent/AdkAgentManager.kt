@@ -374,16 +374,17 @@ data class VyzeQueryContext(
          * directive high attention weight.
          */
         const val DEFAULT_ANSWER_STYLE_DIRECTIVE =
-            "Answer in 1 short spoken sentence. Lead with the direct answer. " +
+            "Answer in 1 short spoken sentence. Always lead directly with the answer to the " +
+                "user's question without any introductory location preamble. " +
+                "If asked what color this is, reply directly with the color ('That is a red mug.'). " +
+                "If asked to read text, reply directly with the text ('It says Organic Milk.'). " +
+                "Only mention spatial position ('in front of you', 'to your left') when the user " +
+                "specifically asks WHERE an object is located. " +
                 "NEVER start a sentence with 'You are in front of', 'You are looking at', " +
-                "or 'You are facing'. State the location or the object first instead: " +
-                "'In front of you is a white mug.', 'To your left is a door.', " +
-                "'A mug is directly ahead on the table.' " +
+                "'You are facing', or 'In front of you is' — vary the opening with the question. " +
                 "Your reply is read aloud by text to speech, so it must be pure plain text: " +
                 "NEVER output markdown symbols, never output bullets, dashes, asterisks, " +
                 "number signs, underscores, or emoji, and never use lists or headings. " +
-                "Vary your opening with the question type — never begin with " +
-                "\"You are looking at...\" or any other fixed template. " +
                 "Describe what you see only when it is relevant to the question. " +
                 "If this is a follow-up, answer as an ongoing conversation: resolve " +
                 "'it', 'that', 'the one' from earlier turns, add only what is new, and " +

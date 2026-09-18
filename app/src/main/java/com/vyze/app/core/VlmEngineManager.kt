@@ -1800,10 +1800,14 @@ class VlmEngineManager(
             "Answer in 1 short spoken sentence about what you see. " +
             "Always address the user directly. " +
             "Refer to past conversation turns when they are provided. " +
+            "Always lead directly with the answer to the user's question without any " +
+            "introductory location preamble. " +
+            "If asked what color this is, reply directly with the color ('That is a red mug.'). " +
+            "If asked to read text, reply directly with the text ('It says Organic Milk.'). " +
+            "Only mention spatial position ('in front of you', 'to your left') when the user " +
+            "specifically asks WHERE an object is located. " +
             "NEVER start a sentence with 'You are in front of', 'You are looking at', " +
-            "or 'You are facing'. State the location or the object first instead: " +
-            "'In front of you is a white mug.', 'To your left is a door.', " +
-            "'A mug is directly ahead on the table.' " +
+            "'You are facing', or 'In front of you is' — vary the opening with the question. " +
             "Your reply is read aloud by text to speech, so it must be pure plain text: " +
             "NEVER output markdown symbols, never output bullets, dashes, asterisks, " +
             "number signs, underscores, or emoji, and never use lists or headings. " +
@@ -1822,21 +1826,22 @@ class VlmEngineManager(
             "Always address the user directly in the second person ('you', 'your', 'in front of you'). " +
             "NEVER say 'in front of me' or 'to my left' — always describe positions relative to the " +
             "user ('in front of you', 'to your left', 'at 12 o'clock'). " +
-            "Spatial-first phrasing: state the location or object first — say 'In front of you is " +
-            "a mug' or 'To your left is a door', and NEVER begin a sentence with 'You are in front " +
-            "of', 'You are looking at', or 'You are facing'."
+            "Mention spatial position only when the question asks WHERE something is, and then " +
+            "state the object first ('Your cup is directly to your right.'). NEVER begin a sentence " +
+            "with 'You are in front of', 'You are looking at', 'You are facing', or 'In front of you is'."
         private const val PERSPECTIVE_MS =
             "Sentiasa rujuk pengguna dalam kata ganti nama kedua ('anda', 'di hadapan anda'). " +
             "JANGAN sesekali kata 'di hadapan saya' atau 'di sebelah kiri saya' — sentiasa nyatakan " +
             "kedudukan relatif kepada pengguna ('di hadapan anda', 'di sebelah kiri anda', 'pukul 12'). " +
-            "Susun ayat lokasi dahulu: katakan 'Di hadapan anda ialah sebuah cawan' atau " +
-            "'Di sebelah kiri anda ialah sebuah pintu', dan JANGAN sekali-kali mulakan ayat dengan " +
-            "'Anda berada di hadapan' atau 'Anda sedang melihat'."
+            "Sebut kedudukan hanya apabila soalan bertanya DI MANA sesuatu berada, dan nyatakan " +
+            "objek dahulu ('Cawan anda berada di sebelah kanan anda.'). JANGAN mulakan setiap ayat " +
+            "dengan frasa yang sama, seperti 'Di hadapan anda ialah', 'Anda berada di hadapan', " +
+            "atau 'Anda sedang melihat'."
         private const val PERSPECTIVE_ZH =
             "始终使用第二人称直接称呼用户（'你'、'在你面前'）。" +
             "绝不要说'在我面前'或'在我左边'——始终以用户为基准描述位置（'在你面前'、'在你的左边'、'12点钟方向'）。" +
-            "空间优先表述：先说位置或物体——例如'你面前是一个白色马克杯'、'你的左边是一扇门'；" +
-            "绝不要用'你正在看'、'你在看'或'你在……的前面'作为句子的开头。"
+            "只有当问题询问位置时才提到方位，并且先说物体——例如'您的杯子就在您右手边'。" +
+            "绝不要每一句都用同样的开头，如'你面前是'、'你正在看'或'你在……的前面'。"
 
         // ── Mid-Tier / Low-RAM Thresholds ───────────────────────
         /** Minimum free device RAM (MB) required to attempt model init on standard devices. */
