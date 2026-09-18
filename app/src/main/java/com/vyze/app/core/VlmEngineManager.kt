@@ -2,6 +2,7 @@ package com.vyze.app.core
 import com.vyze.app.util.CrashLogFile
 
 import android.app.ActivityManager
+import android.content.ComponentCallbacks2
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
@@ -18,6 +19,8 @@ import com.google.ai.edge.litertlm.Content
 import com.google.ai.edge.litertlm.Contents
 import com.google.ai.edge.litertlm.Engine
 import com.google.ai.edge.litertlm.EngineConfig
+import com.google.ai.edge.litertlm.ExperimentalApi
+import com.google.ai.edge.litertlm.ExperimentalFlags
 import com.google.ai.edge.litertlm.MessageCallback
 import com.google.ai.edge.litertlm.Message
 import com.google.ai.edge.litertlm.SamplerConfig
@@ -25,10 +28,10 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import com.vyze.app.memory.MemoryRepository
@@ -47,8 +50,37 @@ import java.util.concurrent.TimeUnit
  * Gemma 4 E2B (Edge 2 Billion) — multimodal vision-language model.
  * File: gemma-4-E2B-it.litertlm (2.59 GB) — generic variant with vision encoder
  *
- * ## Hardware Acceleration
- * GPU-only execution (OpenCL/Vulkan). CPU inference is not supported for this model size.
+ * ## Hardware Acceleration — TIERED ENGINE INITIALIZATION STRATEGY
+ * The device is classified ONCE at startup into a hardware tier from
+ * ActivityManager.MemoryInfo (total RAM) and GPU-class SoC heuristics
+ * (Build.HARDWARE):
+ *
+ *  - **Tier 1** (high-end: >= ~8 GB RAM + flagship GPU): default `Backend.GPU()`
+ *    with the full context window and Multi-Token Prediction (MTP —
+ *    speculative decoding) enabled.
+ *  - **Tier 2** (mid-range: ~6-8 GB RAM, or mid-range GPU / Mali drivers):
+ *    attempt `Backend.GPU()` inside a try-catch with fallback to
+ *    `Backend.CPU()` (4 threads). Reduced max context tokens. MTP disabled
+ *    (explicitly on the CPU fallback).
+ *  - **Tier 3** (lower-end: < ~6 GB RAM): initialize DIRECTLY on
+ *    `Backend.CPU()` with a reduced context budget (2048 max tokens).
+ *  - **Tier 0** (memory-constrained: < ~4 GB RAM): VLM generation is bypassed
+ *    entirely. A friendly fallback message is surfaced via [onError] (spoken
+ *    as TTS by the controller) while fast-path tools (OCR, haptics, light
+ *    check, color analysis) remain fully operational.
+ *
+ * ### Why: the "m0 was canceled" class of failures
+ * On mid-range MediaTek chipsets the GPU backend (OpenCL/Vulkan) or its
+ * memory allocation can fail SILENTLY inside the native layer; the pending
+ * init coroutine is then cancelled and the failure propagated as an uncaught
+ * Job cancellation. This class contains every engine-creation step:
+ *  - each backend attempt is wrapped in try-catch (GPU → CPU chain per tier),
+ *  - C++/JNI driver errors, UnsatisfiedLinkError and OutOfMemoryError are
+ *    classified and logged instead of propagating,
+ *  - a timed build guard bounds each attempt (a hung native constructor can
+ *    no longer stall initialization forever),
+ *  - a VLM init failure NEVER cancels the parent CoroutineScope and never
+ *    breaks non-VLM features (standalone OCR, Light Check, Color Analysis).
  *
  * ## Prompt Format
  * Uses Gemma 4's turn format:
@@ -57,13 +89,16 @@ import java.util.concurrent.TimeUnit
  * passing the Bitmap — no literal [IMAGE_TOKEN] placeholder needed.
  *
  * ## Memory Management
- * Incoming Bitmap frames are downscaled proportionally when exceeding target dimension.
- * Gemma 4 handles dynamic aspect ratios natively — no rigid center-cropping applied.
- * All scaled bitmaps are explicitly recycled after inference to prevent memory leaks.
+ * Incoming Bitmap frames are downscaled proportionally when exceeding the
+ * TIER-ADJUSTED target dimension. Gemma 4 handles dynamic aspect ratios
+ * natively — no rigid center-cropping applied. All scaled bitmaps are
+ * explicitly recycled after inference to prevent memory leaks. On lower
+ * tiers the engine GCs / trims memory BEFORE allocating KV-cache tensors.
  *
- * ## GPU Warm-up
- * A dummy 1×1 image is run through the engine immediately after initialization
- * to pre-compile OpenCL/Vulkan GPU kernels and minimize first-inference latency.
+ * ## Engine Warm-up
+ * A dummy text-only message is run through the engine immediately after
+ * initialization to pre-compile GPU kernels (or warm the CPU decoder) and
+ * minimize first-inference latency.
  *
  * ## API
  * Use [analyzeImage] to send a camera frame + text prompt and get a response.
@@ -90,6 +125,45 @@ class VlmEngineManager(
         } catch (e: Throwable) { false }
     }
 
+    // ── Dynamic Hardware Detection (Tiered Initialization) ─────────
+
+    /**
+     * The device hardware profile — detected ONCE (lazy) at engine startup.
+     * Drives the tiered backend plan, context budget, image dimension cap,
+     * memory-pressure thresholds and MTP gating for this session.
+     */
+    private val deviceProfile: DeviceProfile by lazy { detectDeviceProfile() }
+
+    /**
+     * Friendly fallback message (spoken as TTS by the controller) when VLM
+     * generation is bypassed (Tier 0) — fast-path tools remain operational.
+     */
+    @Volatile
+    private var gracefulFallbackMessage: String? = null
+
+    /**
+     * Consecutive failed initialize() attempts. Past [MAX_INIT_FAILURES] the
+     * engine stops retrying and degrades gracefully — a friendly message goes
+     * out and non-VLM features keep working. Reset by [close].
+     */
+    @Volatile
+    private var initFailureCount = 0
+
+    /**
+     * Holder for an engine build that outlived its time budget. The native
+     * Engine constructor + initialize() cannot be interrupted — when a build
+     * times out we park its result here so the NEXT attempt can drain-wait
+     * for it and close it properly instead of leaking it (or racing a second
+     * native init against it on a memory-constrained device).
+     */
+    private class EngineBuildResult {
+        @Volatile var engine: Engine? = null
+        @Volatile var error: Throwable? = null
+    }
+
+    @Volatile
+    private var pendingBuild: EngineBuildResult? = null
+
     /**
      * Available device-level memory in MB.
      * Uses ActivityManager.MemoryInfo which reports total available RAM
@@ -108,6 +182,141 @@ class VlmEngineManager(
         val runtime = Runtime.getRuntime()
         return (runtime.freeMemory() + (runtime.maxMemory() - runtime.totalMemory())) / (1024 * 1024)
     }
+
+    /**
+     * TOTAL device RAM in MB (ActivityManager.MemoryInfo.totalMem — includes
+     * the native heap where LiteRT-LM loads model weights and KV-cache).
+     */
+    private fun totalRamMB(): Long {
+        return try {
+            val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+            if (am != null) {
+                val memInfo = ActivityManager.MemoryInfo()
+                am.getMemoryInfo(memInfo)
+                val total = memInfo.totalMem / (1024L * 1024L)
+                if (total > 0) total else fallbackTotalRamMB()
+            } else {
+                fallbackTotalRamMB()
+            }
+        } catch (_: Throwable) {
+            fallbackTotalRamMB()
+        }
+    }
+
+    /** Last-resort total-RAM probe via /proc/meminfo (0 = unknown). */
+    private fun fallbackTotalRamMB(): Long = try {
+        val firstLine = File("/proc/meminfo").readLines().firstOrNull() ?: return 0L
+        Regex("(\\d+)").find(firstLine)?.groupValues?.get(1)?.toLongOrNull()?.div(1024L) ?: 0L
+    } catch (_: Throwable) {
+        0L
+    }
+
+    /**
+     * Detect the hardware profile and classify the device into a tier.
+     * Never throws — on any detection failure the device falls back to the
+     * safest tier that still carries a CPU fallback chain (Tier 2), never to
+     * a state that would silently disable VLM on a capable phone.
+     */
+    private fun detectDeviceProfile(): DeviceProfile {
+        val totalRamMb = try { totalRamMB() } catch (_: Throwable) { 0L }
+        val hardware = try { Build.HARDWARE ?: "unknown" } catch (_: Throwable) { "unknown" }
+        val flagship = try { isFlagshipGpu(hardware) } catch (_: Throwable) { false }
+        val midGpu = try { isMidRangeGpu(hardware) } catch (_: Throwable) { false }
+        val gles = try { detectGlesVersion() } catch (_: Throwable) { "GLES unknown" }
+
+        val tier = classifyTier(totalRamMb, flagship, midGpu)
+        val profile = DeviceProfile(tier, totalRamMb, hardware, flagship, midGpu, gles)
+
+        Log.i(TAG, "Device tier detected: ${profileSummary(profile)}")
+        CrashLogFile.log(TAG, "=== DEVICE TIER ===")
+        CrashLogFile.log(TAG, "Tier: ${tier.label}")
+        CrashLogFile.log(TAG, "Total RAM: ${totalRamMb}MB (reported) | hw=$hardware | flagshipGPU=$flagship | midGPU=$midGpu | $gles")
+        CrashLogFile.log(TAG, "Low-RAM flag (Android): $isLowRamDevice")
+        return profile
+    }
+
+    /**
+     * Tier classification from total RAM + GPU class:
+     *  - Tier 0  : reported RAM below the ~4 GB floor → VLM bypassed.
+     *  - Tier 1  : reported RAM >= ~8 GB floor AND flagship GPU.
+     *  - Tier 2  : reported RAM >= ~6 GB floor, OR a flagship GPU with
+     *              squeezed RAM (still gets the GPU→CPU chain).
+     *  - Tier 3  : everything else → CPU directly.
+     */
+    private fun classifyTier(totalRamMb: Long, flagship: Boolean, midGpu: Boolean): DeviceTier {
+        if (totalRamMb <= 0) {
+            // Detection failed — never disable VLM on a guess; use the tier
+            // whose backend chain is safest (GPU attempt with CPU fallback).
+            return DeviceTier.TIER_2
+        }
+        if (totalRamMb < VLM_BYPASS_TOTAL_RAM_MB) return DeviceTier.TIER_DISABLED
+        return when {
+            totalRamMb >= TIER1_MIN_TOTAL_RAM_MB && flagship -> DeviceTier.TIER_1
+            totalRamMb >= TIER2_MIN_TOTAL_RAM_MB -> DeviceTier.TIER_2
+            // High-end GPU with less RAM: the certified OpenCL/Vulkan drivers
+            // are more trustworthy than raw capacity — still try GPU → CPU.
+            flagship -> DeviceTier.TIER_2
+            else -> DeviceTier.TIER_3
+        }
+    }
+
+    /**
+     * Flagship-GPU heuristic over [Build.HARDWARE]. Covers the SoC families
+     * whose OpenCL/Vulkan drivers are known-good for LiteRT-LM GPU delegates:
+     * Qualcomm Snapdragon 8-series, MediaTek Dimensity 8000/9000 series and
+     * Google Tensor.
+     */
+    private fun isFlagshipGpu(hardware: String): Boolean {
+        val hw = hardware.lowercase(Locale.US)
+        val flagshipFamilies = listOf(
+            // Qualcomm Snapdragon 8-series SoC identifiers
+            "sm8", "sdm8", "msmn8", "qcs8", "msmnile", "kona", "lahaina",
+            "taro", "kalama", "pineapple", "sun",
+            // MediaTek Dimensity 8000/9000 series
+            "mt6983", "mt6985", "mt6989", "mt6893", "mt6895", "mt6896",
+            "mt6879", "mt6886",
+            // Google Tensor
+            "tensor", "gs101", "gs201", "zuma", "zumapro"
+        )
+        if (flagshipFamilies.any { hw.contains(it) }) return true
+        if (hw.contains("snapdragon") && Regex("8[0-9]{2,3}").containsMatchIn(hw)) return true
+        if (hw.contains("dimensity") && Regex("[89][0-9]{3}").containsMatchIn(hw)) return true
+        return false
+    }
+
+    /**
+     * Mid-range-GPU heuristic — in practice the Mali-driver MediaTek Helio /
+     * Dimensity 6000/7000 families and Qualcomm 6/7-series, where GPU init
+     * failures ("m0 was canceled", OpenCL kernel-compile faults) are common.
+     */
+    private fun isMidRangeGpu(hardware: String): Boolean {
+        val hw = hardware.lowercase(Locale.US)
+        val midFamilies = listOf(
+            // MediaTek Helio + Dimensity 6000/7000 (Mali drivers)
+            "mt6785", "mt6789", "mt6833", "mt6853", "mt6855", "mt6873",
+            "mt6875", "mt6877", "mt6883", "mt6885", "helio",
+            // Qualcomm 6/7-series
+            "sm6", "sm7", "sdm6", "sdm7", "qcm6", "qcs6", "bengal", "atoll", "lito", "holi"
+        )
+        if (midFamilies.any { hw.contains(it) }) return true
+        if (hw.contains("dimensity") && Regex("[67][0-9]{3}").containsMatchIn(hw)) return true
+        return false
+    }
+
+    /** GLES version reported by the device configuration (diagnostic only). */
+    private fun detectGlesVersion(): String {
+        return try {
+            val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+            val info = am?.deviceConfigurationInfo
+            if (info != null) "GLES ${info.glEsVersion}" else "GLES unknown"
+        } catch (_: Throwable) {
+            "GLES unknown"
+        }
+    }
+
+    private fun profileSummary(p: DeviceProfile): String =
+        "${p.tier.label} | totalRAM=${p.totalRamMB}MB | hw=${p.hardware} | " +
+            "flagshipGPU=${p.flagshipGpu} midGPU=${p.midRangeGpu} | ${p.glesVersion}"
 
     // Callbacks for UI updates
     var onTokenGenerated: ((String, String) -> Unit)? = null  // (token, sessionId)
@@ -186,6 +395,16 @@ class VlmEngineManager(
     private val generationMutex = Mutex()
 
     /**
+     * Serializes ENGINE CREATION / reinit. Only one native engine build may
+     * run at a time — overlapping Engine(engineConfig) + initialize() calls
+     * double the memory footprint on exactly the constrained devices where
+     * allocation fails, and two concurrent native inits race for the GPU
+     * driver. All creation paths ([initialize], [resetSession]) funnel
+     * through [createEngineGuarded] under this mutex.
+     */
+    private val engineInitMutex = Mutex()
+
+    /**
      * Completes when the CURRENT (possibly abandoned) native generation has
      * fully ended. Starts completed — the engine is idle at boot. Replaced by
      * each new run; the terminal onDone/onError callback of that run completes
@@ -214,16 +433,60 @@ class VlmEngineManager(
         }
     }
 
-    // ── Initialization ─────────────────────────────────────────────
+    // ── Initialization (Tiered Engine Initialization Strategy) ────
 
     /**
-     * Initialize the Gemma 4 E2B engine.
-     * NPU → GPU fallback chain for optimal hardware acceleration.
+     * Initialize the Gemma 4 E2B engine using the TIERED BACKEND STRATEGY.
+     *
+     * The device is classified once by [detectDeviceProfile] and the backend
+     * chain follows the tier:
+     *
+     *  | Tier | Device                                  | Backend plan                          | Context | MTP |
+     *  |------|------------------------------------------|---------------------------------------|---------|-----|
+     *  | 1    | >= ~8GB RAM + flagship GPU               | GPU                                   | 4096    | on  |
+     *  | 2    | ~6-8GB RAM or mid-range GPU/Mali         | GPU → CPU (4 threads)                 | 3072    | off |
+     *  | 3    | < ~6GB RAM                               | CPU (4 threads) directly              | 2048    | off |
+     *  | 0    | < ~4GB RAM                               | none — VLM bypassed, TTS fallback msg | —       | —   |
+     *
+     * Every engine-creation failure (JNI/C++ driver errors, OOM, GPU-init
+     * cancellations like "m0 was canceled") is caught HERE and either retried
+     * on the next backend in the chain or counted for graceful degradation —
+     * it can never cancel the parent CoroutineScope or break non-VLM
+     * features (standalone OCR, Light Check, Color Analysis).
      */
     suspend fun initialize(): Boolean = withContext(Dispatchers.IO) {
         if (isInitialized) return@withContext true
 
-        CrashLogFile.log(TAG, "=== INIT START (Gemma 4 E2B) ===")
+        CrashLogFile.log(TAG, "=== INIT START (Gemma 4 E2B, tiered) ===")
+
+        // ── Tier 0: VLM bypassed entirely (< ~4GB RAM) ───────────────
+        // Keep fast-path tools (OCR, haptics, light check, color analysis)
+        // fully operational — they never touch the VLM engine. Surface a
+        // friendly message through onError; the controller speaks it via TTS.
+        if (deviceProfile.tier == DeviceTier.TIER_DISABLED) {
+            gracefulFallbackMessage = VLM_BYPASS_MESSAGE
+            CrashLogFile.log(
+                TAG,
+                "Tier 0 device (totalRAM=${deviceProfile.totalRamMB}MB) — " +
+                    "VLM generation bypassed; fast-path tools stay active"
+            )
+            onStepProgress?.invoke(100, "Fast tools ready")
+            onError?.invoke(gracefulFallbackMessage!!, "")
+            return@withContext false
+        }
+
+        // ── Circuit breaker: too many prior failures → degrade gracefully ──
+        if (initFailureCount >= MAX_INIT_FAILURES) {
+            val msg = VLM_UNAVAILABLE_MESSAGE
+            gracefulFallbackMessage = msg
+            CrashLogFile.log(
+                TAG,
+                "Init skipped after $initFailureCount failures — degrading gracefully; " +
+                    "non-VLM features stay active"
+            )
+            onError?.invoke(msg, "")
+            return@withContext false
+        }
 
         // ── Pre-flight RAM Check ──────────────────────────────────
         // Gemma 4 E2B requires ~3 GB of RAM at peak (model weights
@@ -246,7 +509,7 @@ class VlmEngineManager(
         CrashLogFile.log(TAG, "RAM: ${freeMB}MB free, lowRam=$isLowRamDevice")
 
         try {
-            Log.i(TAG, "Starting Gemma 4 E2B initialization...")
+            Log.i(TAG, "Starting Gemma 4 E2B initialization [tier=${deviceProfile.tier.label}]...")
 
             // Step 0: Ensure native library is loaded
             CrashLogFile.log(TAG, "Step 0: Loading native library")
@@ -268,88 +531,377 @@ class VlmEngineManager(
             Log.i(TAG, "Model resolved: ${modelFile.absolutePath} (${modelFile.length()} bytes)")
             CrashLogFile.log(TAG, "Model: ${modelFile.absolutePath} (${modelFile.length() / (1024 * 1024)}MB)")
 
-            // Step 2: GPU backend (primary)
+            // Step 2: Walk the tier's backend plan (GPU → CPU per tier).
             // NPU is skipped — the Gemma 4 E2B generic model does not ship with
             // TF_LITE_PREFILL_DECODE for NPU, so NPU init always fails and
             // wastes 5-10s on mid-tier Dimensity/Snapdragon devices.
-            onStepProgress?.invoke(30, "Opening my eyes...")
-            CrashLogFile.log(TAG, "Step 2: Initializing GPU backend...")
+            val tier = deviceProfile.tier
+            val plan = backendPlanFor(tier)
+            CrashLogFile.log(TAG, "Backend plan [$tier]: ${plan.joinToString(" → ") { it.backendName }}")
 
-            val gpuSuccess = tryInitializeWithBackend(modelFile, Backend.GPU(), "GPU")
-            if (gpuSuccess) {
-                // GPU warm-up — pre-compile OpenCL/Vulkan kernels
-                onStepProgress?.invoke(75, "Sharpening my focus (this takes a moment)...")
-                CrashLogFile.log(TAG, "Step 3: GPU warm-up (dummy inference)...")
-                warmUp()
+            for ((index, step) in plan.withIndex()) {
+                onStepProgress?.invoke(30 + index * 10, progressMessageFor(step))
+                val ok = createEngineGuarded(modelFile, step, tier)
+                if (ok) {
+                    // Warm-up — pre-compile GPU kernels / warm the CPU decoder
+                    onStepProgress?.invoke(75, "Sharpening my focus (this takes a moment)...")
+                    CrashLogFile.log(TAG, "Step 3: Engine warm-up (dummy inference) [${step.backendName}]...")
+                    warmUp()
 
-                onStepProgress?.invoke(95, "Finalizing...")
-                CrashLogFile.log(TAG, "=== INIT SUCCESS [GPU] ===")
-                Log.i(TAG, "Gemma 4 E2B loaded successfully [backend=GPU]")
-                return@withContext true
+                    onStepProgress?.invoke(95, "Finalizing...")
+                    CrashLogFile.log(TAG, "=== INIT SUCCESS [${step.backendName}, $tier] ===")
+                    Log.i(TAG, "Gemma 4 E2B loaded successfully [backend=${step.backendName}, tier=$tier]")
+                    return@withContext true
+                }
+                CrashLogFile.log(TAG, "Backend ${step.backendName} failed — moving to next in plan")
             }
 
-            // GPU failed — no CPU fallback for this model size
-            val errorMsg = "VLM init failed: GPU backend unavailable. " +
-                "CPU fallback is disabled for Gemma 4 E2B model."
+            // All backends in the tier's plan failed — count the failure.
+            // Past the threshold, degrade gracefully: friendly message via
+            // onError (spoken as TTS); fast-path tools stay untouched.
+            initFailureCount++
+            isInitialized = false
+            val degrade = initFailureCount >= MAX_INIT_FAILURES
+            if (degrade) gracefulFallbackMessage = VLM_UNAVAILABLE_MESSAGE
+            val errorMsg = "VLM init failed: all backends for $tier exhausted." +
+                if (degrade) " $VLM_UNAVAILABLE_MESSAGE" else " (attempt $initFailureCount/$MAX_INIT_FAILURES)"
             Log.e(TAG, errorMsg)
             CrashLogFile.logError(TAG, errorMsg)
             onError?.invoke(errorMsg, "")
             false
 
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            // The CALLER's coroutine was cancelled (app teardown / session
+            // switch) — propagate silently. This is NOT an engine failure and
+            // must not count toward the circuit breaker.
+            CrashLogFile.log(TAG, "Init cancelled by caller — not an engine failure")
+            throw e
         } catch (e: Throwable) {
-            val errorMsg = "VLM init failed: ${e.javaClass.simpleName}: ${e.message}"
+            // Catches Errors too (OutOfMemoryError, UnsatisfiedLinkError from
+            // native init) — a VLM init failure must never cancel the parent
+            // CoroutineScope or break non-VLM features.
+            initFailureCount++
+            isInitialized = false
+            val degrade = initFailureCount >= MAX_INIT_FAILURES
+            if (degrade) gracefulFallbackMessage = VLM_UNAVAILABLE_MESSAGE
+            val errorMsg = "VLM init failed: ${e.javaClass.simpleName}: ${e.message}" +
+                if (degrade) " — $VLM_UNAVAILABLE_MESSAGE" else ""
             Log.e(TAG, errorMsg, e)
             CrashLogFile.logError(TAG, errorMsg, e)
             onError?.invoke(errorMsg, "")
-            isInitialized = false
             false
         }
     }
 
+    // ── Tiered Backend Planning ───────────────────────────────────
+
+    /** One backend attempt in a tier's initialization plan. */
+    private data class TierBackendPlan(
+        val backendName: String,
+        val backend: Backend,
+        val contextTokens: Int?
+    )
+
     /**
-     * Try to initialize the engine with a specific backend.
-     * Returns true on success, false on failure.
+     * The backend chain for a tier:
+     *  - Tier 1: GPU only (flagship — certified drivers; a failure here is
+     *    treated as a real fault, not a tiering issue).
+     *  - Tier 2: GPU with catch-fallback to CPU (4 threads) — the mid-range
+     *    Mali/OpenCL driver belt.
+     *  - Tier 3: CPU directly — never waste 5-10s on a GPU init that will
+     *    fail on low-end chipsets.
      */
-    private fun tryInitializeWithBackend(
-        modelFile: File,
-        backend: Backend,
-        backendName: String
-    ): Boolean {
-        CrashLogFile.log(TAG, "Trying $backendName backend...")
-        onStepProgress?.invoke(35, "Preparing my vision...")
+    private fun backendPlanFor(tier: DeviceTier): List<TierBackendPlan> = when (tier) {
+        DeviceTier.TIER_1 -> listOf(
+            TierBackendPlan("GPU", Backend.GPU(), CONTEXT_TOKENS_TIER1)
+        )
+        DeviceTier.TIER_2 -> listOf(
+            TierBackendPlan("GPU", Backend.GPU(), CONTEXT_TOKENS_TIER2),
+            TierBackendPlan("CPU", cpuBackendForDevice(), CONTEXT_TOKENS_TIER2)
+        )
+        DeviceTier.TIER_3 -> listOf(
+            TierBackendPlan("CPU", cpuBackendForDevice(), CONTEXT_TOKENS_TIER3)
+        )
+        DeviceTier.TIER_DISABLED -> emptyList()
+    }
 
-        var eng: Engine? = null
-        try {
-            val engineConfig = EngineConfig(
-                modelPath = modelFile.absolutePath,
-                backend = backend,
-                visionBackend = backend,
-                // Audio encoder runs on CPU — Gemma 4 E2B's audio model is
-                // separate from the text/vision path and loads on demand.
-                audioBackend = Backend.CPU(),
-                cacheDir = context.cacheDir.path
-            )
+    /** CPU backend with the tier's thread budget (4 threads, capped by cores). */
+    private fun cpuBackendForDevice(): Backend {
+        val threads = cpuThreadCount()
+        CrashLogFile.log(TAG, "CPU backend: $threads threads")
+        return Backend.CPU(threadCount = threads)
+    }
 
-            CrashLogFile.log(TAG, "EngineConfig created [$backendName] — creating Engine...")
-            eng = Engine(engineConfig)
-
-            onStepProgress?.invoke(45, "Getting my vision ready...")
-            CrashLogFile.log(TAG, "Engine created [$backendName] — calling initialize()...")
-            eng.initialize()
-
-            engine = eng
-            activeBackend = backendName
-            isInitialized = true
-            return true
-
-        } catch (e: Throwable) {
-            CrashLogFile.logError(TAG, "$backendName init failed: ${e.javaClass.simpleName}: ${e.message}", e)
-            Log.e(TAG, "$backendName init failed: ${e.message}", e)
-            // Clean up partial engine
-            try { eng?.close() } catch (_: Throwable) {}
-            engine = null
-            return false
+    private fun cpuThreadCount(): Int {
+        val cores = try {
+            Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
+        } catch (_: Throwable) {
+            4
         }
+        return minOf(CPU_FALLBACK_THREADS, maxOf(2, cores / 2))
+    }
+
+    private fun progressMessageFor(step: TierBackendPlan): String = when (step.backendName) {
+        "GPU" -> "Opening my eyes..."
+        else -> "Warming up my thinking engine..."
+    }
+
+    /**
+     * Tier-scoped EXPERIMENTAL flags (LiteRT-LM 0.16.1 static registry).
+     *
+     *  - MTP-class acceleration (speculative decoding / multi-token
+     *    prediction): Tier 1 ONLY — flagship GPUs have the compute headroom
+     *    for the extra parallel token prediction. Explicitly reset to the
+     *    default (off) on every other tier, and on every CPU fallback.
+     *  - Visual token budget: capped on Tier 2/3 so a single camera frame
+     *    cannot blow the reduced context window.
+     *
+     * The flags are STATIC — all of them are assigned on EVERY attempt so a
+     * previous attempt's flags can never leak into the next one.
+     */
+    @OptIn(ExperimentalApi::class)
+    private fun applyTierExperimentalFlags(tier: DeviceTier) {
+        try {
+            ExperimentalFlags.enableSpeculativeDecoding = when (tier) {
+                DeviceTier.TIER_1 -> true
+                else -> null  // MTP off — reset to engine default
+            }
+            ExperimentalFlags.visualTokenBudget = when (tier) {
+                DeviceTier.TIER_2 -> VISUAL_TOKEN_BUDGET_TIER2
+                DeviceTier.TIER_3 -> VISUAL_TOKEN_BUDGET_TIER3
+                else -> null   // Tier 1: engine default (full budget)
+            }
+            CrashLogFile.log(
+                TAG,
+                "Experimental flags [tier=$tier]: mtp=${tier == DeviceTier.TIER_1}, " +
+                    "visualBudget=${ExperimentalFlags.visualTokenBudget ?: "default"}"
+            )
+        } catch (e: Throwable) {
+            // Older runtime without these flags — non-fatal.
+            Log.w(TAG, "ExperimentalFlags unavailable: ${e.message}")
+        }
+    }
+
+    /**
+     * Create + initialize the engine for ONE backend attempt, fully guarded:
+     *
+     *  - serialized by [engineInitMutex] (one native build at a time),
+     *  - GC + trim BEFORE the native side allocates KV-cache tensors,
+     *  - hard time budget per attempt (a hung native constructor can no
+     *    longer stall initialization forever),
+     *  - ALL Throwables (JNI/C++ driver errors, OutOfMemoryError,
+     *    UnsatisfiedLinkError, cancelled GPU init) are caught and classified
+     *    — nothing propagates as an uncaught Job cancellation,
+     *  - external caller cancellation is rethrown untouched.
+     *
+     * @return true when the engine is ready on this backend.
+     */
+    private suspend fun createEngineGuarded(
+        modelFile: File,
+        step: TierBackendPlan,
+        tier: DeviceTier
+    ): Boolean {
+        return engineInitMutex.withLock {
+            CrashLogFile.log(
+                TAG,
+                "Trying ${step.backendName} backend (tier=$tier, contextTokens=${step.contextTokens})..."
+            )
+            onStepProgress?.invoke(35, "Preparing my vision...")
+
+            // Drop whatever we can BEFORE the native side allocates KV-cache
+            // tensors — on lower-tier hardware every reclaimed MB counts.
+            reclaimMemoryBeforeTensorAllocation(aggressive = tier != DeviceTier.TIER_1)
+
+            val timeoutMs =
+                if (step.backend is Backend.CPU) CPU_ENGINE_CREATE_TIMEOUT_MS
+                else ENGINE_CREATE_TIMEOUT_MS
+
+            try {
+                applyTierExperimentalFlags(tier)
+
+                val eng = buildEngineTimed(
+                    EngineConfig(
+                        modelPath = modelFile.absolutePath,
+                        backend = step.backend,
+                        visionBackend = step.backend,
+                        // Audio encoder runs on CPU — Gemma 4 E2B's audio model is
+                        // separate from the text/vision path and loads on demand.
+                        audioBackend = Backend.CPU(),
+                        maxNumTokens = step.contextTokens,
+                        cacheDir = context.cacheDir.path
+                    ),
+                    timeoutMs
+                )
+
+                if (eng == null) {
+                    CrashLogFile.logError(
+                        TAG,
+                        "${step.backendName} build exceeded ${timeoutMs / 1000}s budget — treating as failure"
+                    )
+                    return@withLock false
+                }
+
+                onStepProgress?.invoke(45, "Getting my vision ready...")
+                CrashLogFile.log(TAG, "Engine created + initialized [${step.backendName}]")
+
+                engine = eng
+                activeBackend = step.backendName
+                isInitialized = true
+                true
+
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                // External cancellation (caller scope) — rethrow untouched;
+                // never swallow and never count as an engine failure.
+                CrashLogFile.log(TAG, "${step.backendName} build cancelled by caller")
+                throw e
+            } catch (e: Throwable) {
+                // JNI / C++ driver errors, OutOfMemoryError, UnsatisfiedLinkError,
+                // "m0 was canceled"-style silent GPU failures — contained here.
+                CrashLogFile.logError(
+                    TAG,
+                    "${step.backendName} init failed: ${e.javaClass.simpleName}: ${e.message}",
+                    e
+                )
+                Log.e(TAG, "${step.backendName} init failed: ${e.message}", e)
+                false
+            }
+        }
+    }
+
+    /**
+     * Build + initialize an [Engine] under a hard time budget.
+     *
+     * The native constructor and initialize() cannot be interrupted, so the
+     * build runs on the dedicated single-thread init lane while the caller
+     * polls. On completion within budget the engine is returned; on timeout
+     * the result holder is parked in [pendingBuild] so the NEXT attempt can
+     * drain-wait for the (uninterruptible) build and close it properly
+     * instead of leaking it or racing a second native init against it.
+     */
+    private suspend fun buildEngineTimed(engineConfig: EngineConfig, timeoutMs: Long): Engine? {
+        // Drain + close any previous timed-out build still materializing.
+        awaitAndClosePendingBuild(PENDING_BUILD_DRAIN_MS)
+
+        val result = EngineBuildResult()
+        val deadline = System.currentTimeMillis() + timeoutMs
+
+        scope.launch(engineInitDispatcher) {
+            try {
+                val e = Engine(engineConfig)
+                e.initialize()
+                result.engine = e
+            } catch (t: Throwable) {
+                result.error = t
+            }
+        }
+
+        while (result.engine == null && result.error == null &&
+            System.currentTimeMillis() < deadline
+        ) {
+            delay(100)
+        }
+
+        result.engine?.let {
+            pendingBuild = null
+            return it
+        }
+        result.error?.let { throw it }
+
+        // Timed out — the native build may STILL complete later (it cannot be
+        // interrupted). Park the holder for the next attempt to drain + close.
+        pendingBuild = result
+        CrashLogFile.log(TAG, "Engine build timed out after ${timeoutMs / 1000}s — parked for drain")
+        return null
+    }
+
+    /**
+     * Wait (bounded) for a previously timed-out engine build to materialize,
+     * then close it. The native side of that build cannot be interrupted —
+     * this guarantees it is drained and released before another backend
+     * attempt starts, instead of two native inits fighting for RAM/GPU.
+     */
+    private suspend fun awaitAndClosePendingBuild(maxWaitMs: Long) {
+        val pending = pendingBuild ?: return
+        pendingBuild = null
+
+        val deadline = System.currentTimeMillis() + maxWaitMs
+        while (pending.engine == null && pending.error == null &&
+            System.currentTimeMillis() < deadline
+        ) {
+            delay(100)
+        }
+
+        pending.engine?.let { zombie ->
+            CrashLogFile.log(TAG, "Closing timed-out engine build (late completion)")
+            try {
+                zombie.close()
+            } catch (_: Throwable) {}
+        }
+        pending.engine = null
+        pending.error = null
+    }
+
+    /**
+     * Reclaim memory BEFORE the native side allocates KV-cache tensors —
+     * required on lower-tier hardware where allocation is the #1 init/inference
+     * killer. [aggressive] (used at engine creation on Tier 2/3) also asks the
+     * framework to trim its own caches.
+     */
+    private fun reclaimMemoryBeforeTensorAllocation(aggressive: Boolean) {
+        try {
+            repeat(if (aggressive) 3 else 1) { System.gc() }
+            System.runFinalization()
+            if (aggressive) trimAppMemoryIfPossible()
+            val free = availableHeapMB()
+            CrashLogFile.log(
+                TAG,
+                "Memory reclaimed before tensor allocation: ${free}MB free (aggressive=$aggressive)"
+            )
+        } catch (e: Throwable) {
+            Log.w(TAG, "Memory reclaim failed: ${e.message}")
+        }
+    }
+
+    /** Best-effort framework-level trim of this app's own caches. */
+    private fun trimAppMemoryIfPossible() {
+        try {
+            (context as? ComponentCallbacks2)
+                ?.onTrimMemory(ComponentCallbacks2.TRIM_MEMORY_COMPLETE)
+        } catch (_: Throwable) {}
+    }
+
+    /** Message used by inference paths when the engine is not ready. */
+    private fun notReadyMessage(): String =
+        gracefulFallbackMessage
+            ?: if (initFailureCount >= MAX_INIT_FAILURES) VLM_UNAVAILABLE_MESSAGE
+            else "AI model not ready"
+
+    // ── Tier-aware parameter clamps ───────────────────────────────
+
+    /** Per-turn output cap for the device tier (never above the context budget). */
+    private fun clampMaxTokens(requested: Int): Int {
+        val tierCap = when (deviceProfile.tier) {
+            DeviceTier.TIER_1 -> MAX_TOKENS_TIER_CAP_TIER1
+            DeviceTier.TIER_2 -> MAX_TOKENS_TIER_CAP_TIER2
+            else -> MAX_TOKENS_TIER_CAP_TIER3
+        }
+        val contextCeiling = when (deviceProfile.tier) {
+            DeviceTier.TIER_1 -> CONTEXT_TOKENS_TIER1
+            DeviceTier.TIER_2 -> CONTEXT_TOKENS_TIER2
+            else -> CONTEXT_TOKENS_TIER3
+        } - CONTEXT_HEADROOM_TOKENS
+        val clamped = requested.coerceAtMost(tierCap).coerceAtMost(contextCeiling)
+        if (clamped != requested) {
+            Log.i(TAG, "maxTokens clamped $requested → $clamped (tier=${deviceProfile.tier})")
+        }
+        return clamped
+    }
+
+    /** Image pre-processing dimension cap for the device tier. */
+    private fun clampTargetDimension(requested: Int): Int = when (deviceProfile.tier) {
+        DeviceTier.TIER_1 -> requested
+        DeviceTier.TIER_2 -> minOf(requested, IMAGE_DIMENSION_TIER2)
+        else -> minOf(requested, IMAGE_DIMENSION_TIER3)
     }
 
     private fun buildModelNotFoundError(): String {
@@ -396,7 +948,8 @@ class VlmEngineManager(
      * @param bitmap          Camera frame — will be downscaled proportionally before inference
      * @param prompt          User query describing what to analyze
      * @param memoryContext   Optional context string injected below the baseline instruction
-     * @param targetDimension Target bitmap dimension (scales proportionally, no center-crop)
+     * @param targetDimension Target bitmap dimension (scales proportionally, no center-crop);
+     *                        clamped to the device tier's image budget
      * @return The complete model response, or null on error
      */
     suspend fun analyzeImage(
@@ -410,8 +963,9 @@ class VlmEngineManager(
     ): String? = withContext(Dispatchers.Default) {
         val eng = engine
         if (eng == null || !isInitialized) {
-            Log.e(TAG, "VLM not initialized — cannot run inference")
-            onError?.invoke("AI model not ready", sessionId)
+            val msg = notReadyMessage()
+            Log.e(TAG, "VLM not initialized — cannot run inference: $msg")
+            onError?.invoke(msg, sessionId)
             return@withContext null
         }
 
@@ -421,9 +975,16 @@ class VlmEngineManager(
             CrashLogFile.log(TAG, "=== ANALYZE IMAGE ===")
             CrashLogFile.log(TAG, "Input bitmap: ${bitmap.width}x${bitmap.height}")
 
-            // 1. Preprocess bitmap — center-crop to square + scale to targetDimension
-            scaledBitmap = preprocessBitmap(bitmap, targetDimension)
-            CrashLogFile.log(TAG, "Preprocessed: ${scaledBitmap.width}x${scaledBitmap.height} (target=$targetDimension)")
+            // 1. Preprocess bitmap — proportional scale to the TIER-ADJUSTED
+            //    target dimension (no center-crop; vision-token memory on
+            //    lower tiers is bounded by the smaller dimension).
+            val effectiveTarget = clampTargetDimension(targetDimension)
+            scaledBitmap = preprocessBitmap(bitmap, effectiveTarget)
+            CrashLogFile.log(
+                TAG,
+                "Preprocessed: ${scaledBitmap.width}x${scaledBitmap.height} " +
+                    "(target=$effectiveTarget, tier=${deviceProfile.tier})"
+            )
 
             // 2. Encode image to JPEG bytes
             val imageBytes = bitmapToJpegBytes(scaledBitmap)
@@ -485,7 +1046,7 @@ class VlmEngineManager(
      *
      * @param prompt    The full formatted instruction (DynamicPromptBuilder output)
      * @param sessionId Session gating ID for callbacks
-     * @param maxTokens Output token cap for the answer
+     * @param maxTokens Output token cap for the answer (tier-clamped)
      * @return The complete model response, or null on error
      */
     suspend fun analyzeText(
@@ -578,8 +1139,9 @@ class VlmEngineManager(
     ): String? {
         val eng = engine
         if (eng == null || !isInitialized) {
-            Log.e(TAG, "VLM not initialized — cannot run inference")
-            onError?.invoke("AI model not ready", sessionId)
+            val msg = notReadyMessage()
+            Log.e(TAG, "VLM not initialized — cannot run inference: $msg")
+            onError?.invoke(msg, sessionId)
             return null
         }
 
@@ -595,6 +1157,17 @@ class VlmEngineManager(
         // until that finishes.
         return generationMutex.withLock {
             withTimeoutOrNull(GENERATION_DRAIN_TIMEOUT_MS) { generationFinished.await() }
+
+            // ── Memory Safety (lower tiers) ─────────────────────────
+            // Reclaim what we can BEFORE the engine allocates fresh KV-cache
+            // tensors for this turn. On Tier 2/3 idle-cache pressure is the
+            // #1 inference killer; a GC (+ trim on Tier 3) beforehand is
+            // cheap insurance against mid-generation OOM.
+            if (deviceProfile.tier != DeviceTier.TIER_1) {
+                reclaimMemoryBeforeTensorAllocation(
+                    aggressive = deviceProfile.tier == DeviceTier.TIER_3
+                )
+            }
 
             val turnFinished = CompletableDeferred<Unit>()
             generationFinished = turnFinished
@@ -634,13 +1207,14 @@ class VlmEngineManager(
     ): String? {
         val eng = engine
         if (eng == null || !isInitialized) {
-            Log.e(TAG, "VLM not initialized — cannot run inference")
-            onError?.invoke("AI model not ready", sessionId)
+            val msg = notReadyMessage()
+            Log.e(TAG, "VLM not initialized — cannot run inference: $msg")
+            onError?.invoke(msg, sessionId)
             return null
         }
         val result: String? = try {
             val conversationConfig = ConversationConfig(
-                maxOutputToken = maxTokens,
+                maxOutputToken = clampMaxTokens(maxTokens),
                 samplerConfig = SamplerConfig(
                     topK = TOP_K,
                     topP = TOP_P,
@@ -692,17 +1266,29 @@ class VlmEngineManager(
                 conversation.sendMessageAsync(contents, callback)
 
                 // Wait for completion (max 180s — Gemma 3n E2B int4 at 3.66GB)
-                // On low-RAM devices, use a shorter timeout to fail fast instead of
-                // hanging during an OOM recovery that may never complete.
-                val timeoutSec = if (isLowRamDevice) LOW_RAM_INFERENCE_TIMEOUT_SEC else INFERENCE_TIMEOUT_SEC
+                // On low-RAM / Tier 3 devices, use a shorter timeout to fail
+                // fast instead of hanging during an OOM recovery that may
+                // never complete.
+                val timeoutSec =
+                    if (isLowRamDevice || deviceProfile.tier == DeviceTier.TIER_3) {
+                        LOW_RAM_INFERENCE_TIMEOUT_SEC
+                    } else {
+                        INFERENCE_TIMEOUT_SEC
+                    }
                 val completed = latch.await(timeoutSec, TimeUnit.SECONDS)
 
-                // ── Memory pressure check ──────────────────────────
-                // If available heap drops below threshold during inference,
-                // log a warning. The watchdog timer in VyzeCoreController
-                // handles the force-reset if the engine hangs due to OOM.
+                // ── Memory pressure check (tier-aware) ─────────────
+                // If available heap drops below the tier's threshold during
+                // inference, log a warning. The watchdog timer in
+                // VyzeCoreController handles the force-reset if the engine
+                // hangs due to OOM.
                 val remainingMB = availableHeapMB()
-                if (remainingMB < LOW_RAM_THRESHOLD_MB) {
+                val pressureThreshold = when (deviceProfile.tier) {
+                    DeviceTier.TIER_1 -> LOW_RAM_THRESHOLD_MB
+                    DeviceTier.TIER_2 -> LOW_RAM_THRESHOLD_MB_TIER2
+                    else -> LOW_RAM_THRESHOLD_MB_TIER3
+                }
+                if (remainingMB < pressureThreshold) {
                     Log.w(TAG, "Memory pressure during inference: ${remainingMB}MB free — may OOM")
                     CrashLogFile.log(TAG, "LOW MEMORY WARNING: ${remainingMB}MB free during inference")
                 }
@@ -717,7 +1303,7 @@ class VlmEngineManager(
                 }
 
                 if (!completed) {
-                    Log.w(TAG, "Inference timed out after ${INFERENCE_TIMEOUT_SEC}s")
+                    Log.w(TAG, "Inference timed out after ${timeoutSec}s")
                     inferenceError = "Inference timed out"
                     // Stop the native generation so the engine frees up for the
                     // next query (same mechanism as interrupt()).
@@ -830,8 +1416,9 @@ class VlmEngineManager(
      * Preprocess a camera bitmap for VLM input.
      *
      * Gemma 4 handles dynamic aspect ratios natively via its vision token
-     * budget. We only downscale if the bitmap exceeds the target dimension,
-     * preserving the original aspect ratio — no center-cropping.
+     * budget. We only downscale if the bitmap exceeds the (tier-clamped)
+     * target dimension, preserving the original aspect ratio — no
+     * center-cropping.
      *
      * @param source         Raw camera bitmap
      * @param targetDimension Maximum dimension (width or height) allowed
@@ -864,12 +1451,13 @@ class VlmEngineManager(
         return stream.toByteArray()
     }
 
-    // ── GPU Warm-up ─────────────────────────────────────────────
+    // ── Engine Warm-up ──────────────────────────────────────────
 
     /**
-     * Run a dummy 1×1 image through the engine to pre-compile OpenCL/Vulkan GPU
-     * kernels. This eliminates the first-inference cold-start penalty so the real
-     * user query benefits from already-warmed GPU delegates.
+     * Run a dummy text-only message through the engine to pre-compile
+     * OpenCL/Vulkan GPU kernels (or warm the CPU decoder on CPU tiers).
+     * This eliminates the first-inference cold-start penalty so the real
+     * user query benefits from already-warmed delegates.
      */
     private suspend fun warmUp() = withContext(Dispatchers.IO) {
         val eng = engine ?: return@withContext
@@ -880,7 +1468,7 @@ class VlmEngineManager(
             // The text decoder and GPU kernels are warmed up by this text-only
             // message; the vision encoder warms up on the first real inference.
             val conversationConfig = ConversationConfig(
-                maxOutputToken = MAX_TOKENS,
+                maxOutputToken = clampMaxTokens(MAX_TOKENS),
                 samplerConfig = SamplerConfig(
                     topK = TOP_K,
                     topP = TOP_P,
@@ -904,9 +1492,9 @@ class VlmEngineManager(
                 latch.await(WARMUP_TIMEOUT_SEC, TimeUnit.SECONDS)
             }
 
-            Log.i(TAG, "GPU warm-up completed (text-only)")
+            Log.i(TAG, "Engine warm-up completed (text-only) [backend=$activeBackend]")
         } catch (e: Throwable) {
-            Log.w(TAG, "GPU warm-up failed (non-fatal): ${e.javaClass.simpleName}: ${e.message}")
+            Log.w(TAG, "Engine warm-up failed (non-fatal): ${e.javaClass.simpleName}: ${e.message}")
         }
     }
 
@@ -914,6 +1502,18 @@ class VlmEngineManager(
 
     fun isReady(): Boolean = isInitialized && engine != null
     fun getActiveBackend(): String = activeBackend
+
+    /** True when VLM generation is usable — always false on Tier 0 devices. */
+    fun isVlmAvailable(): Boolean = isReady()
+
+    /** True when the device is Tier 0 (VLM bypassed; fast-path tools remain). */
+    fun isVlmBypassed(): Boolean = deviceProfile.tier == DeviceTier.TIER_DISABLED
+
+    /** Human-readable device tier (for status lines / telemetry). */
+    fun getDeviceTierName(): String = deviceProfile.tier.label
+
+    /** Full hardware profile summary (for logs / diagnostics screens). */
+    fun getDeviceProfileSummary(): String = profileSummary(deviceProfile)
 
     /**
      * Check if the model file exists on disk (without initializing the engine).
@@ -977,6 +1577,11 @@ class VlmEngineManager(
      * Each [analyzeImage] call already creates a fresh Conversation via
      * [Engine.createConversation], so conversation-level history is already
      * isolated. This method addresses Engine-level KV-cache accumulation.
+     *
+     * Reinitialization uses the SAME tiered backend chain as [initialize]
+     * (GPU → CPU per device tier) so the optimal backend is always selected
+     * and a mid-reset GPU driver failure can never cancel the caller's job
+     * or take down non-VLM features.
      */
     fun resetSession() {
         if (!isInitialized || engine == null) return
@@ -988,25 +1593,34 @@ class VlmEngineManager(
         }
         engine = null
         isInitialized = false
-        // Reinitialize on background thread — uses the SAME NPU → GPU fallback
-        // chain as initialize() so the optimal backend is always selected.
-        val eng = scope.launch(Dispatchers.IO) {
+
+        // Reinitialize on a background thread — all failures are contained
+        // inside this job (SupervisorJob scope: a failure here can never
+        // cancel the parent scope or any other feature's work).
+        scope.launch(Dispatchers.IO) {
             try {
+                if (deviceProfile.tier == DeviceTier.TIER_DISABLED) {
+                    Log.i(TAG, "resetSession: Tier 0 device — VLM stays bypassed")
+                    return@launch
+                }
                 val modelFile = resolveModelFile()
-                if (modelFile != null) {
-                    // GPU only — NPU is skipped (see initialize() rationale)
-                    val gpuOk = tryInitializeWithBackend(modelFile, Backend.GPU(), "GPU")
-                    if (gpuOk) {
-                        Log.i(TAG, "resetSession: reinitialized on GPU")
+                if (modelFile == null) {
+                    Log.e(TAG, "resetSession: model file not found — VLM stays offline")
+                    return@launch
+                }
+
+                val tier = deviceProfile.tier
+                for (step in backendPlanFor(tier)) {
+                    if (createEngineGuarded(modelFile, step, tier)) {
+                        Log.i(TAG, "resetSession: reinitialized on ${step.backendName} [tier=$tier]")
                         warmUp()
                         return@launch
                     }
-                    Log.e(TAG, "resetSession: GPU init failed")
-                    engine = null
-                    isInitialized = false
-                } else {
-                    Log.e(TAG, "resetSession: model file not found")
+                    Log.e(TAG, "resetSession: ${step.backendName} init failed — trying next backend")
                 }
+                Log.e(TAG, "resetSession: all backends for $tier failed — VLM stays offline (non-VLM features unaffected)")
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Throwable) {
                 Log.e(TAG, "resetSession reinit failed: ${e.message}", e)
                 engine = null
@@ -1027,6 +1641,14 @@ class VlmEngineManager(
         private val dispatcher = Dispatchers.IO.limitedParallelism(1)
         suspend fun <T> lane(block: suspend () -> T): T = withContext(dispatcher) { block() }
     }
+
+    /**
+     * Dedicated single-thread ENGINE INIT lane. Engine creation/initialize()
+     * runs here — structurally isolated from the inference lane so a native
+     * build can never interleave with a live generation on the same thread,
+     * and never competes with inference for a pooled worker.
+     */
+    private val engineInitDispatcher = Dispatchers.IO.limitedParallelism(1)
 
     /**
      * Run [block] on the single-thread inference lane. Used by
@@ -1088,6 +1710,8 @@ class VlmEngineManager(
         engine = null
         isInitialized = false
         activeBackend = "NONE"
+        initFailureCount = 0
+        gracefulFallbackMessage = null
     }
 
     // ── Companion ──────────────────────────────────────────────────
@@ -1143,7 +1767,7 @@ class VlmEngineManager(
         // Timeouts
         private const val INFERENCE_TIMEOUT_SEC = 180L  // 3 min for real inference
         private const val LOW_RAM_INFERENCE_TIMEOUT_SEC = 60L  // 1 min on low-RAM devices — fail fast
-        private const val WARMUP_TIMEOUT_SEC = 60L       // 60s for GPU warm-up (mid-tier may need longer)
+        private const val WARMUP_TIMEOUT_SEC = 60L       // 60s for engine warm-up (mid-tier may need longer)
 
         /**
          * Max time to wait for a previous (cancelled) native generation to fully
@@ -1201,8 +1825,65 @@ class VlmEngineManager(
         private const val MIN_RAM_STANDARD_MB = 1200L
         /** Minimum free device RAM (MB) required on devices flagged as low-RAM. */
         private const val MIN_RAM_LOW_RAM_DEVICE_MB = 800L
-        /** Log a warning if free device RAM drops below this during inference. */
+        /** Log a warning if free device RAM drops below this during inference (Tier 1). */
         private const val LOW_RAM_THRESHOLD_MB = 500L
+        /** Tier-aware memory-pressure warning thresholds (free MB). */
+        private const val LOW_RAM_THRESHOLD_MB_TIER2 = 700L
+        private const val LOW_RAM_THRESHOLD_MB_TIER3 = 900L
+
+        // ── Tiered Engine Initialization Strategy ───────────────
+        // NOTE: ActivityManager.MemoryInfo.totalMem is KERNEL-ADJUSTED — an
+        // "8 GB" phone reports ~7.2-7.7 GB, a "6 GB" phone ~5.4-5.8 GB. The
+        // floors below are calibrated to REPORTED values so nominal device
+        // tiers land correctly.
+        /** Reported-RAM floor for Tier 1 (nominal 8 GB). */
+        private const val TIER1_MIN_TOTAL_RAM_MB = 7168L
+        /** Reported-RAM floor for Tier 2 (nominal 6 GB); below it → Tier 3. */
+        private const val TIER2_MIN_TOTAL_RAM_MB = 5500L
+        /** Reported-RAM floor below which VLM generation is bypassed (nominal 4 GB). */
+        private const val VLM_BYPASS_TOTAL_RAM_MB = 3400L
+
+        /** Engine context window (EngineConfig.maxNumTokens) per tier. */
+        private const val CONTEXT_TOKENS_TIER1 = 4096
+        private const val CONTEXT_TOKENS_TIER2 = 3072
+        private const val CONTEXT_TOKENS_TIER3 = 2048
+        /** Headroom between the engine context window and per-turn maxOutputToken. */
+        private const val CONTEXT_HEADROOM_TOKENS = 256
+
+        /** Per-turn output token cap per tier (defense against runaway generation). */
+        private const val MAX_TOKENS_TIER_CAP_TIER1 = 512
+        private const val MAX_TOKENS_TIER_CAP_TIER2 = 320
+        private const val MAX_TOKENS_TIER_CAP_TIER3 = 256
+
+        /** Image pre-processing dimension cap per tier (vision-token memory ~quadratic). */
+        private const val IMAGE_DIMENSION_TIER2 = 384
+        private const val IMAGE_DIMENSION_TIER3 = 256
+
+        /** Visual token budget caps (ExperimentalFlags) for image encoding on lower tiers. */
+        private const val VISUAL_TOKEN_BUDGET_TIER2 = 320
+        private const val VISUAL_TOKEN_BUDGET_TIER3 = 192
+
+        /** CPU threads for the CPU-fallback backend (Tier 2 fallback / Tier 3). */
+        private const val CPU_FALLBACK_THREADS = 4
+
+        /** Consecutive init failures before the engine degrades gracefully. */
+        private const val MAX_INIT_FAILURES = 3
+
+        /** Hard budget for ONE GPU Engine build + initialize() (2.59 GB model mmap needs time). */
+        private const val ENGINE_CREATE_TIMEOUT_MS = 90_000L
+        /** CPU-backend builds get a shorter budget (no GPU driver stall is possible). */
+        private const val CPU_ENGINE_CREATE_TIMEOUT_MS = 60_000L
+        /** Max wait for a timed-out engine build to materialize before it is closed. */
+        private const val PENDING_BUILD_DRAIN_MS = 60_000L
+
+        /** Friendly fallback (spoken as TTS) when VLM is bypassed on < ~4 GB devices. */
+        private const val VLM_BYPASS_MESSAGE =
+            "This device's memory is too small for visual AI. " +
+                "Text reading, color and light detection still work."
+        /** Friendly fallback after repeated VLM init failures — fast-path tools stay operational. */
+        private const val VLM_UNAVAILABLE_MESSAGE =
+            "Visual AI is unavailable on this device. " +
+                "Text reading, color and light detection still work."
 
         private var nativeLibLoaded = false
 
@@ -1230,3 +1911,21 @@ class VlmEngineManager(
         }
     }
 }
+
+/** Hardware classification of the running device (detected once, cached). */
+private enum class DeviceTier(val label: String) {
+    TIER_1("Tier 1 (high-end)"),
+    TIER_2("Tier 2 (mid-range)"),
+    TIER_3("Tier 3 (lower-end)"),
+    TIER_DISABLED("Tier 0 (VLM bypassed — memory-constrained)")
+}
+
+/** Immutable snapshot of the detected hardware profile. */
+private data class DeviceProfile(
+    val tier: DeviceTier,
+    val totalRamMB: Long,
+    val hardware: String,
+    val flagshipGpu: Boolean,
+    val midRangeGpu: Boolean,
+    val glesVersion: String
+)

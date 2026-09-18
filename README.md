@@ -165,15 +165,25 @@ Vyze speaks through the Android platform TextToSpeech engine, preferring the Goo
 
 ---
 
-## Hardware Acceleration
+## Hardware Acceleration — Tiered Engine Initialization
 
-Vyze uses a multi-backend fallback chain:
+Vyze classifies each device into a hardware tier at startup (total RAM via `ActivityManager.MemoryInfo` + GPU-class SoC heuristics from `Build.HARDWARE`) and picks the backend chain accordingly — this fixes the "m0 was canceled" class of silent GPU-init failures on mid-range MediaTek chipsets:
 
-1. **NPU** (Neural Processing Unit) — preferred for lower power draw on devices with dedicated AI accelerators
-2. **GPU** (OpenCL/Vulkan) — universal fallback for all ARM64 devices
-3. **CPU** — not supported for Gemma 4 E2B (model too large)
+| Tier | Device class | Backend plan | Context | MTP (speculative decoding) |
+|---|---|---|---|---|
+| **Tier 1** | ≥ ~8 GB RAM + flagship GPU (Snapdragon 8-series, Dimensity 8000/9000, Tensor) | `Backend.GPU()` | 4096 tokens | Enabled |
+| **Tier 2** | ~6–8 GB RAM, or mid-range GPU / Mali drivers | `Backend.GPU()` → fallback `Backend.CPU(4 threads)` | 3072 tokens | Disabled (always on CPU) |
+| **Tier 3** | < ~6 GB RAM | `Backend.CPU(4 threads)` directly | 2048 tokens | Disabled |
+| **Tier 0** | < ~4 GB RAM | None — VLM bypassed entirely | — | — |
 
-GPU kernels are pre-compiled during warm-up to eliminate first-inference cold-start latency.
+On Tier 0 devices the VLM is skipped; a friendly message is spoken via TTS while fast-path tools (OCR, haptics, light check, color analysis) remain fully operational.
+
+Additional safeguards at engine creation:
+
+- **Guarded builds** — every engine build is serialized (`engineInitMutex`), time-budgeted (90 s GPU / 60 s CPU) with a drain-and-close path for timed-out native builds, and catches all C++/JNI driver errors, `OutOfMemoryError` and `UnsatisfiedLinkError` instead of letting them propagate as uncaught Job cancellations. A VLM init failure can never cancel the parent CoroutineScope or break non-VLM features.
+- **Circuit breaker** — after 3 consecutive init failures the engine degrades gracefully with a friendly spoken message instead of retrying forever.
+- **Memory hygiene** — GC + framework memory trim run BEFORE the native side allocates KV-cache tensors on Tier 2/3; tier-aware image dimension caps (512/384/256 px), visual-token budgets, and memory-pressure thresholds (500/700/900 MB) apply at inference time.
+- **Warm-up** — a text-only dummy inference pre-compiles GPU kernels (or warms the CPU decoder) to eliminate first-inference cold-start latency.
 
 ### Mid-Tier Device Support
 - Pre-flight RAM check rejects devices with insufficient memory (prevents OOM crashes)
@@ -186,7 +196,7 @@ GPU kernels are pre-compiled during warm-up to eliminate first-inference cold-st
 
 | Component | Technology |
 |---|---|
-| **VLM Engine** | Gemma 4 E2B (2.59 GB, multimodal) via LiteRT-LM 0.16.1 |
+| **VLM Engine** | Gemma 4 E2B (2.59 GB, multimodal) via LiteRT-LM 0.16.1 — tiered engine init (GPU on flagship, GPU→CPU(4T) fallback on mid-range, CPU-only on low-RAM; VLM bypassed < ~4 GB) |
 | **Agent Orchestration** | Google ADK for Kotlin (`google-adk-kotlin-core-android:0.2.0` + KSP processor) — shadow router, live query agent, session episodes, eval |
 | **OCR** | Google ML Kit Text Recognition (Latin + Chinese) |
 | **Barcode** | Google ML Kit Barcode Scanning (1D + 2D) |
