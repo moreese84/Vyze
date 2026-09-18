@@ -72,8 +72,12 @@ object VyzeShadowRouter {
 
     // Reading-intent keywords, aligned with the legacy voice-query path
     // (OCR reading included automatically via reading keywords).
+    // Document terms (letter, surat, 信, 信件) keep the shadow taxonomy in
+    // parity with the native TEXT_KEYWORDS list — a "read this letter" ask
+    // is a reading intent, not a generic visual query.
     private val READ_KEYWORDS =
-        listOf("read", "text", "label", "sign", "baca", "teks", "字", "读", "念")
+        listOf("read", "text", "label", "sign", "baca", "teks", "字", "读", "念",
+            "letter", "surat", "document", "信", "信件")
 
     /** Monotonic count of logged decisions (observability hook). */
     val decisionCount = AtomicLong(0)

@@ -1808,6 +1808,9 @@ class VlmEngineManager(
             "specifically asks WHERE an object is located. " +
             "NEVER start a sentence with 'You are in front of', 'You are looking at', " +
             "'You are facing', or 'In front of you is' — vary the opening with the question. " +
+            "IMPORTANT EXCEPTION: when OCR text is provided in the prompt, the one-sentence " +
+            "rule does NOT apply — read the OCR text in full, in reading order, and do not " +
+            "summarize, skip, or stop early. " +
             "Your reply is read aloud by text to speech, so it must be pure plain text: " +
             "NEVER output markdown symbols, never output bullets, dashes, asterisks, " +
             "number signs, underscores, or emoji, and never use lists or headings. " +
