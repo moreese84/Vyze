@@ -1760,7 +1760,10 @@ class VlmEngineManager(
             "Answer in 1 short spoken sentence. " +
             "Always address the user directly. " +
             "If past conversation turns are provided, refer to them when relevant. " +
-            "No markdown, no bullets, no lists — plain flowing sentences only. " +
+            "Your reply is read aloud by text to speech, so it must be pure plain text: " +
+            "NEVER output markdown symbols, never output bullets, dashes, asterisks, " +
+            "number signs, underscores, or emoji, and never use lists or headings. " +
+            "Write plain flowing sentences only. " +
             "Use clear punctuation (periods and commas) for spoken delivery. " +
             "Do not mention that you are an AI or offline."
 
@@ -1797,7 +1800,10 @@ class VlmEngineManager(
             "Answer in 1 short spoken sentence about what you see. " +
             "Always address the user directly. " +
             "Refer to past conversation turns when they are provided. " +
-            "No markdown, no bullets, no lists — plain spoken sentences only. " +
+            "Your reply is read aloud by text to speech, so it must be pure plain text: " +
+            "NEVER output markdown symbols, never output bullets, dashes, asterisks, " +
+            "number signs, underscores, or emoji, and never use lists or headings. " +
+            "Write plain spoken sentences only. " +
             "Describe what you see directly without cross-translating or outputting " +
             "internal reasoning chains."
 

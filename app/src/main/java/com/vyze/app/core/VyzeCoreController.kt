@@ -2017,7 +2017,9 @@ class VyzeCoreController(
                     "The user asks for MORE detail about the previous answer: \"$prior\". " +
                     "Describe the scene in MORE depth: objects you did not mention before, " +
                     "colors, textures, positions, distances, and any visible text. " +
-                    "Do NOT repeat the previous answer. Do NOT invent objects that are not visible."
+                    "Do NOT repeat the previous answer. Do NOT invent objects that are not visible. " +
+                    "Reply as pure plain spoken text: never markdown symbols, bullets, " +
+                    "dashes, asterisks, or emoji."
                 val basePrompt = promptBuilder.buildPrompt(
                     snapshotDescription = expansionDirective,
                     queryOverride = expansionDirective,
@@ -2342,6 +2344,7 @@ class VyzeCoreController(
         val asrPrompt = "Transcribe the following speech segment in $langName into $langName text. " +
             "Follow these specific instructions for formatting the answer: " +
             "Only output the transcription, with no newlines. " +
+            "Output plain text only: no markdown symbols, no bullets, no asterisks, no emoji. " +
             "When transcribing numbers, write the digits, i.e. write 1.7 and not one point seven, " +
             "and write 3 instead of three."
         return vlmEngine.transcribeAudio(

@@ -76,8 +76,9 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
             sb.appendLine("The OCR text above is the ground truth. Read it as whole words and " +
                 "continuous sentences — never spell it letter by letter. When asked to read " +
                 "text, read ALL of it in reading order; do not summarize, skip, or stop early. " +
-                "When reading text aloud, the 2-sentence limit does NOT apply — read every " +
-                "word of the OCR text completely.")
+                "When reading text aloud, the two sentence limit does NOT apply — read every " +
+                "word of the OCR text completely. Output plain spoken text only: never " +
+                "markdown symbols, bullets, dashes, asterisks, or emoji.")
             }
 
             // 2b-bis. LEARNED BREVITY — silently adapted answer length.
@@ -231,6 +232,9 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
             "Vehicle plates, codes, serial and phone numbers are read CHARACTER BY CHARACTER — letters one by one, digits one by one ('QLB 3469' is spoken 'Q L B, three four six nine'), never as a quantity. " +
             "Skip phrases like 'in the image' or 'it appears', but natural speech like " +
             "'there is', 'you are facing', or 'a person is standing' is exactly right. " +
+            "Your reply is read aloud by text to speech, so it must be pure plain text: " +
+            "NEVER output markdown symbols, never output bullets, dashes, asterisks, " +
+            "number signs, underscores, or emoji, and never use lists or headings. " +
             "If unsure about an object, say 'not clearly visible'. Do NOT guess or hallucinate. " +
             "Mirrors/glass: describe the surface itself.\n"
 
@@ -248,6 +252,9 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
             "Keep the whole answer to 1-3 short spoken sentences. " +
             "If text is blurry or unreadable, say 'Text is unclear' — NEVER guess. " +
             "If no text visible, say 'No text visible'. " +
+            "Your reply is read aloud by text to speech, so it must be pure plain text: " +
+            "NEVER output markdown symbols, never output bullets, dashes, asterisks, " +
+            "number signs, underscores, or emoji, and never use lists or headings. " +
             "Only what you see in THIS image.\n"
 
         // ── Language-matched few-shot examples ────────────────────────
@@ -340,14 +347,15 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
             "Describe environment: obstacles, doors, people, text."
 
         private const val OUTPUT_CONSTRAINTS =
-            "1-2 sentences. No bullet/markdown."
+            "Keep answers to 1 to 2 spoken sentences. Never output markdown " +
+            "symbols, bullets, or emoji — plain text only for text to speech."
 
         /** Fallback prompt — used if dynamic prompt construction fails. */
         private const val FALLBACK_PROMPT = """You are Vyze, an accessible vision engine. Describe spatial layouts and obstacles directly. Do NOT use filler words like 'I see' or 'This photo shows'. Keep answers under 2 sentences.
 
 Describe the immediate environment for navigation. Focus on obstacles, doors, people, and visible text.
 
-Output 1-2 spoken sentences with spatial positioning. No filler, no formatting."""
+Output 1 to 2 spoken sentences with spatial positioning. Your reply is read aloud by text to speech, so it must be pure plain text: never output markdown symbols, bullets, dashes, asterisks, number signs, or emoji. Plain sentences only, no filler."""
 
         /**
          * Money-reading rules — banknotes and coins.
@@ -359,7 +367,9 @@ Output 1-2 spoken sentences with spatial positioning. No filler, no formatting."
             "large numerals and printed text. State the value and the currency " +
             "(for example: 50 Ringgit, or 10 cents) and the dominant color. " +
             "If the value cannot be read clearly, say exactly: I cannot read this " +
-            "clearly. NEVER guess or invent a value. Do not mention serial numbers."
+            "clearly. NEVER guess or invent a value. Do not mention serial numbers. " +
+            "Reply as pure plain text for text to speech: never output markdown " +
+            "symbols, bullets, dashes, asterisks, or emoji."
 
         /**
          * Bank card identification rules.
@@ -373,12 +383,16 @@ Output 1-2 spoken sentences with spatial positioning. No filler, no formatting."
             "Public Bank, HSBC). Then state the card type (debit, credit, or ATM) " +
             "if visible. If you cannot clearly identify the bank or card type, say " +
             "exactly: I cannot identify this card clearly. NEVER guess or invent " +
-            "a bank name. Do not read or mention the card number."
+            "a bank name. Do not read or mention the card number. " +
+            "Reply as pure plain text for text to speech: never output markdown " +
+            "symbols, bullets, dashes, asterisks, or emoji."
 
         private const val CONTINUOUS_MODE_RULES =
             "Instant assistant. ONE short natural spoken sentence, about 15 words maximum: " +
             "the key objects, their positions and their states. Write a complete sentence " +
-            "with a verb, and end it with a period — never a comma-separated list."
+            "with a verb, and end it with a period — never a comma-separated list. " +
+            "Reply as pure plain text for text to speech: never output markdown " +
+            "symbols, bullets, dashes, asterisks, or emoji."
 
         /**
          * Text-only Q&A rules — used when NO camera frame is available
@@ -391,6 +405,8 @@ Output 1-2 spoken sentences with spatial positioning. No filler, no formatting."
             "available, so do NOT describe any scene, object, or text — answer " +
             "the question directly. Use clear punctuation: periods to end " +
             "sentences, commas for pauses. Keep the answer concise: 1-3 sentences. " +
+            "Reply as pure plain text for text to speech: never output markdown " +
+            "symbols, bullets, dashes, asterisks, or emoji. " +
             "If you do not know the answer, say 'I do not know that' — never guess."
 
         /**
