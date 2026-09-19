@@ -179,7 +179,18 @@ dependencies {
     // declares the agent/tool facades but nothing in production calls them
     // yet. The Android artifact REPLACES the JVM one — never add both
     // (per developer.android.com/ai/adk).
-    implementation("com.google.adk:google-adk-kotlin-core-android:0.2.0")
+    implementation("com.google.adk:google-adk-kotlin-core-android:0.2.0") {
+        // DEAD-DEPENDENCY EXCLUSION (offline-claim hardening):
+        // ADK transitively pulls com.google.mlkit:genai-prompt (Gemini Nano
+        // prompt API), which Vyze never imports — grep of the source tree
+        // shows zero com.google.mlkit.genai usage. genai-prompt drags
+        // Google's transport-backend-cct telemetry stack (and an
+        // android.permission.INTERNET manifest declaration) into every
+        // APK. Vyze performs no network communication; this removes one of
+        // the two INTERNET riders. The other comes from ML Kit OCR's own
+        // transport path — see docs/eval/OFFLINE_GUARANTEE.md.
+        exclude(group = "com.google.mlkit", module = "genai-prompt")
+    }
     // KSP processor that generates tool descriptors from @Tool-annotated
     // functions (consumed via generatedTools() in Phase 1).
     ksp("com.google.adk:google-adk-kotlin-processor:0.2.0")

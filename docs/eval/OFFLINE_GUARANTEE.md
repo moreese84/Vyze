@@ -31,10 +31,12 @@ in any APK.
 **Fact:** the merged release manifest DOES contain
 `android.permission.INTERNET` — but it is not declared by Vyze. It is
 merged in from Google's `com.google.android.datatransport:transport-backend-cct`,
-pulled transitively by `com.google.mlkit:genai-prompt` and the ML Kit
-text-recognition artifacts. Vyze's own code never invokes this transport;
-it is Google's telemetry plumbing, inert without an enqueuer (Vyze uses
-no Firebase/analytics).
+pulled transitively by the ML Kit text-recognition (OCR) and
+barcode-scanning artifacts. (A second rider previously came from
+`com.google.mlkit:genai-prompt` via Google ADK; that dead dependency was
+excluded — Vyze never imported `com.google.mlkit.genai`.) Vyze's own code
+never invokes this transport; it is Google's telemetry plumbing, inert
+without an enqueuer (Vyze uses no Firebase/analytics).
 
 **What this means for claims:**
 
@@ -60,6 +62,10 @@ aapt2 dump permissions app/build/outputs/apk/release/app-release.apk
 
 # Which component declared INTERNET (after any dependency change):
 grep -B 2 -A 2 INTERNET app/build/outputs/logs/manifest-merger-release-report.txt
+
+# Confirm the dead genai-prompt exclusion stays in effect (expect 0):
+./gradlew :app:dependencies --configuration releaseRuntimeClasspath \
+  | grep -c "genai-prompt"
 
 # Confirm the exporter never reaches release:
 grep -c InteractionLogExportReceiver \
