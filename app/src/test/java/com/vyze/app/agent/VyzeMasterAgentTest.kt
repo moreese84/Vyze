@@ -87,8 +87,47 @@ class VyzeMasterAgentTest {
         val p = ctx.instructionFor("what is paracetamol used for?")
         assertTrue(p.contains(VyzeQueryContext.DEFAULT_PERSONA_DIRECTIVE))
         assertTrue(p.contains(VyzeQueryContext.DEFAULT_ANSWER_STYLE_DIRECTIVE))
-        assertTrue(p.endsWith("User question: what is paracetamol used for?"))
+        assertTrue(p.contains("User question: what is paracetamol used for?"))
         assertEquals("adk_master", ctx.asSessionState()["lane"])
+    }
+
+    // ── Anti-echo + language-mirroring contract ─────────────────
+
+    @Test
+    fun `master instruction carries the strict anti-echo directive`() {
+        // Whitespace-normalized: the trimIndent block wraps lines, so
+        // contains() must ignore line breaks (case-insensitive too).
+        val i = VyzeMasterAgent.MASTER_INSTRUCTION.replace(Regex("\\s+"), " ").lowercase()
+        assertTrue(i.contains("never repeat, echo, or quote the user's query or question"))
+        assertTrue(i.contains("begin immediately with the direct description or answer"))
+    }
+
+    @Test
+    fun `master instruction carries the mandatory language mirroring rule`() {
+        val i = VyzeMasterAgent.MASTER_INSTRUCTION.replace(Regex("\\s+"), " ").lowercase()
+        assertTrue(i.contains("language mirroring"))
+        assertTrue(i.contains("respond strictly in that exact same language"))
+        assertTrue(i.contains("never revert to default english"))
+    }
+
+    @Test
+    fun `query context directives carry anti-echo and language mirroring`() {
+        val persona = VyzeQueryContext.DEFAULT_PERSONA_DIRECTIVE
+        val style = VyzeQueryContext.DEFAULT_ANSWER_STYLE_DIRECTIVE
+        for (d in listOf(persona, style)) {
+            assertTrue(d.contains("NEVER repeat, echo, or quote the user's query or question"))
+            assertTrue(d.contains("LANGUAGE MIRRORING"))
+            assertTrue(d.contains("Never revert to default English"))
+        }
+    }
+
+    @Test
+    fun `assembled master prompt ends with the no-echo output contract`() {
+        // Delimiter-audit contract: the raw user question must never be the
+        // last text before the generation boundary.
+        val p = VyzeQueryContext().instructionFor("what about this?")
+        assertTrue(p.endsWith(VyzeQueryContext.OUTPUT_CONTRACT_TAIL))
+        assertTrue(p.contains("never repeat, echo, or quote the question"))
     }
 
     // ── Bridge ────────────────────────────────────────────────────

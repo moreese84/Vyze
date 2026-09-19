@@ -50,6 +50,16 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
             } else {
                 sb.appendLine("[OUTPUT LANGUAGE: English] Write every word of your response in English. Do not continue in any other language.")
             }
+            // MANDATORY LANGUAGE MIRRORING (top of prompt = highest attention
+            // weight). DO NOT REMOVE: past fixes broke mirroring by leaving
+            // the rule to a single prompt layer — it is deliberately enforced
+            // here, in the bottom REMEMBER line, and in the engine/agent
+            // directives (VlmEngineManager, VyzeMasterAgent).
+            sb.appendLine(LANGUAGE_MIRRORING_MANDATE)
+            // STRICT ANTI-ECHO DIRECTIVE — kills the follow-up bug where the
+            // model began its spoken answer by playing the user's question
+            // back ("what about this.. this is ...").
+            sb.appendLine(ANTI_ECHO_DIRECTIVE)
             sb.appendLine()
 
             // 1. Inject appropriate rules based on query intent
@@ -106,9 +116,15 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
             //     instead of re-describing the whole scene from scratch.
             //     Injected only for genuine voice follow-ups (see controller).
             if (!dialogueContext.isNullOrBlank()) {
-                sb.appendLine("Recent conversation:")
+                // DELIMITER AUDIT: the history block is explicitly framed as
+                // read-only context with the echo prohibition inline, so its
+                // last "User:" line can never be mistaken for the start of
+                // the model's output prefix. The CURRENT query arrives
+                // separately in the Task line below — never inside this
+                // block, never adjacent to the generation boundary.
+                sb.appendLine("Recent conversation (context only — never repeat, echo, or quote these lines):")
                 sb.appendLine(dialogueContext)
-                sb.appendLine("This is a follow-up in an ongoing conversation. Resolve words like 'it', 'that', 'the one' using the conversation above. Answer the follow-up directly — do NOT re-describe the whole scene.")
+                sb.appendLine("This is a follow-up in an ongoing conversation. Resolve words like 'it', 'that', 'the one' using the conversation above. Answer the follow-up directly in the user's language — do NOT re-describe the whole scene, and NEVER repeat or echo the user's question at the start of your answer.")
                 sb.appendLine()
             }
 
@@ -125,9 +141,15 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
                 sb.appendLine()
             }
 
-            // 3. Task specification
+            // 3. Task specification.
+            //     ANTI-ECHO FIX: the old `Answer: "<query>"` line was a
+            //     quoted output preface sitting right before the generation
+            //     boundary — the model continued the pattern by replaying the
+            //     question. The query is now stated ONCE, unquoted, as input
+            //     to answer, and the output contract bans question playback.
             if (isDirectQuery) {
-                sb.appendLine("Answer: \"$queryOverride\"")
+                sb.appendLine("Task: The user asked: $queryOverride")
+                sb.appendLine(TASK_OUTPUT_CONTRACT)
             } else {
                 sb.appendLine(DEFAULT_NAVIGATION_QUERY)
             }
@@ -144,7 +166,7 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
 
             // 4. Language mirror — reinforce at bottom (ALL languages now:
             //    symmetric anchor, English included — see the top mirror note)
-            sb.appendLine("REMEMBER: Respond only in $langName.")
+            sb.appendLine("REMEMBER: Respond only in $langName. Begin immediately with the answer itself — never repeat or echo the user's question.")
 
             val prompt = sb.toString()
             Log.d(TAG, "Built prompt: ${prompt.length} chars, " +
@@ -350,12 +372,17 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
         // buildPrompt runs on every capture; re-concatenating identical
         // immutable strings each turn is pure allocation churn. The six
         // static blocks are built once (lazy = thread-safe) and reused.
-        private val navRulesEn by lazy { NAV_RULES_PROSE + NAV_EXAMPLES_EN }
-        private val navRulesMs by lazy { NAV_RULES_PROSE + NAV_EXAMPLES_MS }
-        private val navRulesZh by lazy { NAV_RULES_PROSE + NAV_EXAMPLES_ZH }
-        private val directRulesEn by lazy { DIRECT_RULES_PROSE + DIRECT_EXAMPLES_EN }
-        private val directRulesMs by lazy { DIRECT_RULES_PROSE + DIRECT_EXAMPLES_MS }
-        private val directRulesZh by lazy { DIRECT_RULES_PROSE + DIRECT_EXAMPLES_ZH }
+        // EACH block now appends the multi-turn FEW-SHOT FOLLOW-UP examples
+        // in the same language (EN block -> EN examples, MS block -> MS
+        // examples, ...) so the demonstrated structure, the demonstrated
+        // output language, and the demonstrated no-echo behavior always
+        // match what the model must produce.
+        private val navRulesEn by lazy { NAV_RULES_PROSE + NAV_EXAMPLES_EN + "\n\n" + FOLLOWUP_EXAMPLES_EN }
+        private val navRulesMs by lazy { NAV_RULES_PROSE + NAV_EXAMPLES_MS + "\n\n" + FOLLOWUP_EXAMPLES_MS }
+        private val navRulesZh by lazy { NAV_RULES_PROSE + NAV_EXAMPLES_ZH + "\n\n" + FOLLOWUP_EXAMPLES_ZH }
+        private val directRulesEn by lazy { DIRECT_RULES_PROSE + DIRECT_EXAMPLES_EN + "\n\n" + FOLLOWUP_EXAMPLES_EN }
+        private val directRulesMs by lazy { DIRECT_RULES_PROSE + DIRECT_EXAMPLES_MS + "\n\n" + FOLLOWUP_EXAMPLES_MS }
+        private val directRulesZh by lazy { DIRECT_RULES_PROSE + DIRECT_EXAMPLES_ZH + "\n\n" + FOLLOWUP_EXAMPLES_ZH }
 
         /** Navigation rules with few-shot examples in the user's language. */
         private fun navigationRulesFor(language: String): String = when (language) {
@@ -438,11 +465,71 @@ Output 1 to 2 spoken sentences with spatial positioning. Your reply is read alou
             "If you do not know the answer, say 'I do not know that' — never guess."
 
         /**
-         * Language mirror directive — forces Gemma to respond in the same
-         * language as the user's spoken query. {lang} is replaced dynamically
-         * with the detected language name (e.g., "Malay", "Chinese").
+         * FEW-SHOT FOLLOW-UP EXAMPLES (EN) — multi-turn demonstrations of
+         * clean follow-ups WITHOUT question echoing. The "Vyze:" label
+         * intentionally matches the injected dialogue history format from
+         * VyzeCoreController.dialogueContextForPrompt, so the demonstrated
+         * format is exactly the format the model sees on real follow-ups.
          */
-        private const val LANGUAGE_MIRROR_DIRECTIVE =
-            "[OUTPUT LANGUAGE: {lang}] Write every word in {lang}. No English."
+        private const val FOLLOWUP_EXAMPLES_EN =
+            "Follow-up conversation examples (continue the exchange; answer ONLY the " +
+            "newest question, in the SAME language it was asked, and NEVER repeat or echo " +
+            "the user's question):\n" +
+            "User: What is in front of me?\n" +
+            "Vyze: A coffee mug on the desk.\n" +
+            "User: What about this?\n" +
+            "Vyze: That is a pair of reading glasses."
+
+        /** FEW-SHOT FOLLOW-UP EXAMPLES (MS) — same exchange, Malay mirroring. */
+        private const val FOLLOWUP_EXAMPLES_MS =
+            "Contoh perbualan susulan (sambungkan pertukaran ini; jawab HANYA soalan " +
+            "terbaharu, dalam BAHASA YANG SAMA, dan JANGAN sesekali ulang atau gema " +
+            "soalan pengguna):\n" +
+            "User: Apa kat depan saya?\n" +
+            "Vyze: Sebiji cawan kopi di atas meja.\n" +
+            "User: Bagaimana dengan ini?\n" +
+            "Vyze: Itu sepasang cermin mata membaca."
+
+        /** FEW-SHOT FOLLOW-UP EXAMPLES (ZH) — same exchange, Chinese mirroring. */
+        private const val FOLLOWUP_EXAMPLES_ZH =
+            "Follow-up conversation examples (continue the exchange; answer ONLY the " +
+            "newest question, in the SAME language it was asked, and NEVER repeat or echo " +
+            "the user's question):\n" +
+            "User: 我前面有什么？\n" +
+            "Vyze: 桌上有一个咖啡杯。\n" +
+            "User: 那这个呢？\n" +
+            "Vyze: 那是一副老花眼镜。"
+
+        /**
+         * STRICT ANTI-ECHOING DIRECTIVE — the negative constraint for the
+         * follow-up echo bug. Injected at the TOP of every prompt (highest
+         * attention weight) and echoed again in the bottom REMEMBER line.
+         */
+        private const val ANTI_ECHO_DIRECTIVE =
+            "CRITICAL: NEVER repeat, echo, or quote the user's query or question at the " +
+            "start of your response. Begin immediately with the direct description or answer."
+
+        /**
+         * MANDATORY LANGUAGE MIRRORING RULE (DO NOT BREAK). Past fixes
+         * regressed mirroring when this rule lived in only one prompt layer;
+         * it is now injected at the top of EVERY prompt, in the bottom
+         * REMEMBER line, AND in the engine/agent system directives
+         * (VlmEngineManager, VyzeMasterAgent) so no refactor can silently
+         * drop it again.
+         */
+        private const val LANGUAGE_MIRRORING_MANDATE =
+            "LANGUAGE MIRRORING: You MUST detect the language of the user's query and " +
+            "respond strictly in that exact same language (e.g., Malay query -> Malay " +
+            "response, English query -> English response, Chinese query -> Chinese " +
+            "response). Never revert to default English if the user speaks another language."
+
+        /**
+         * Output contract placed DIRECTLY under the current query — the last
+         * words the model reads before the generation boundary, where the
+         * echo behavior used to trigger.
+         */
+        private const val TASK_OUTPUT_CONTRACT =
+            "Respond with the answer only: never repeat, echo, or quote the question, " +
+            "never restate the task, and write every word in the user's language."
     }
 }

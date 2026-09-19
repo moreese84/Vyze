@@ -72,7 +72,13 @@ class VyzeAgentLiveRouteTest {
         )
         assertTrue(
             "prompt must end with the raw user question",
-            gotPrompt!!.endsWith("User question: what is paracetamol used for?")
+            gotPrompt!!.contains("User question: what is paracetamol used for?")
+        )
+        // Delimiter audit: the no-echo output contract is the final text
+        // before the generation boundary — never the raw user question.
+        assertTrue(
+            "prompt must end with the no-echo output contract",
+            gotPrompt!!.endsWith(VyzeQueryContext.OUTPUT_CONTRACT_TAIL)
         )
         // Episode closed after the generation.
         assertEquals(0, rt.episodes.size())

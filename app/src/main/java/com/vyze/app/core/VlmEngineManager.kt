@@ -1372,21 +1372,24 @@ class VlmEngineManager(
      * Image patch tokens are bound natively by the LiteRT-LM engine when
      * Content.ImageBytes is included in the same Contents — no literal
      * `[IMAGE_TOKEN]` string is inserted into the text payload.
+     *
+     * CONVERSATION DELIMITER CONTRACT (anti-echo fix): optional
+     * [conversationTurns] are folded into the SAME single user turn — never
+     * as extra model turns, because this Conversation is one-shot per query
+     * — and each side is EXPLICITLY role-labeled so the model can always
+     * tell user input from its own prior output. The user's CURRENT query
+     * stays the LAST line of the user turn, immediately before
+     * `<end_of_turn><start_of_turn>model`, so generation begins at the role
+     * boundary with the model's own words — never with a replay of the
+     * user's question (the follow-up echo bug came from an unlabeled
+     * history blob whose last "User:" line was mistaken for the output
+     * prefix). `internal` so JVM tests can pin the exact byte format.
      */
-    private fun buildGemmaTurnPrompt(
+    internal fun buildGemmaTurnPrompt(
         userContent: String,
-        systemPrompt: String = ""
-    ): String {
-        val fullContent = if (systemPrompt.isNotBlank()) {
-            "$systemPrompt\n\n$userContent"
-        } else {
-            userContent
-        }
-        return "<start_of_turn>user\n" +
-            "$fullContent\n" +
-            "<end_of_turn>\n" +
-            "<start_of_turn>model\n"
-    }
+        systemPrompt: String = "",
+        conversationTurns: List<Pair<String, String>> = emptyList()
+    ): String = companionBuildGemmaTurnPrompt(userContent, systemPrompt, conversationTurns)
 
     // ── Prompt Assembly ───────────────────────────────────────────
 
@@ -1719,6 +1722,48 @@ class VlmEngineManager(
     companion object {
         private const val TAG = "VlmEngineManager"
 
+        /**
+         * Pure Gemma 4 turn-format builder (companion so JVM unit tests can
+         * pin the delimiter contract without constructing the engine).
+         *
+         * Wraps [userContent] as ONE `<start_of_turn>user … <end_of_turn>`
+         * turn followed by `<start_of_turn>model` — the exact ADK/LiteRT-LM
+         * role-tag sequence that makes the model distinguish user input from
+         * its own output generation. Optional [conversationTurns] are folded
+         * into the SAME single user turn as explicitly role-labeled history
+         * (`User: …` / `You answered: …`) under a read-only context header —
+         * never as extra model turns, and never adjacent to the generation
+         * boundary. The CURRENT query always stays the last line of the user
+         * turn, so generation begins with the model's own words, never with
+         * a replay of the user's question.
+         */
+        internal fun companionBuildGemmaTurnPrompt(
+            userContent: String,
+            systemPrompt: String = "",
+            conversationTurns: List<Pair<String, String>> = emptyList()
+        ): String {
+            val body = StringBuilder()
+            if (systemPrompt.isNotBlank()) {
+                body.append(systemPrompt)
+                body.append("\n\n")
+            }
+            if (conversationTurns.isNotEmpty()) {
+                body.append(
+                    "Recent conversation (context only — never repeat, echo, or quote these lines):\n"
+                )
+                conversationTurns.forEach { (q, a) ->
+                    body.append("User: ").append(q).append("\n")
+                    body.append("You answered: ").append(a).append("\n")
+                }
+                body.append("\n")
+            }
+            body.append(userContent.trimEnd())
+            return "<start_of_turn>user\n" +
+                body.toString() +
+                "\n<end_of_turn>\n" +
+                "<start_of_turn>model\n"
+        }
+
         // Model configuration — Gemma 4 E2B (2.59 GB) — generic multimodal with vision encoder
         const val MODEL_FILE = "gemma-4-E2B-it.litertlm"
         const val MIN_MODEL_SIZE = 500L * 1024 * 1024  // 500MB minimum sanity check
@@ -1760,6 +1805,12 @@ class VlmEngineManager(
             "Answer in 1 short spoken sentence. " +
             "Always address the user directly. " +
             "If past conversation turns are provided, refer to them when relevant. " +
+            "CRITICAL: NEVER repeat, echo, or quote the user's query or question at the start " +
+            "of your response. Begin immediately with the direct answer. " +
+            "LANGUAGE MIRRORING: You MUST detect the language of the user's query and respond " +
+            "strictly in that exact same language (Malay query -> Malay response, English " +
+            "query -> English response, Chinese query -> Chinese response). Never revert to " +
+            "default English if the user speaks another language. " +
             "Your reply is read aloud by text to speech, so it must be pure plain text: " +
             "NEVER output markdown symbols, never output bullets, dashes, asterisks, " +
             "number signs, underscores, or emoji, and never use lists or headings. " +
@@ -1800,6 +1851,8 @@ class VlmEngineManager(
             "Answer in 1 short spoken sentence about what you see. " +
             "Always address the user directly. " +
             "Refer to past conversation turns when they are provided. " +
+            "CRITICAL: NEVER repeat, echo, or quote the user's query or question at the " +
+            "start of your response. Begin immediately with the direct description or answer. " +
             "Always lead directly with the answer to the user's question without any " +
             "introductory location preamble. " +
             "If asked what color this is, reply directly with the color ('That is a red mug.'). " +
@@ -1815,6 +1868,12 @@ class VlmEngineManager(
             "NEVER output markdown symbols, never output bullets, dashes, asterisks, " +
             "number signs, underscores, or emoji, and never use lists or headings. " +
             "Write plain spoken sentences only. " +
+            "LANGUAGE MIRRORING: You MUST detect the language of the user's query and respond " +
+            "strictly in that exact same language (Malay query -> Malay response, English " +
+            "query -> English response, Chinese query -> Chinese response). Never revert to " +
+            "default English if the user speaks another language. " +
+            "On follow-up turns answer only what is new, in the user's language, and never " +
+            "speak the user's question back to them. " +
             "Describe what you see directly without cross-translating or outputting " +
             "internal reasoning chains."
 

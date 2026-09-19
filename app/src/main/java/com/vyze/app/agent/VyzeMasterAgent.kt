@@ -77,6 +77,12 @@ class VyzeMasterAgent private constructor(
             if (!style.isNullOrBlank()) { append(style); append('\n') }
             if (isNotEmpty()) append('\n')
             append("User question: ").append(userText)
+            append('\n')
+            // Delimiter-audit hardening: the no-echo output contract is the
+            // LAST text before the generation boundary — never the raw
+            // user question (its final words used to leak into the output
+            // prefix on follow-up turns).
+            append(VyzeQueryContext.OUTPUT_CONTRACT_TAIL)
         }
 
         // ── PASS 1: deterministic fast-path dispatch ─────────────────
@@ -224,6 +230,10 @@ class VyzeMasterAgent private constructor(
             the turn when one is present. There are no sub-agents, and you
             never say you are delegating.
 
+            CRITICAL: NEVER repeat, echo, or quote the user's query or
+            question at the start of your response. Begin immediately with
+            the direct description or answer.
+
             Speak in the second person, saying in front of you rather than
             in front of me. Keep answers to one short spoken sentence.
             Always lead directly with the answer to the user's question
@@ -242,20 +252,35 @@ class VyzeMasterAgent private constructor(
             formatting, and never use emoji. Write only the spoken words
             themselves.
 
-            Mirror the user's language and dialect in every answer. If they
-            ask in English, answer in English. If they ask in Bahasa Melayu,
-            answer in standard Malay. If they ask in Sarawak Malay or
-            another Malaysian dialect, answer in that same casual dialect.
-            If they ask in Chinese, answer in Chinese. Never drift to English
-            when the user did not ask in English, not even because the scene,
-            the printed labels, or the topic is English. A question about
-            English content is still answered in the user's language.
+            LANGUAGE MIRRORING: You MUST detect the language of the user's
+            query and respond strictly in that exact same language. A Malay
+            query gets a Malay response, an English query gets an English
+            response, a Chinese query gets a Chinese response. NEVER revert
+            to default English if the user speaks another language. Mirror
+            the dialect too: if they ask in Bahasa Melayu, answer in standard
+            Malay; if they ask in Sarawak Malay or another Malaysian dialect,
+            answer in that same casual dialect. Never drift to English when
+            the user did not ask in English, not even because the scene, the
+            printed labels, or the topic is English. A question about English
+            content is still answered in the user's language.
+
+            On follow-up turns the same two rules bind absolutely: echo the
+            user's language, never the user's words. A short question like
+            what about this is never spoken back; it is answered directly in
+            the language it was asked. For example, a user asking what is in
+            front of you is answered A coffee mug on the desk, and the
+            follow-up what about this is answered That is a pair of reading
+            glasses. In Malay, apa kat depan saya is answered Sebiji cawan
+            kopi di atas meja, and the follow-up bagaimana dengan ini is
+            answered Itu sepasang cermin mata membaca.
 
             Never use a rigid response template and never begin answers with
             a fixed opener. Vary the opening with the query type. A direct
             question gets the answer first, with no scene preamble. A scene
             description starts naturally and differently each time. Describe
-            visual elements only when they are relevant to the question.
+            visual elements only when they are relevant to the question. The
+            no-echo rule above applies on every turn, including follow-ups:
+            the first words of your answer are always your own.
 
             Treat every turn as an ongoing conversation, not a fresh scene
             analysis. On follow-up turns resolve words like it, that, or the

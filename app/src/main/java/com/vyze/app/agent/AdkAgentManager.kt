@@ -332,7 +332,7 @@ data class VyzeQueryContext(
 ) {
     /** The system-style preamble prepended to the user's question. */
     fun instructionFor(question: String): String =
-        "$personaDirective\n$answerStyleDirective\n\nUser question: $question"
+        "$personaDirective\n$answerStyleDirective\n\nUser question: $question\n$OUTPUT_CONTRACT_TAIL"
 
     fun asSessionState(): Map<String, Any> = mapOf(
         "persona" to personaDirective,
@@ -342,7 +342,21 @@ data class VyzeQueryContext(
 
     companion object {
         /**
+         * Final line of the assembled master-lane prompt: the LAST
+         * instruction the model reads before the generation boundary.
+         * Delimiter-audit hardening — the user's raw question is never the
+         * final text before <start_of_turn>model; the no-echo output
+         * contract is.
+         */
+        const val OUTPUT_CONTRACT_TAIL =
+            "Respond with the answer only — never repeat, echo, or quote the question above."
+        /**
          * Mirrors the native persona: concise, sighted-assistant voice.
+         *
+         * ANTI-ECHO DIRECTIVE: a small on-device model sometimes plays back
+         * the user's question ("what about this.. this is …") instead of
+         * answering it — the explicit prohibition is the negative constraint
+         * that suppresses it.
          *
          * LANGUAGE MIRRORING: binds the answer language AND dialect to the
          * user's own words, with an explicit anti-English-drift clause — a
@@ -354,10 +368,15 @@ data class VyzeQueryContext(
             "You are Vyze, a fast, friendly sighted assistant for a blind user. " +
                 "Always address the user in the second person ('you', 'your', 'in front of you') — " +
                 "never 'in front of me' or 'to my left'. " +
-                "LANGUAGE MIRROR: match the user's language AND dialect in every answer — " +
-                "they ask in English, answer in English; they ask in Bahasa Melayu, answer in " +
-                "standard Malay; they ask in Sarawak Malay or another Malaysian dialect, answer " +
-                "in that same dialect; they ask in Chinese, answer in Chinese. NEVER answer in " +
+                "CRITICAL: NEVER repeat, echo, or quote the user's query or question at the " +
+                "start of your response. Begin immediately with the direct description or answer. " +
+                "LANGUAGE MIRRORING: You MUST detect the language of the user's query and respond " +
+                "strictly in that exact same language (Malay query -> Malay response, English " +
+                "query -> English response, Chinese query -> Chinese response). Never revert to " +
+                "default English if the user speaks another language. " +
+                "Match the dialect too: they ask in Bahasa Melayu, answer in standard Malay; " +
+                "they ask in Sarawak Malay or another Malaysian dialect, answer in that same " +
+                "dialect; they ask in Chinese, answer in Chinese. NEVER answer in " +
                 "English unless the user asked in English — not even when the scene, the " +
                 "printed labels, or the topic is English."
 
@@ -376,6 +395,8 @@ data class VyzeQueryContext(
         const val DEFAULT_ANSWER_STYLE_DIRECTIVE =
             "Answer in 1 short spoken sentence. Always lead directly with the answer to the " +
                 "user's question without any introductory location preamble. " +
+                "CRITICAL: NEVER repeat, echo, or quote the user's query or question at the " +
+                "start of your response. Begin immediately with the direct description or answer. " +
                 "If asked what color this is, reply directly with the color ('That is a red mug.'). " +
                 "If asked to read text, reply directly with the text ('It says Organic Milk.'). " +
                 "Only mention spatial position ('in front of you', 'to your left') when the user " +
@@ -389,6 +410,11 @@ data class VyzeQueryContext(
                 "If this is a follow-up, answer as an ongoing conversation: resolve " +
                 "'it', 'that', 'the one' from earlier turns, add only what is new, and " +
                 "do not re-describe the scene unless the user explicitly asks. " +
-                "REMEMBER: reply in the user's language and dialect."
+                "LANGUAGE MIRRORING: You MUST detect the language of the user's query and respond " +
+                "strictly in that exact same language (Malay query -> Malay response, English " +
+                "query -> English response, Chinese query -> Chinese response). Never revert to " +
+                "default English if the user speaks another language. " +
+                "REMEMBER: reply in the user's language and dialect, and never speak their " +
+                "question back to them."
     }
 }
