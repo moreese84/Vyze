@@ -1,0 +1,6 @@
+# Real device transcripts may contain sensitive context — never commit them.
+corpus/*
+!corpus/.gitkeep
+
+# Harness outputs (frozen test fixtures in later phases are added explicitly)
+out/

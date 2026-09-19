@@ -1,6 +1,7 @@
 package com.vyze.app.agent
 
 import android.util.Log
+import com.vyze.app.agent.student.StudentRouter
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -132,7 +133,7 @@ object VyzeShadowRouter {
         val lower = text.lowercase()
         val isReadIntent = READ_KEYWORDS.any { lower.contains(it) }
 
-        return if (isReadIntent) {
+        val decision: RouterDecision = if (isReadIntent) {
             RouterDecision(
                 action = RouterDecision.Action.VLM_TEXT_READ,
                 reason = "reading keyword (legacy: OCR pipeline still-capture path)",
@@ -140,13 +141,21 @@ object VyzeShadowRouter {
                 includeCameraFrame = true,
             )
         } else {
-            RouterDecision(
-                action = RouterDecision.Action.VLM_VOICE_QUERY,
-                reason = "general voice query (legacy: openVoiceQuery session)",
-                requiresVlm = true,
-                includeCameraFrame = true,
-            )
-        }.let { d ->
+            // STUDENT ROUTER (Phase 3 distillation of the Phase 0 Jev
+            // harness labels): the legacy read check has already run, so
+            // the student only classifies the previously-unclassifiable
+            // middle (scene openers, color/light asks, out-of-domain).
+            // Its catch-all is VLM_VOICE_QUERY — the exact legacy
+            // fallback — so unseen queries keep legacy behavior, and the
+            // agent-lane grant gate (VLM_VOICE_QUERY only) still declines
+            // every non-catch-all decision to the native dispatch.
+            StudentRouter.decide(text).let { d ->
+                if (d.action == RouterDecision.Action.VLM_VOICE_QUERY) d.copy(
+                    reason = "general voice query (legacy: openVoiceQuery session)",
+                ) else d
+            }
+        }
+        return decision.let { d ->
             if (!snapshot.engineReady) d.copy(
                 reason = d.reason + " | engine NOT ready → legacy error-announce path",
             ) else d

@@ -1,0 +1,6 @@
+{"id": "s1", "lang": "en", "query": "What is in front of me?", "previous": null, "answer": "A coffee mug on the desk."}
+{"id": "s2", "lang": "en", "query": "What about this?", "previous": "What is in front of me?", "answer": "what about this.. this is a pair of reading glasses."}
+{"id": "s3", "lang": "ms", "query": "Apa kat depan saya?", "previous": null, "answer": "Sebiji cawan kopi di atas meja."}
+{"id": "s4", "lang": "ms", "query": "Bagaimana dengan ini?", "previous": "Apa kat depan saya?", "answer": "That is a pair of reading glasses."}
+{"id": "s5", "lang": "zh", "query": "我面前是什么？", "previous": null, "answer": "你面前有一张桌子和一个杯子。"}
+{"id": "s6", "lang": "en", "query": "What does this label say?", "previous": null, "answer": "It says Organic Milk, one litre."}

@@ -85,7 +85,8 @@ store/kit/node_modules/
 !store/kit/out/**
 
 # Local doc/pitch-deck generator scripts
-tools/
+tools/*
+!tools/jev_harness
 
 # AI-tool local config dirs
 .commandcode/
