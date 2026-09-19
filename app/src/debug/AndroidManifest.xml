@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    DEBUG-ONLY manifest additions (src/debug source set).
+
+    Nothing in this file merges into the release variant: no INTERNET
+    permission, no extra components — the release APK stays 100% offline
+    by construction. The receiver exists solely so a development machine
+    can pull recorded transcripts for the Jev harness:
+
+        adb shell am broadcast \
+            -n com.vyze.app/.debug.InteractionLogExportReceiver
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application>
+        <!--
+            exported=true is deliberate: it only exists in debug builds and
+            the receiver's only effect is a local-file export. Explicit
+            component targeting required (no intent-filter — no implicit
+            pickup by any other app... which also doesn't ship this class).
+        -->
+        <receiver
+            android:name="com.vyze.app.debug.InteractionLogExportReceiver"
+            android:exported="true" />
+    </application>
+
+</manifest>

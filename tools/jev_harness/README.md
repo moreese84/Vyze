@@ -1,10 +1,11 @@
 # Vyze × TypeSafe Jev harness (Phase 0)
 
 **Jev is cloud-only and runs on the dev machine. Nothing in this folder ever
-ships in the APK** — the release binary stays 100% offline, with no INTERNET
-permission and no network code. The harness exists to (a) audit the prompt
-pipeline and (b) produce the labeled corpus from which the offline **student
-router** (Phase 3) is distilled.
+ships in the APK** — the release binary contains no Jev code and no network
+code of ours (the precise offline guarantee, including one documented
+library-level exception, lives in `docs/eval/OFFLINE_GUARANTEE.md`). The
+harness exists to (a) audit the prompt pipeline and (b) produce the labeled
+corpus from which the offline **student router** (Phase 3) is distilled.
 
 ## Architecture in one line
 
@@ -70,9 +71,21 @@ Two corpus kinds:
 1. **Seed corpus** (`queries.py`, committed): hand-written, balanced, safe
    to commit.
 2. **Device corpus** (`corpus/`, git-ignored): real dogfooding transcripts
-   exported from the `interaction_records` table (Phase 1's debug-only
-   JSONL export). **Never commit real usage transcripts** — they can
-   contain health/banking context.
+   from the debug-only on-device export. **Never commit real usage
+   transcripts** — they can contain health/banking context.
+
+   Workflow (debug build installed on the test device):
+
+   ```sh
+   adb shell am broadcast -n com.vyze.app/.debug.InteractionLogExportReceiver
+   adb pull /sdcard/Android/data/com.vyze.app/files/jev_export/ corpus/
+   python -m tools.jev_harness audit --corpus corpus/jev_export/<file>.jsonl --live
+   ```
+
+   The exporter merges both transcript stores (camera-lane
+   `interaction_records` + text-lane `vyze_memory` interaction rows),
+   threads follow-up adjacency into `previous`, and never emits the built
+   VLM prompt — only the extracted user query and the spoken answer.
 
 ## Known limits (documented, not discovered-the-hard-way)
 
