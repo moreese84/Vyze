@@ -18,7 +18,12 @@ import json
 import time
 from pathlib import Path
 
-from .audit_judgment import audit_questions, build_state as audit_state, extract as audit_extract
+from .audit_judgment import (
+    audit_questions,
+    build_state as audit_state,
+    extract as audit_extract,
+    lane_of,
+)
 from .regex_baseline import decide_speech
 from .router_judgment import build_state as route_state, extract as route_extract, route_questions
 
@@ -106,9 +111,13 @@ def audit_transcripts(items: list[dict], *, live: bool, model: str = MODEL_DEFAU
                       sleep_s: float = 0.2) -> list[dict]:
     """Audit (query, answer) transcript rows for contract compliance.
 
-    Rows need: query, answer; optional: previous, lang.
+    Rows need: query, answer; optional: previous, lang, lane.
     Thresholds default to 0.5 (the probability midpoint) — they are run
     parameters, NOT universal rules; sweep them in reports if needed.
+
+    Lane handling (v2): tap-lane rows ("User tapped at position …") carry
+    no spoken language, so their language-mirror judgment is recorded but
+    NEVER counted as a mismatch — only echo and relevance still apply.
     """
     usable = [i for i in items if i.get("answer") is not None]
     skipped = len(items) - len(usable)
@@ -121,6 +130,7 @@ def audit_transcripts(items: list[dict], *, live: bool, model: str = MODEL_DEFAU
             rows.append({
                 "id": item.get("id"), "lang": item.get("lang"),
                 "query": item["query"], "answer": item["answer"],
+                "lane": lane_of(item),
                 "audit_echoed_noul": None, "audit_language_match_noul": None,
                 "audit_relevance_level": None, "audit_relevance_probabilities": None,
                 "error": "dry-run",
@@ -131,7 +141,8 @@ def audit_transcripts(items: list[dict], *, live: bool, model: str = MODEL_DEFAU
     with client:
         for i, item in enumerate(items):
             row = {"id": item.get("id"), "lang": item.get("lang"),
-                   "query": item["query"], "answer": item["answer"]}
+                   "query": item["query"], "answer": item["answer"],
+                   "lane": lane_of(item)}
             try:
                 result = client.system_one(
                     state=audit_state(item), questions=audit_questions(),
@@ -139,7 +150,8 @@ def audit_transcripts(items: list[dict], *, live: bool, model: str = MODEL_DEFAU
                 row.update(audit_extract(result))
                 row["echoed_flag"] = row["audit_echoed_noul"] >= echo_threshold
                 row["language_mismatch_flag"] = (
-                    row["audit_language_match_noul"] < lang_threshold
+                    row["lane"] != "tap"
+                    and row["audit_language_match_noul"] < lang_threshold
                 )
                 row["error"] = None
             except Exception as exc:  # noqa: BLE001

@@ -883,6 +883,8 @@ class MainActivity : AppCompatActivity() {
 
         // Signal A: High-frequency function words
         // These appear in virtually every Malay sentence and never in English.
+        // (v2: followed by Signal A2 ASR-garble aliases and Signal A3
+        // fused-word evidence — see the device audit findings.)
         val malayFunctionWords = setOf(
             "saya", "kami", "kita", "anda", "kamu", "mereka",  // pronouns
             "tidak", "tak", "bukan", "jangan", "belum",        // negation
@@ -894,6 +896,7 @@ class MainActivity : AppCompatActivity() {
             "sudah", "sedang", "akan", "baru", "lagi",        // tense/aspect
             "boleh", "mahu", "nak", "perlu", "mesti",         // modals
             "ini", "apa", "siapa", "mana", "kenapa",          // question words
+            "pula",                                              // follow-up marker ("X pula?" = "what about X?")
             "bila", "berapa", "mengapa",
             "ada", "depan", "belakang"                        // Phase 3: short-query coverage
         )
@@ -901,6 +904,44 @@ class MainActivity : AppCompatActivity() {
             val cleaned = word.replace(Regex("[^a-z]"), "")
             if (cleaned in malayFunctionWords) {
                 malayScore += 2  // high confidence signal
+            }
+        }
+
+        // Signal A2: ASR-garble aliases (v2 — device audit ir_6).
+        // On English-default phones the recognizer mangles Malay speech into
+        // near-misses the exact-match lookup above cannot see: the real query
+        // "inipula appa" (Ini pula apa?) scored ZERO — every Malay token was
+        // corrupted — and the answer came back English. Aliases stay narrow
+        // (exact garble forms observed in the wild); no fuzzy similarity, to
+        // avoid false-positive English matches.
+        val malayGarbleAliases = mapOf(
+            "appa" to "apa",   // 'apa' through an English acoustic model (ir_6)
+            "apah" to "apa",   // aspirated variant of the same failure
+        )
+        for (word in words) {
+            val cleaned = word.replace(Regex("[^a-z]"), "")
+            if (malayGarbleAliases.containsKey(cleaned)) {
+                malayScore += 2
+            }
+        }
+
+        // Signal A3: fused-word evidence (v2 — same audit row).
+        // ASR often merges Malay words without spaces ("inipula" = "ini pula")
+        // or transcribes run-together speech as one token. A Malay function
+        // word found INSIDE a longer token scores +1 (capped at 2 total) —
+        // enough to rescue "inipula" alongside an alias hit, too weak for a
+        // single English word that merely contains a short Malay string.
+        if (malayScore < 4) {
+            for (word in words) {
+                val cleaned = word.replace(Regex("[^a-z]"), "")
+                if (cleaned.length < 5) continue
+                val fused = malayFunctionWords.any { fn ->
+                    fn.length >= 3 && cleaned != fn && cleaned.contains(fn)
+                }
+                if (fused) {
+                    malayScore += 1
+                    if (malayScore >= 4) break
+                }
             }
         }
 

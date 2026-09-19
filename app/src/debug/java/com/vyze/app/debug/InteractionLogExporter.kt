@@ -66,12 +66,13 @@ object InteractionLogExporter {
                 r.timestamp,
                 InteractionLogRow(
                     id = "ir_${r.id}",
-                    lang = "unknown",
+                    lang = InteractionLogRow.inferLanguage(query),
                     query = query,
                     answer = r.output,
                     previous = null, // threaded below
                     ts = r.timestamp,
                     source = "interaction_records",
+                    lane = InteractionLogRow.laneOf(query),
                 ),
             )
         }
@@ -81,12 +82,13 @@ object InteractionLogExporter {
                 m.timestamp,
                 InteractionLogRow(
                     id = "vm_${m.id}",
-                    lang = "unknown",
+                    lang = InteractionLogRow.inferLanguage(m.metadata),
                     query = m.metadata,
                     answer = m.value,
                     previous = null, // threaded below
                     ts = m.timestamp,
                     source = "vyze_memory",
+                    lane = InteractionLogRow.laneOf(m.metadata),
                 ),
             )
         }

@@ -66,7 +66,7 @@ class InteractionLogRowTest {
         assertTrue(json.contains("\"previous\": \"What is in front of me?\""))
         assertTrue(json.contains("\"answer\": \"That is a pair of reading glasses.\""))
         assertTrue(json.contains("\"ts\": 1700000000000"))
-        assertTrue(json.endsWith(", \"source\": \"interaction_records\"}"))
+        assertTrue(json.endsWith(", \"source\": \"interaction_records\", \"lane\": \"voice\"}"))
     }
 
     @Test
@@ -104,5 +104,59 @@ class InteractionLogRowTest {
         val json = row.toJson()
         assertTrue(json.contains("\"query\": \"那这个呢？\""))
         assertTrue(json.contains("\"previous\": \"我面前是什么？\""))
+    }
+
+    // ── laneOf: voice vs tap classification (v2) ──────────────────
+
+    @Test
+    fun `laneOf classifies tap queries by the CameraFragment prefix`() {
+        assertEquals(
+            InteractionLogRow.LANE_TAP,
+            InteractionLogRow.laneOf("User tapped at position (679, 1487)"),
+        )
+        assertEquals(InteractionLogRow.LANE_VOICE, InteractionLogRow.laneOf("what about this"))
+        assertEquals(InteractionLogRow.LANE_VOICE, InteractionLogRow.laneOf("apa kat depan saya?"))
+        assertEquals(InteractionLogRow.LANE_VOICE, InteractionLogRow.laneOf(""))
+    }
+
+    // ── inferLanguage: pure language detection (v2) ───────────────
+
+    @Test
+    fun `inferLanguage recovers the garbled Malay query from the device audit`() {
+        // THE v2 regression: ir_6. "inipula appa" (Ini pula apa?) scored
+        // zero under v1 detection → answered in English. The alias (appa)
+        // plus fused-word evidence (inipula ⊃ pula/ini) must now reach ms.
+        assertEquals("ms", InteractionLogRow.inferLanguage("inipula appa"))
+    }
+
+    @Test
+    fun `inferLanguage detects clean Malay queries`() {
+        assertEquals("ms", InteractionLogRow.inferLanguage("apa kat depan saya?"))
+        assertEquals("ms", InteractionLogRow.inferLanguage("APA Ini"))
+        assertEquals("ms", InteractionLogRow.inferLanguage("tolong baca label"))
+        assertEquals("ms", InteractionLogRow.inferLanguage("apa ini pula"))
+    }
+
+    @Test
+    fun `inferLanguage detects English and Chinese`() {
+        assertEquals("en", InteractionLogRow.inferLanguage("What is in front of me?"))
+        assertEquals("en", InteractionLogRow.inferLanguage("what about this"))
+        assertEquals("zh", InteractionLogRow.inferLanguage("我面前是什么？"))
+        assertEquals("zh", InteractionLogRow.inferLanguage("那这个呢"))
+    }
+
+    @Test
+    fun `inferLanguage returns unknown for uninterpretable or non-linguistic text`() {
+        assertEquals("unknown", InteractionLogRow.inferLanguage(""))
+        assertEquals("unknown", InteractionLogRow.inferLanguage("   "))
+        assertEquals("unknown", InteractionLogRow.inferLanguage("123 456"))
+    }
+
+    @Test
+    fun `inferLanguage keeps plain English below the Malay threshold`() {
+        // English words must not trip Malay signals (no 'sama'-style
+        // single-hit false positives on everyday English queries).
+        assertEquals("en", InteractionLogRow.inferLanguage("is that a refrigerator"))
+        assertEquals("en", InteractionLogRow.inferLanguage("read the label please"))
     }
 }

@@ -103,7 +103,12 @@ def audit_report(rows: list[dict]) -> str:
 
     n = len(ok)
     echoed = sum(1 for r in ok if r["echoed_flag"])
-    lang_ok = sum(1 for r in ok if not r["language_mismatch_flag"])
+    # v2: language-mirror compliance is judged over VOICE rows only. Tap
+    # rows ("User tapped at position …") carry no spoken language, so they
+    # are excluded from the mirror denominator entirely (lane missing on
+    # pre-v2 result files → treated as voice, backward compatible).
+    voice = [r for r in ok if r.get("lane") != "tap"]
+    lang_ok = sum(1 for r in voice if not r["language_mismatch_flag"])
 
     # Ordered relevance levels → numeric average.
     rel_vals = []
@@ -115,10 +120,18 @@ def audit_report(rows: list[dict]) -> str:
 
     lines = [
         "AUDIT REPORT",
-        f"  audited transcripts:         {n}",
+        f"  audited transcripts:         {n} ({len(voice)} voice, {n - len(voice)} tap)",
         f"  echo rate (Noul ≥ 0.5):      {echoed}/{n} = {echoed / n:.1%}",
-        f"  language-mirror compliance:  {lang_ok}/{n} = {lang_ok / n:.1%}",
     ]
+    if voice:
+        lines.append(
+            f"  language-mirror compliance:  {lang_ok}/{len(voice)} = "
+            f"{lang_ok / len(voice):.1%} (voice rows only)"
+        )
+    else:
+        lines.append(
+            "  language-mirror compliance:  n/a (tap-only corpus — no spoken language)"
+        )
     if rel_avg is not None:
         lines.append(f"  mean relevance (0–2):        {rel_avg:.2f}")
 
@@ -132,11 +145,16 @@ def audit_report(rows: list[dict]) -> str:
                 f"a=\"{r['answer'][:40]}\" noul={r['audit_echoed_noul']:.2f}"
             )
 
-    # Per-language compliance.
-    lines.append("  per-language mirror compliance:")
-    for lang in sorted({r["lang"] for r in ok if r["lang"]}):
-        sub = [r for r in ok if r["lang"] == lang]
-        good = sum(1 for r in sub if not r["language_mismatch_flag"])
-        lines.append(f"    {lang}: {good}/{len(sub)} = {good / len(sub):.1%}")
+    # Per-language compliance (voice rows only — tap rows have no language;
+    # the v2 exporter infers lang per query instead of the old 'unknown').
+    voice_langs = sorted({r["lang"] for r in voice if r["lang"]})
+    if voice_langs:
+        lines.append("  per-language mirror compliance (voice rows):")
+        for lang in voice_langs:
+            sub = [r for r in voice if r["lang"] == lang]
+            good = sum(1 for r in sub if not r["language_mismatch_flag"])
+            lines.append(f"    {lang}: {good}/{len(sub)} = {good / len(sub):.1%}")
+    else:
+        lines.append("  per-language mirror compliance: n/a (no voice rows)")
 
     return "\n".join(lines)

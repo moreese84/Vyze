@@ -17,6 +17,21 @@ per pair (parallel questions, one call), per SKILL.md guidance.
 
 from .taxonomy import RELEVANCE_LEVELS
 
+# CameraFragment submits screen-tap queries as "User tapped at position
+# (x, y)…" — they carry NO spoken language, so language-mirror grading is
+# meaningless for them (device-audit v2: 4 of 13 rows were tap rows and
+# dragged compliance down as noise). The exporter tags new rows with
+# lane="tap"; this prefix rule classifies OLD exports the same way.
+TAP_QUERY_PREFIX = "User tapped at position"
+
+
+def lane_of(item: dict) -> str:
+    """Row lane: 'tap' (no spoken language) vs 'voice'. Backward compatible."""
+    lane = item.get("lane")
+    if lane:
+        return lane
+    return "tap" if str(item.get("query", "")).startswith(TAP_QUERY_PREFIX) else "voice"
+
 
 def audit_questions() -> dict:
     """Fresh question objects per call (never reuse SDK objects across requests)."""
