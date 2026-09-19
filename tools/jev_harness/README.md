@@ -71,8 +71,11 @@ Two corpus kinds:
 1. **Seed corpus** (`queries.py`, committed): hand-written, balanced, safe
    to commit.
 2. **Device corpus** (`corpus/`, git-ignored): real dogfooding transcripts
-   from the debug-only on-device export. **Never commit real usage
-   transcripts** — they can contain health/banking context.
+   from the debug-only on-device export (Tier 1 of the data strategy —
+   see `docs/eval/OFFLINE_GUARANTEE.md`; release users have no automatic
+   channel by design, and Tier 2 share-sheet diagnostics is the planned
+   pre-release addition). **Never commit real usage transcripts** — they
+   can contain health/banking context.
 
    Workflow (debug build installed on the test device):
 

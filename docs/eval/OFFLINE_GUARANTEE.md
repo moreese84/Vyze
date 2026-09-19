@@ -72,6 +72,48 @@ grep -c InteractionLogExportReceiver \
   app/build/intermediates/merged_manifests/release/processReleaseManifest/AndroidManifest.xml   # expect 0
 ```
 
+## Data strategy for improving the student router
+
+The release app has NO path from users' phones back to the developer —
+that is the price and the point of the offline guarantee. Training data
+therefore moves by deliberate human channels only. Three tiers were
+evaluated; **Tier 1 is the shipped strategy.**
+
+### Tier 1 — Dev-device corpus (SHIPPED)
+
+The developer's own dogfooding feeds the loop: use the debug build, run
+the adb export → pull → harness audit, distill, gate-test, ship the next
+StudentRouter. Additionally, user feedback arrives as *words* (app-store
+reviews, messages, "it answered in English when I speak Malay") and is
+reproduced on the dev device to enter the same pipeline. The
+`interaction_records.feedback` column already exists locally for a future
+in-app "that was wrong" affordance.
+
+### Tier 2 — Share-sheet diagnostics (planned, pre-release)
+
+A release-app Settings button writes the same harness JSONL and opens the
+Android share sheet; the user emails the file to the developer
+themselves. The app still performs zero network communication (the OS
+share sheet is the transport), consent is explicit, and the file is
+user-readable before sending. Requires a preview/trim UI (transcripts can
+contain medication/banking context) and developer-side scrubbing before
+anything enters the committed seed corpus — device rows stay git-ignored.
+
+### Tier 3 — Opt-in automatic telemetry (NOT planned)
+
+Would require network code in the release APK: Play Data Safety
+declarations, the privacy claim downgraded from architecture to policy,
+and a hard trade for a user base that reads bank cards aloud. Rejected
+for v1; only revisit as a fresh, separately-gated decision.
+
+### Why stranger-contributed data is safe to accept
+
+Every distillation round must pass the frozen-fixture gate
+(StudentRouterFixtureTest: student ≥ regex overall and per language,
+80% absolute floor, Jev teacher pinned) regardless of data source. A bad
+or malicious contribution can only ship if the student still beats the
+baseline on the frozen eval set.
+
 ## What ships where
 
 | Component | Release APK | Debug APK | Dev machine |
